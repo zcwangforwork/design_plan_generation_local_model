@@ -1,0 +1,46 @@
+# Database files (exceed GitHub 100MB limit)
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.db-journal
+
+# ChromaDB / vector store
+**/chroma*/
+**/chroma.sqlite3
+
+# Agent checkpoints and project store
+**/project_store/*.db
+**/project_store/*.sqlite*
+**/agent_checkpoints*
+**/checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+
+# Virtual envs
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
