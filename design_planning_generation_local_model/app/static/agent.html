@@ -1,0 +1,1053 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>设计策划写作 Agent</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #f5f7fa;
+            height: 100vh;
+            display: flex;
+        }
+        /* Sidebar */
+        .sidebar {
+            width: 300px;
+            min-width: 300px;
+            background: #fff;
+            border-right: 1px solid #e0e0e0;
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+        }
+        .sidebar-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid #e0e0e0;
+            font-weight: 600;
+            font-size: 14px;
+            color: #333;
+        }
+        .step-list { padding: 8px 0; }
+        .step-item {
+            padding: 10px 20px;
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            font-size: 13px;
+            color: #666;
+            transition: background 0.2s;
+        }
+        .step-item:hover { background: #f5f7fa; }
+        .step-icon {
+            width: 20px; height: 20px;
+            border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 11px; flex-shrink: 0;
+        }
+        .step-icon.done { background: #e8f5e9; color: #4caf50; }
+        .step-icon.in_progress { background: #fff3e0; color: #ff9800; }
+        .step-icon.pending { background: #f5f5f5; color: #bbb; }
+        .step-icon.skipped { background: #fce4ec; color: #e91e63; }
+        .step-text { line-height: 1.5; }
+        .step-label { font-weight: 500; color: #333; }
+        .step-detail { font-size: 11px; color: #999; margin-top: 2px; }
+        .unresolved-box {
+            margin: 12px 16px; padding: 12px;
+            background: #fff8e1; border-radius: 8px;
+            font-size: 12px; color: #795548;
+        }
+        .unresolved-box h4 { font-size: 12px; margin-bottom: 6px; }
+        .unresolved-box li { margin-left: 16px; margin-bottom: 2px; }
+
+        /* Main chat area */
+        .main {
+            flex: 1; display: flex; flex-direction: column;
+            min-width: 0;
+        }
+        .main-header {
+            padding: 12px 20px;
+            background: #fff; border-bottom: 1px solid #e0e0e0;
+            display: flex; align-items: center; gap: 10px;
+        }
+        .main-header h2 { font-size: 16px; color: #333; }
+        .badge {
+            font-size: 11px; padding: 2px 8px;
+            background: #e3f2fd; color: #1976d2;
+            border-radius: 10px;
+        }
+        .chat-area {
+            flex: 1; overflow-y: auto; padding: 20px;
+            display: flex; flex-direction: column; gap: 16px;
+        }
+        .msg {
+            max-width: 80%; padding: 12px 16px;
+            border-radius: 12px; font-size: 14px;
+            line-height: 1.6; word-wrap: break-word;
+        }
+        .msg.agent {
+            background: #fff; border: 1px solid #e0e0e0;
+            align-self: flex-start;
+        }
+        .msg.user {
+            background: #1976d2; color: #fff;
+            align-self: flex-end;
+        }
+        .msg pre { background: #f5f5f5; padding: 8px; border-radius: 4px; font-size: 12px; overflow-x: auto; }
+        .msg code { font-family: monospace; font-size: 13px; }
+        /* Collapsible long messages */
+        .msg.agent.collapsed {
+            max-height: 280px;
+            overflow: hidden;
+            position: relative;
+        }
+        .msg.agent.collapsed::after {
+            content: '';
+            position: absolute;
+            bottom: 0; left: 0; right: 0;
+            height: 60px;
+            background: linear-gradient(transparent, #fff);
+            pointer-events: none;
+        }
+        .msg-toggle {
+            display: block;
+            margin-top: 6px;
+            font-size: 12px;
+            color: #1976d2;
+            cursor: pointer;
+            background: none;
+            border: none;
+            padding: 2px 0;
+            text-align: left;
+        }
+        .msg-toggle:hover { text-decoration: underline; }
+        .tool-indicator {
+            display: flex; align-items: center; gap: 8px;
+            padding: 8px 16px; font-size: 12px; color: #666;
+            background: #f5f5f5; border-radius: 8px;
+            align-self: flex-start; max-width: 80%;
+        }
+        .tool-indicator .icon { font-size: 16px; }
+        .tool-indicator .spinner {
+            width: 14px; height: 14px; border: 2px solid #ddd;
+            border-top-color: #1976d2; border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .approval-bar {
+            display: flex; gap: 8px; padding: 8px 0;
+            align-self: flex-start;
+        }
+        .approval-bar button {
+            padding: 6px 16px; border-radius: 6px; border: none;
+            font-size: 13px; cursor: pointer; transition: opacity 0.2s;
+        }
+        .approval-bar button:hover { opacity: 0.8; }
+        .btn-approve { background: #4caf50; color: #fff; }
+        .btn-reject { background: #f44336; color: #fff; }
+        .btn-edit { background: #ff9800; color: #fff; }
+        .download-box {
+            align-self: flex-start;
+            padding: 12px 16px;
+            background: #e8f5e9;
+            border: 2px solid #4caf50;
+            border-radius: 8px;
+            display: flex; align-items: center; gap: 10px;
+        }
+        .download-box .dl-icon { font-size: 24px; }
+        .download-box .dl-info { flex: 1; font-size: 13px; color: #333; }
+        .download-box .dl-size { font-size: 11px; color: #999; }
+        .download-box button {
+            padding: 8px 16px;
+            background: #4caf50; color: #fff;
+            border: none; border-radius: 6px;
+            font-size: 13px; cursor: pointer;
+            transition: background 0.2s;
+        }
+        .download-box button:hover { background: #388e3c; }
+        .input-area {
+            padding: 12px 20px; background: #fff;
+            border-top: 1px solid #e0e0e0;
+            display: flex; gap: 10px;
+        }
+        .input-area textarea {
+            flex: 1; padding: 10px; border: 1px solid #ddd;
+            border-radius: 8px; font-size: 14px; resize: none;
+            font-family: inherit; min-height: 44px; max-height: 120px;
+        }
+        .input-area textarea:focus { outline: none; border-color: #1976d2; }
+        .input-area button {
+            padding: 10px 24px; background: #1976d2; color: #fff;
+            border: none; border-radius: 8px; font-size: 14px;
+            cursor: pointer; transition: background 0.2s;
+        }
+        .input-area button:hover { background: #1565c0; }
+        .input-area button:disabled { background: #bdbdbd; cursor: not-allowed; }
+        /* Attachment area */
+        .attachment-area {
+            padding: 4px 20px 0;
+            display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+        }
+        .attachment-area.drag-over {
+            background: #e3f2fd; padding-top: 12px; padding-bottom: 8px;
+        }
+        .att-upload-btn {
+            width: 32px; height: 32px;
+            border-radius: 50%; border: 1px dashed #bbb;
+            background: #fafafa; color: #888;
+            font-size: 16px; cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            transition: all 0.2s; flex-shrink: 0;
+        }
+        .att-upload-btn:hover { border-color: #1976d2; color: #1976d2; background: #e3f2fd; }
+        .att-chip {
+            display: flex; align-items: center; gap: 6px;
+            padding: 4px 8px 4px 10px;
+            background: #e3f2fd; border: 1px solid #bbdefb;
+            border-radius: 16px; font-size: 12px; color: #1565c0;
+            max-width: 220px;
+        }
+        .att-chip .att-name {
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+            max-width: 120px;
+        }
+        .att-chip .att-size { color: #90a4ae; font-size: 10px; flex-shrink: 0; }
+        .att-chip .att-remove {
+            cursor: pointer; color: #999; font-size: 14px; line-height: 1;
+            flex-shrink: 0;
+        }
+        .att-chip .att-remove:hover { color: #f44336; }
+        .att-chip.uploading { opacity: 0.6; background: #f5f5f5; border-color: #e0e0e0; color: #999; }
+        .att-chip.uploading .att-spinner {
+            width: 10px; height: 10px; border: 2px solid #ddd;
+            border-top-color: #1976d2; border-radius: 50%;
+            animation: spin 0.6s linear infinite; flex-shrink: 0;
+        }
+        .empty-state {
+            text-align: center; color: #999; padding: 60px 20px;
+        }
+        .empty-state h3 { font-size: 18px; margin-bottom: 8px; }
+        .error-msg {
+            background: #ffebee; color: #c62828;
+            padding: 8px 12px; border-radius: 6px;
+            font-size: 12px; align-self: flex-start;
+        }
+        /* Auto-gen dialog */
+        .dialog-overlay {
+            display: none;
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.4); z-index: 1000;
+            justify-content: center; align-items: center;
+        }
+        .dialog-overlay.active { display: flex; }
+        .dialog-box {
+            background: #fff; border-radius: 12px; padding: 24px;
+            width: 420px; max-width: 90vw; box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+        }
+        .dialog-box h3 { font-size: 16px; margin-bottom: 16px; color: #333; }
+        .dialog-box label { display: block; font-size: 13px; color: #666; margin-bottom: 4px; margin-top: 12px; }
+        .dialog-box input, .dialog-box textarea, .dialog-box select {
+            width: 100%; padding: 8px 12px; border: 1px solid #ddd;
+            border-radius: 6px; font-size: 13px; font-family: inherit;
+        }
+        .dialog-box input:focus, .dialog-box textarea:focus, .dialog-box select:focus { outline: none; border-color: #4caf50; }
+        .dialog-btns { display: flex; gap: 10px; margin-top: 20px; justify-content: flex-end; }
+        .dialog-btns button { padding: 8px 20px; border-radius: 6px; border: none; font-size: 13px; cursor: pointer; }
+        .dialog-btns .btn-cancel { background: #f5f5f5; color: #666; }
+        .dialog-btns .btn-start { background: #4caf50; color: #fff; }
+        .dialog-btns .btn-start:disabled { background: #bdbdbd; cursor: not-allowed; }
+        /* Responsive: hide sidebar on narrow screens */
+        @media (max-width: 768px) {
+            .sidebar { display: none; }
+        }
+    </style>
+</head>
+<body>
+    <!-- Sidebar: Progress Panel -->
+    <aside class="sidebar">
+        <div class="sidebar-header">📋 设计策划文档编写进度</div>
+        <div class="step-list" id="stepList"></div>
+        <div class="unresolved-box" id="unresolvedBox" style="display:none">
+            <h4>⚠ 待处理</h4>
+            <ul id="unresolvedList"></ul>
+        </div>
+    </aside>
+
+    <!-- Auto-generate dialog -->
+    <div class="dialog-overlay" id="autoGenDialog">
+        <div class="dialog-box">
+            <h3>⚡ 一键生成设计策划文档</h3>
+            <p style="font-size:12px;color:#999;margin-bottom:8px">Agent将按SOP全流程自动执行，无需逐步确认</p>
+            <label>文档类型</label>
+            <select id="agDocType">
+                <option value="design_development_plan">项目开发计划书</option>
+	                <option value="risk_management_plan">风险管理计划</option>
+	                <option value="market_research_product_definition">市场调研与产品定义报告</option>
+	                <option value="project_feasibility_study">项目可行性研究报告</option>
+	                <option value="patent_analysis_report">专利分析报告</option>
+	                <option value="project_approval_review">立项评审记录</option>
+	                <option value="regulatory_strategy_document">注册路径策略</option>
+            </select>
+            <label>产品名称</label>
+            <input id="agProductName" value="贴敷式胰岛素泵" placeholder="产品名称">
+            <label>医疗器械分类</label>
+            <input id="agClassification" value="III类有源医疗器械" placeholder="分类">
+            <label>预期用途</label>
+            <textarea id="agIntendedUse" rows="2" placeholder="预期用途">用于糖尿病患者持续皮下输注胰岛素</textarea>
+            <div class="dialog-btns">
+                <button class="btn-cancel" onclick="closeAutoGenDialog()">取消</button>
+                <button class="btn-start" id="btnStartAutoGen" onclick="startAutoGenerate()">开始生成</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main: Chat Area -->
+    <div class="main">
+        <div class="main-header">
+            <h2>✏️ 设计策划写作 Agent</h2>
+            <span class="badge" id="projectBadge">新项目</span>
+            <span style="flex:1"></span>
+            <button id="autoGenBtn" onclick="showAutoGenDialog()" style="padding:6px 14px;background:#4caf50;color:#fff;border:none;border-radius:6px;font-size:12px;cursor:pointer;margin-right:12px">⚡ 一键生成</button>
+            <a href="#" id="reviewLink" style="font-size:12px;color:#1976d2;text-decoration:none;margin-right:16px;display:none">审阅文档</a>
+            <a href="#" id="downloadLink" style="font-size:12px;color:#1976d2;text-decoration:none;margin-right:16px;display:none" onclick="downloadDocument()">下载文档</a>
+            <a href="/" style="font-size:12px;color:#999;text-decoration:none">旧版表单 →</a>
+        </div>
+        <div class="chat-area" id="chatArea">
+            <div class="empty-state">
+                <h3>👋 你好！我是设计策划文档写作助手</h3>
+                <p>我会按 SOP 流程引导你完成贴敷式胰岛素泵<br>设计策划阶段文档的编写。</p>
+                <p style="margin-top:12px;color:#bbb">你可以随时提问、跳过、或调整顺序。<br>输一条消息开始吧。</p>
+            </div>
+        </div>
+        <div class="attachment-area" id="attachmentArea">
+            <input type="file" id="fileInput" style="display:none"
+                accept=".pdf,.docx,.doc,.txt,.xlsx,.xls,.md"
+                onchange="handleFileSelect(event)" multiple>
+            <button class="att-upload-btn" id="attUploadBtn" onclick="document.getElementById('fileInput').click()" title="上传附件">📎</button>
+        </div>
+        <div class="input-area">
+            <textarea id="userInput" placeholder="输入消息..." rows="1"
+                onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}"></textarea>
+            <button id="sendBtn" onclick="sendMessage()">发送</button>
+        </div>
+    </div>
+
+    <script>
+        // ── State ──
+        // 从URL参数恢复已有项目，或创建新项目ID
+        const urlParams = new URLSearchParams(window.location.search);
+        const existingProject = urlParams.get('project');
+        const PROJECT_ID = existingProject || ('project_' + Date.now());
+        // 如果有已有项目，更新URL以保持一致
+        if (existingProject && window.location.search) {
+            // URL already has the project param, keep it
+        }
+        let isStreaming = false;
+        let waitingApproval = null;
+        let currentDocLabel = '文档';
+
+        document.getElementById('projectBadge').textContent =
+            '项目: ' + (existingProject ? '已恢复会话' : new Date().toLocaleDateString());
+        // Set up review link
+        const reviewLink = document.getElementById('reviewLink');
+        reviewLink.href = '/agent/review/' + PROJECT_ID;
+        reviewLink.style.display = 'inline';
+
+        // ── Attachments ──
+        let uploadedFiles = [];  // {file_id, filename, char_count, preview, status}
+
+        async function handleFileSelect(event) {
+            const files = event.target.files;
+            if (!files.length) return;
+            for (const file of files) {
+                await uploadFile(file);
+            }
+            event.target.value = '';  // reset input
+        }
+
+        async function uploadFile(file) {
+            // Validate size (10MB)
+            const maxSize = 10 * 1024 * 1024;
+            if (file.size > maxSize) {
+                showError(`文件「${file.name}」超过10MB限制 (${(file.size/1024/1024).toFixed(1)}MB)`);
+                return;
+            }
+            // Validate format
+            const ext = '.' + file.name.split('.').pop().toLowerCase();
+            const allowed = ['.pdf', '.docx', '.doc', '.txt', '.xlsx', '.xls', '.md'];
+            if (!allowed.includes(ext)) {
+                showError(`不支持的文件格式「${ext}」`);
+                return;
+            }
+
+            // Add uploading chip
+            const tempId = 'uploading_' + Date.now();
+            uploadedFiles.push({ file_id: tempId, filename: file.name, char_count: 0, status: 'uploading' });
+            renderAttachmentChips();
+
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
+
+                const resp = await fetch(`/api/agent/upload/${PROJECT_ID}`, {
+                    method: 'POST',
+                    body: formData,
+                });
+                const data = await resp.json();
+
+                if (data.success) {
+                    // Replace temp with real entry
+                    uploadedFiles = uploadedFiles.filter(f => f.file_id !== tempId);
+                    uploadedFiles.push({
+                        file_id: data.file_id,
+                        filename: data.filename,
+                        char_count: data.char_count,
+                        preview: data.preview,
+                        status: 'completed',
+                    });
+                    // Brief success indicator in chat
+                    appendMessage('agent', `📎 已上传「${data.filename}」(${data.char_count} 字符)。我可以在对话中检索此文件内容。`);
+                } else {
+                    uploadedFiles = uploadedFiles.filter(f => f.file_id !== tempId);
+                    showError(data.message || '上传失败');
+                }
+            } catch (err) {
+                uploadedFiles = uploadedFiles.filter(f => f.file_id !== tempId);
+                showError('上传失败: ' + err.message);
+            }
+            renderAttachmentChips();
+            fetchState();  // refresh sidebar
+        }
+
+        async function removeAttachment(fileId) {
+            try {
+                await fetch(`/api/agent/projects/${PROJECT_ID}/attachments/${fileId}`, {
+                    method: 'DELETE',
+                });
+            } catch (err) {
+                // Still remove locally even if server fails
+            }
+            uploadedFiles = uploadedFiles.filter(f => f.file_id !== fileId);
+            renderAttachmentChips();
+            fetchState();
+        }
+
+        function renderAttachmentChips() {
+            const area = document.getElementById('attachmentArea');
+            // Clear all chips but keep the upload button
+            const uploadBtn = document.getElementById('attUploadBtn');
+            const fileInput = document.getElementById('fileInput');
+            area.innerHTML = '';
+            area.appendChild(fileInput);
+            area.appendChild(uploadBtn);
+
+            uploadedFiles.forEach(f => {
+                const chip = document.createElement('span');
+                chip.className = 'att-chip' + (f.status === 'uploading' ? ' uploading' : '');
+                if (f.status === 'uploading') {
+                    chip.innerHTML = `
+                        <span class="att-spinner"></span>
+                        <span class="att-name">${escapeHtml(f.filename)}</span>
+                        <span class="att-size">上传中...</span>
+                    `;
+                } else {
+                    const sizeKB = (f.char_count / 1024).toFixed(1);
+                    chip.innerHTML = `
+                        <span class="att-name" title="${escapeHtml(f.filename)}">${escapeHtml(f.filename)}</span>
+                        <span class="att-size">${sizeKB}KB</span>
+                        <span class="att-remove" onclick="removeAttachment('${f.file_id}')" title="移除附件">×</span>
+                    `;
+                }
+                area.appendChild(chip);
+            });
+        }
+
+        async function fetchAttachments() {
+            try {
+                const resp = await fetch(`/api/agent/projects/${PROJECT_ID}/attachments`);
+                const data = await resp.json();
+                if (data.success && data.attachments) {
+                    uploadedFiles = data.attachments.map(a => ({ ...a, status: 'completed' }));
+                    renderAttachmentChips();
+                }
+            } catch (e) { /* Silently fail */ }
+        }
+
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+
+        // Drag-and-drop on chat area
+        (function setupDragDrop() {
+            const chatArea = document.getElementById('chatArea');
+            const attArea = document.getElementById('attachmentArea');
+
+            ['dragenter', 'dragover'].forEach(evt => {
+                chatArea.addEventListener(evt, function(e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    attArea.classList.add('drag-over');
+                });
+            });
+            ['dragleave', 'drop'].forEach(evt => {
+                chatArea.addEventListener(evt, function(e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    attArea.classList.remove('drag-over');
+                });
+            });
+            chatArea.addEventListener('drop', function(e) {
+                const files = e.dataTransfer.files;
+                if (files.length) {
+                    for (const file of files) {
+                        uploadFile(file);
+                    }
+                }
+            });
+            // Also allow drop on attachment area itself
+            attArea.addEventListener('drop', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                attArea.classList.remove('drag-over');
+                const files = e.dataTransfer.files;
+                if (files.length) {
+                    for (const file of files) {
+                        uploadFile(file);
+                    }
+                }
+            });
+            ['dragenter', 'dragover'].forEach(evt => {
+                attArea.addEventListener(evt, function(e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    attArea.classList.add('drag-over');
+                });
+            });
+            attArea.addEventListener('dragleave', function(e) {
+                attArea.classList.remove('drag-over');
+            });
+        })();
+
+        // ── Progress Panel ──
+        const STEPS = [
+            { id: 'product', label: '1. 产品画像', key: 'product' },
+            { id: 'standards', label: '2. 标准适用性清单', key: 'standards' },
+            { id: 'content_collection', label: '3. 结构化内容采集', key: 'content_sections' },
+            { id: 'document', label: '4. 文档生成', key: 'document_generation' },
+            { id: 'review', label: '5. 文档审核', key: 'review' },
+            { id: 'export', label: '6. 导出交付', key: 'export' },
+        ];
+
+        function renderSteps(state) {
+            const list = document.getElementById('stepList');
+            list.innerHTML = STEPS.map(s => {
+                let icon = '⬜', cls = 'pending';
+                if (s.key === 'product') {
+                    if (state?.product?.status === 'confirmed') { icon = '✅'; cls = 'done'; }
+                    else if (state?.product?.status === 'partial') { icon = '🔄'; cls = 'in_progress'; }
+                } else if (s.key === 'standards') {
+                    if (state?.standards?.status === 'confirmed') { icon = '✅'; cls = 'done'; }
+                    else if (state?.standards?.status === 'partial') { icon = '🔄'; cls = 'in_progress'; }
+                } else if (s.key === 'content_sections') {
+                    const secs = state?.content_sections || {};
+                    const done = Object.values(secs).filter(v => v.status === 'confirmed').length;
+                    const total = Object.keys(secs).length || 10;
+                    if (done === total) { icon = '✅'; cls = 'done'; }
+                    else if (done > 0) { icon = '🔄'; cls = 'in_progress'; }
+                } else if (s.key === 'document_generation') {
+                    const status = state?.document_generation?.status;
+                    if (status === 'completed') { icon = '✅'; cls = 'done'; }
+                    else if (status === 'in_progress') { icon = '🔄'; cls = 'in_progress'; }
+                } else if (s.key === 'traceability') {
+                    if (state?.traceability?.status === 'completed') { icon = '✅'; cls = 'done'; }
+                } else if (s.key === 'review') {
+                    if (state?.review?.status === 'completed') { icon = '✅'; cls = 'done'; }
+                }
+                return `<div class="step-item">
+                    <div class="step-icon ${cls}">${icon}</div>
+                    <div class="step-text"><span class="step-label">${s.label}</span></div>
+                </div>`;
+            }).join('');
+
+            // Unresolved items
+            const unresolved = state?.unresolved_items || [];
+            const box = document.getElementById('unresolvedBox');
+            if (unresolved.length) {
+                box.style.display = 'block';
+                document.getElementById('unresolvedList').innerHTML =
+                    unresolved.map(i => `<li>${i}</li>`).join('');
+            } else {
+                box.style.display = 'none';
+            }
+        }
+
+        // ── Chat ──
+        function appendMessage(role, content) {
+            const area = document.getElementById('chatArea');
+            // Remove empty state
+            const empty = area.querySelector('.empty-state');
+            if (empty) empty.remove();
+
+            const div = document.createElement('div');
+            div.className = `msg ${role}`;
+            div.innerHTML = formatContent(content);
+            area.appendChild(div);
+            area.scrollTop = area.scrollHeight;
+            return div;
+        }
+
+        function appendToolIndicator(tool, isStart) {
+            const area = document.getElementById('chatArea');
+            const div = document.createElement('div');
+            div.className = 'tool-indicator';
+            div.id = `tool-${tool}`;
+            if (isStart) {
+                div.innerHTML = `<div class="spinner"></div>🔧 Agent 正在${tool === 'search_kb' ? '检索知识库' : tool === 'generate_section' ? '生成章节' : '修改章节'}...`;
+            } else {
+                div.innerHTML = `<div class="icon">✅</div>${tool === 'search_kb' ? '知识库检索完成' : tool === 'generate_section' ? '章节生成完成' : '修改完成'}`;
+            }
+            area.appendChild(div);
+            area.scrollTop = area.scrollHeight;
+            return div;
+        }
+
+        function showApprovalButtons(data) {
+            const area = document.getElementById('chatArea');
+            const div = document.createElement('div');
+            div.className = 'approval-bar';
+            div.id = 'approvalBar';
+            div.innerHTML = `
+                <button class="btn-approve" onclick="resumeAgent('approve')">✓ 确认生成</button>
+                <button class="btn-edit" onclick="editAndResume()">✎ 修改指令</button>
+                <button class="btn-reject" onclick="resumeAgent('reject')">✗ 跳过</button>
+            `;
+            area.appendChild(div);
+            area.scrollTop = area.scrollHeight;
+            waitingApproval = data;
+        }
+
+        function showDownloadButton(downloadId, filename, sizeBytes) {
+    const area = document.getElementById('chatArea');
+    const div = document.createElement('div');
+    div.className = 'download-box';
+    div.id = 'downloadBox';
+    const sizeKB = (sizeBytes / 1024).toFixed(1);
+    div.innerHTML = `
+        <div class="dl-icon">📄</div>
+        <div class="dl-info">
+            <strong>${filename}</strong>
+            <div class="dl-size">${sizeKB} KB</div>
+        </div>
+        <button onclick="downloadDocx('${downloadId}')">下载文档</button>
+    `;
+    area.appendChild(div);
+    area.scrollTop = area.scrollHeight;
+}
+
+function downloadDocx(downloadId) {
+    window.open('/api/agent/download/' + downloadId, '_blank');
+}
+
+function showQuickDownloadBox() {
+    // Don't add duplicate download boxes
+    if (document.getElementById('quickDownloadBox')) return;
+    const area = document.getElementById('chatArea');
+    const div = document.createElement('div');
+    div.className = 'download-box';
+    div.id = 'quickDownloadBox';
+    div.innerHTML = `
+        <div class="dl-icon">📄</div>
+        <div class="dl-info">
+            <strong>${currentDocLabel || '文档'}.docx</strong>
+            <div class="dl-size">点击按钮下载已生成的文档</div>
+        </div>
+        <button onclick="downloadDocument()">下载文档</button>
+    `;
+    area.appendChild(div);
+    area.scrollTop = area.scrollHeight;
+}
+
+function editAndResume() {
+            const instruction = prompt('请输入修改后的生成指令:', '');
+            if (instruction) {
+                resumeAgent('edit:' + instruction);
+            }
+        }
+
+        function downloadDocument() {
+            window.open('/api/agent/projects/' + PROJECT_ID + '/download', '_blank');
+        }
+
+        function showError(msg) {
+            const area = document.getElementById('chatArea');
+            const div = document.createElement('div');
+            div.className = 'error-msg';
+            div.textContent = '⚠ ' + msg;
+            area.appendChild(div);
+        }
+
+        function formatContent(text) {
+            if (!text) return '';
+            // Basic markdown rendering
+            return text
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
+                .replace(/`([^`]+)`/g, '<code>$1</code>')
+                .replace(/^### (.+)$/gm, '<h4>$1</h4>')
+                .replace(/^## (.+)$/gm, '<h3>$1</h3>')
+                .replace(/^# (.+)$/gm, '<h2>$1</h2>')
+                .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+                .replace(/\n/g, '<br>')
+                .replace(/^- (.+)$/gm, '• $1')
+                .replace(/\|(.+)\|/g, (match) => {
+                    if (match.includes('---')) return '';
+                    const cells = match.split('|').filter(c => c.trim());
+                    return '<br>' + cells.map(c => `<span style="padding:2px 8px;border:1px solid #ddd">${c.trim()}</span>`).join('') + '<br>';
+                });
+        }
+
+        const COLLAPSE_THRESHOLD = 500;  // chars
+
+        function autoCollapseLongMessage(div) {
+            const text = div.textContent || '';
+            if (text.length <= COLLAPSE_THRESHOLD) return;
+
+            div.classList.add('collapsed');
+            const btn = document.createElement('span');
+            btn.className = 'msg-toggle';
+            btn.textContent = '▼ 展开全部';
+            btn.onclick = function () {
+                if (div.classList.contains('collapsed')) {
+                    div.classList.remove('collapsed');
+                    btn.textContent = '▲ 收起';
+                } else {
+                    div.classList.add('collapsed');
+                    btn.textContent = '▼ 展开全部';
+                }
+            };
+            div.insertAdjacentElement('afterend', btn);
+        }
+
+        // ── SSE ──
+        async function sendMessage() {
+            if (isStreaming) return;
+
+            const input = document.getElementById('userInput');
+            const message = input.value.trim();
+            if (!message) return;
+
+            // Show user message
+            appendMessage('user', message);
+            input.value = '';
+            input.style.height = 'auto';
+
+            // Disable input during streaming
+            isStreaming = true;
+            document.getElementById('sendBtn').disabled = true;
+
+            let agentDiv = null;
+            let currentTool = null;
+
+            try {
+                const formData = new FormData();
+                formData.append('message', message);
+
+                const response = await fetch(`/api/agent/projects/${PROJECT_ID}/messages`, {
+                    method: 'POST',
+                    body: formData,
+                });
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        const data = JSON.parse(line.slice(6));
+
+                        switch (data.type) {
+                            case 'token':
+                                if (!agentDiv) agentDiv = appendMessage('agent', '');
+                                agentDiv.innerHTML += data.content
+                                    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                                    .replace(/\n/g, '<br>');
+                                document.getElementById('chatArea').scrollTop =
+                                    document.getElementById('chatArea').scrollHeight;
+                                break;
+
+                            case 'tool_start':
+                                currentTool = data.tool;
+                                appendToolIndicator(data.tool, true);
+                                break;
+
+                            case 'tool_end':
+                                if (currentTool) {
+                                    const el = document.getElementById(`tool-${currentTool}`);
+                                    if (el) {
+                                        el.innerHTML = `<div class="icon">✅</div>${currentTool === 'search_kb' ? '知识库检索完成' : currentTool === 'generate_section' ? '章节生成完成' : '修改完成'}`;
+                                    }
+                                }
+                                currentTool = null;
+                                break;
+
+                            case 'waiting_approval':
+                                showApprovalButtons(data.interrupt_data);
+                                break;
+
+                            case 'done':
+                                // Stream complete — auto-collapse if too long
+                                if (agentDiv) autoCollapseLongMessage(agentDiv);
+                                break;
+
+                            case 'file_ready':
+                                showDownloadButton(data.download_id, data.filename, data.size_bytes);
+                                break;
+
+                            case 'sections_ready':
+                                showQuickDownloadBox();
+                                break;
+
+                            case 'error':
+                                showError(data.message);
+                                break;
+                        }
+                    }
+                }
+            } catch (err) {
+                showError('连接失败: ' + err.message);
+            } finally {
+                isStreaming = false;
+                document.getElementById('sendBtn').disabled = false;
+                document.getElementById('userInput').focus();
+
+                // Refresh state sidebar
+                fetchState();
+            }
+        }
+
+        async function resumeAgent(decision) {
+            if (isStreaming) return;
+
+            // Remove approval bar
+            const bar = document.getElementById('approvalBar');
+            if (bar) bar.remove();
+
+            isStreaming = true;
+            document.getElementById('sendBtn').disabled = true;
+
+            try {
+                const formData = new FormData();
+                formData.append('decision', decision);
+
+                const response = await fetch(`/api/agent/projects/${PROJECT_ID}/resume`, {
+                    method: 'POST',
+                    body: formData,
+                });
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                let agentDiv = null;
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        const data = JSON.parse(line.slice(6));
+
+                        switch (data.type) {
+                            case 'token':
+                                if (!agentDiv) agentDiv = appendMessage('agent', '');
+                                agentDiv.innerHTML += data.content
+                                    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                                    .replace(/\n/g, '<br>');
+                                break;
+                            case 'tool_start':
+                                appendToolIndicator(data.tool, true);
+                                break;
+                            case 'tool_end':
+                                const el = document.getElementById(`tool-${data.tool}`);
+                                if (el) el.querySelector('.spinner')?.remove();
+                                break;
+                            case 'done':
+                                waitingApproval = null;
+                                if (agentDiv) autoCollapseLongMessage(agentDiv);
+                                break;
+
+                            case 'file_ready':
+                                showDownloadButton(data.download_id, data.filename, data.size_bytes);
+                                break;
+                            case 'sections_ready':
+                                showQuickDownloadBox();
+                                break;
+                            case 'error':
+                                showError(data.message);
+                                break;
+                        }
+                    }
+                }
+            } catch (err) {
+                showError('恢复失败: ' + err.message);
+            } finally {
+                isStreaming = false;
+                document.getElementById('sendBtn').disabled = false;
+                fetchState();
+            }
+        }
+
+        // ── Auto-generate ──
+        function showAutoGenDialog() {
+            document.getElementById('autoGenDialog').classList.add('active');
+        }
+        function closeAutoGenDialog() {
+            document.getElementById('autoGenDialog').classList.remove('active');
+        }
+
+        async function startAutoGenerate() {
+            if (isStreaming) return;
+
+            const productName = document.getElementById('agProductName').value.trim();
+            const classification = document.getElementById('agClassification').value.trim();
+            const intendedUse = document.getElementById('agIntendedUse').value.trim();
+            const docType = document.getElementById('agDocType').value;
+            if (!productName) { alert('请输入产品名称'); return; }
+
+            closeAutoGenDialog();
+            // Clear chat and show starting message
+            const area = document.getElementById('chatArea');
+            area.innerHTML = '';
+            appendMessage('agent', '⚡ 一键生成模式启动...<br><br>Agent将按SOP流程自动执行：<br>① 产品画像 → ② 标准/资料检索 → ③ 策划内容采集 → ④ 章节生成 → ⑤ 导出文档<br><br>请耐心等待，全程无需手动确认。');
+
+            isStreaming = true;
+            document.getElementById('sendBtn').disabled = true;
+            document.getElementById('autoGenBtn').disabled = true;
+
+            let agentDiv = null;
+            try {
+                const formData = new FormData();
+                formData.append('product_name', productName);
+                formData.append('product_classification', classification);
+                formData.append('product_intended_use', intendedUse);
+                formData.append('doc_type', docType);
+
+                const response = await fetch(`/api/agent/projects/${PROJECT_ID}/auto-generate`, {
+                    method: 'POST',
+                    body: formData,
+                });
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        const data = JSON.parse(line.slice(6));
+
+                        switch (data.type) {
+                            case 'token':
+                                if (!agentDiv) agentDiv = appendMessage('agent', '');
+                                agentDiv.innerHTML += data.content
+                                    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                                    .replace(/\n/g, '<br>');
+                                area.scrollTop = area.scrollHeight;
+                                break;
+                            case 'tool_start':
+                                appendToolIndicator(data.tool, true);
+                                break;
+                            case 'tool_end':
+                                const el = document.getElementById(`tool-${data.tool}`);
+                                if (el) {
+                                    el.innerHTML = `<div class="icon">✅</div>${data.tool === 'search_kb' ? '知识库检索完成' : data.tool === 'generate_section' ? '章节生成完成' : data.tool === 'build_docx' ? '文档构建完成' : '工具执行完成'}`;
+                                }
+                                break;
+                            case 'sections_ready':
+                                showQuickDownloadBox();
+                                break;
+                            case 'file_ready':
+                                showDownloadButton(data.download_id, data.filename, data.size_bytes);
+                                break;
+                            case 'done':
+                                if (agentDiv) autoCollapseLongMessage(agentDiv);
+                                break;
+                            case 'error':
+                                showError(data.message);
+                                break;
+                        }
+                    }
+                }
+            } catch (err) {
+                showError('一键生成失败: ' + err.message);
+            } finally {
+                isStreaming = false;
+                document.getElementById('sendBtn').disabled = false;
+                document.getElementById('autoGenBtn').disabled = false;
+                fetchState();
+            }
+        }
+
+        async function fetchState() {
+            try {
+                const resp = await fetch(`/api/agent/projects/${PROJECT_ID}/state`);
+                const data = await resp.json();
+                if (data.success) {
+                    renderSteps(data.state);
+                    // Show download/review links if sections have been generated
+                    const sections = data.state?.document_generation?.sections_generated || [];
+                    const hasSections = sections.length > 0;
+                    document.getElementById('downloadLink').style.display = hasSections ? 'inline' : 'none';
+                    document.getElementById('reviewLink').style.display = hasSections ? 'inline' : 'none';
+                    // Capture current doc_type label for quick download box
+                    const docType = data.state?.document_generation?.doc_type || 'design_development_plan';
+                    const docLabels = {
+                        'design_development_plan': '项目开发计划书',
+                        'risk_management_plan': '风险管理计划',
+                        'market_research_product_definition': '市场调研与产品定义报告',
+                        'project_feasibility_study': '项目可行性研究报告',
+                        'patent_analysis_report': '专利分析报告',
+                        'project_approval_review': '立项评审记录',
+                        'regulatory_strategy_document': '注册路径策略',
+                    };
+                    currentDocLabel = docLabels[docType] || '文档';
+                }
+            } catch (e) { /* Silently fail */ }
+        }
+
+        // ── Init ──
+        if (existingProject) {
+            // 恢复已有项目：清除空状态，显示恢复提示
+            const area = document.getElementById('chatArea');
+            area.innerHTML = '';
+            appendMessage('agent', '已恢复之前的会话。文档生成进度已加载，可继续操作或直接下载。');
+            fetchState();
+            fetchAttachments();
+        }
+        renderSteps({});
+        document.getElementById('userInput').focus();
+    </script>
+</body>
+</html>
