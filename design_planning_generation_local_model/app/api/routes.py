@@ -461,13 +461,18 @@ async def agent_send_message(
     - waiting_approval: HITL暂停 → 前端展示确认按钮
     - done: 流结束
     """
-    from app.services.agent_engine import stream_agent_events
+    from app.services.agent_engine import stream_agent_events, get_agent
     from app.services.agent_state import create_initial_state
 
     async def event_stream():
         try:
-            # 首次消息: 传入初始状态
-            initial_state = create_initial_state()
+            # 仅首次消息传入初始状态。已有 checkpoint 时不传 initial_state，
+            # 让 LangGraph 从 checkpoint 恢复，避免 create_initial_state() 覆盖附件等已有状态
+            agent = get_agent()
+            config = {"configurable": {"thread_id": project_id}}
+            existing = await agent.aget_state(config)
+            has_checkpoint = existing is not None and bool(existing.values)
+            initial_state = create_initial_state() if not has_checkpoint else None
             async for event in stream_agent_events(
                 user_message=message,
                 thread_id=project_id,
@@ -541,7 +546,7 @@ async def agent_auto_generate(
     支持 doc_type 参数指定要生成的文档类型，默认为 design_development_plan（项目开发计划书）。
     设计策划阶段支持的文档类型参见 DOC_CATEGORIES['design_planning']['types']。
     """
-    from app.services.agent_engine import stream_agent_events
+    from app.services.agent_engine import stream_agent_events, get_agent
     from app.services.agent_state import create_initial_state
     from app.services.doc_types import DOC_TYPE_LABELS
 
@@ -576,6 +581,18 @@ async def agent_auto_generate(
             initial_state["product_status"] = "confirmed"
             initial_state["auto_mode"] = True
             initial_state["doc_type"] = doc_type
+
+            # 保留已有附件（如果用户先上传了附件再一键生成）
+            agent = get_agent()
+            config = {"configurable": {"thread_id": project_id}}
+            try:
+                existing = await agent.aget_state(config)
+                if existing and existing.values:
+                    existing_atts = existing.values.get("attachments", []) or []
+                    if existing_atts:
+                        initial_state["attachments"] = existing_atts
+            except Exception:
+                pass
 
             async for event in stream_agent_events(
                 user_message=auto_prompt,
@@ -954,18 +971,13 @@ async def agent_upload_attachment(
     except Exception:
         state_values = dict(create_initial_state())
 
-    attachments = list(state_values.get("attachments", []) or [])
-    # 限制full_text长度防止状态过大（向量库中仍有完整内容）
-    MAX_TEXT_IN_STATE = 50000
-    stored_text = full_text
-    if full_text and len(full_text) > MAX_TEXT_IN_STATE:
-        stored_text = full_text[:MAX_TEXT_IN_STATE] + f"\n\n... (文件共{char_count}字符，仅存储前{MAX_TEXT_IN_STATE}字符。完整内容可通过search_attachment工具从向量库检索)"
     attachments.append({
         "file_id": task_id,
         "filename": file.filename,
         "char_count": char_count,
         "preview": preview,
-        "full_text": stored_text,
+        "full_text": full_text,  # 附件全文，不截断，直接给大模型
+        "toc": task.get("toc", ""),
         "status": "completed",
     })
 

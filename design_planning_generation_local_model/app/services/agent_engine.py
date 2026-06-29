@@ -492,6 +492,21 @@ async def stream_agent_events(
                 "tool": tool_name,
                 "output_preview": output[:200],
             }
+            # search_kb / search_attachment 完成时，推送完整检索结果到前端
+            if tool_name in ("search_kb", "search_attachment"):
+                try:
+                    import json as _json
+                    parsed = _json.loads(output)
+                    if parsed.get("status") == "ok" and parsed.get("results"):
+                        yield {
+                            "type": "rag_results",
+                            "tool": tool_name,
+                            "query": parsed.get("query", ""),
+                            "count": parsed.get("count", 0),
+                            "results": parsed["results"],
+                        }
+                except Exception:
+                    pass
             # build_docx 完成时发射 file_ready 事件，前端弹出下载按钮
             if tool_name == "build_docx":
                 import json as _json
@@ -625,6 +640,21 @@ async def resume_agent(
                 "tool": tool_name,
                 "output_preview": output[:200],
             }
+            # search_kb / search_attachment 完成时，推送完整检索结果到前端
+            if tool_name in ("search_kb", "search_attachment"):
+                try:
+                    import json as _json
+                    parsed = _json.loads(output)
+                    if parsed.get("status") == "ok" and parsed.get("results"):
+                        yield {
+                            "type": "rag_results",
+                            "tool": tool_name,
+                            "query": parsed.get("query", ""),
+                            "count": parsed.get("count", 0),
+                            "results": parsed["results"],
+                        }
+                except Exception:
+                    pass
             if tool_name == "build_docx":
                 import json as _json
                 try:

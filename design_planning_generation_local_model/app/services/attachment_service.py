@@ -49,14 +49,18 @@ def _do_extract(task_id: str, file_path: str, persist: bool, doc_type: str):
             extract_tasks[task_id]["message"] = "无法从文件中提取文本内容，文件可能为空或格式不支持"
             return
 
-        # 合并为完整文本
-        full_text = "\n".join(text for _, text in paragraphs)
-        # 生成预览（前500字）
-        preview = full_text[:500] + ("..." if len(full_text) > 500 else "")
+        # 合并为完整文本（不做结构处理，直接拼接）
+        lines = []
+        for section_title, text in paragraphs:
+            if section_title:
+                lines.append(section_title)
+            lines.append(text)
+        full_text = "\n\n".join(lines)
 
         extract_tasks[task_id]["char_count"] = len(full_text)
-        extract_tasks[task_id]["preview"] = preview
+        extract_tasks[task_id]["preview"] = full_text[:500] + ("..." if len(full_text) > 500 else "")
         extract_tasks[task_id]["full_text"] = full_text
+        extract_tasks[task_id]["toc"] = ""
 
         # 可选：写入向量库
         if persist:

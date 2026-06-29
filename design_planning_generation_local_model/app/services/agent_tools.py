@@ -98,7 +98,7 @@ async def search_kb(query: str, top_k: int = 5) -> str:
         formatted = []
         for r in results:
             formatted.append({
-                "content": r.get("text", "")[:800],
+                "content": r.get("text", ""),
                 "source": r.get("source_file", "未知来源"),
                 "score": round(r.get("similarity", 0), 3),
             })
@@ -190,7 +190,7 @@ async def search_attachment(query: str, top_k: int = 5) -> str:
 
             if score > 0:
                 all_matches.append({
-                    "content": para[:800],
+                    "content": para,
                     "source": filename,
                     "score": round(min(score / 3.0, 1.0), 3),
                 })
@@ -205,7 +205,7 @@ async def search_attachment(query: str, top_k: int = 5) -> str:
                 formatted = []
                 for r in results:
                     formatted.append({
-                        "content": r.get("text", "")[:800],
+                        "content": r.get("text", ""),
                         "source": r.get("source_file", "用户上传附件"),
                         "score": round(r.get("similarity", 0), 3),
                     })
@@ -287,23 +287,51 @@ async def generate_section(section_name: str, doc_type: str = "design_developmen
 生成《{doc_label}》文档中「{section_name}」章节的初稿。{expert_section}
 
 要求:
+- 内容必须极其细致和具体，每个段落都要有实质性内容，不能只写框架标题
 - 内容专业、完整，符合NMPA注册申报要求
 - 所有标准条款引用必须有明确的条款号
 - 使用Markdown格式，标题层级清晰 (##, ###)
-- 数据和参数要具体、可测量
+- 技术参数要具体、可测量、有明确的数值范围
+- 表格要填写完整，不能留"(描述)"或"待填写"等占位符
 - 针对贴敷式胰岛素泵产品特性编写
-- 用中文表述 (标准号和必要缩写除外)"""
+- 生成内容的详细程度要像实际可用于注册申报的正式文档一样
+- 用中文表述 (标准号和必要缩写除外)
+
+## 输出结构要求
+请按以下结构组织内容:
+1. 首先用1-2段概述本节要点（含法规依据和产品适用性）
+2. 然后逐个详细阐述每个关键要求（每个要求至少200字，包含法规条款原文引用、产品参数映射、实施建议）
+3. 如涉及数据/参数对比，以表格形式呈现（至少3列）
+4. 最后用1段总结本节的合规要点和与贴敷式胰岛素泵的关联性"""
+
+        # RAG 检索: 用章节名 + 文档类型 + 章节内容要点作为查询
+        rag_context = ""
+        try:
+            rag_query = f"{doc_label} {section_name}"
+            if chapter_query:
+                rag_query += f" {chapter_query[:200]}"
+            rag_result = await search_kb.ainvoke({"query": rag_query, "top_k": 5})
+            rag_data = json.loads(rag_result)
+            if rag_data.get("status") == "ok" and rag_data.get("results"):
+                lines = ["\n\n# 知识库参考资料（必须优先依据以下内容编写）:"]
+                for j, r in enumerate(rag_data["results"], 1):
+                    lines.append(
+                        f"\n[参考{j}] 来源: {r['source']} (相关度:{r['score']})\n{r['content']}"
+                    )
+                rag_context = "".join(lines)
+        except Exception:
+            pass
 
         # 构建 user prompt: 章节特定查询
         query_hint = f"\n\n# 本章节内容要点\n请重点覆盖以下方面: {chapter_query}" if chapter_query else ""
-        user_prompt = f"请生成「{section_name}」章节的{doc_label}文档内容。内容包括该章节应覆盖的所有要求项、适用的法规标准依据、以及建议的具体参数/验收标准。{query_hint}"
+        user_prompt = f"请生成「{section_name}」章节的{doc_label}文档内容。内容包括该章节应覆盖的所有要求项、适用的法规标准依据、以及建议的具体参数/验收标准。{query_hint}{rag_context}"
 
         def _do_generate():
             return _call_minimax_api_raw(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 temperature=0.3,
-                max_tokens=4096,
+                max_tokens=8192,
             )
 
         response = await asyncio.wait_for(
@@ -469,7 +497,7 @@ async def revise_section(section_name: str, instruction: str, doc_type: str = "d
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 temperature=0.3,
-                max_tokens=4096,
+                max_tokens=8192,
             )
 
         response = await asyncio.wait_for(
@@ -679,6 +707,31 @@ async def write_chapter(
         pass
     expert_section = f"\n\n{expert_prompt}" if expert_prompt else ""
 
+    # 轻量去重: 对同一小节的检索结果做 Jaccard 相似度去重
+    def _dedup_results(results: list, threshold: float = 0.6) -> list:
+        if len(results) <= 1:
+            return results
+        kept = []
+        for r in results:
+            dup = False
+            r_words = set(r.get("content", "")[:200].split())
+            if not r_words:
+                kept.append(r)
+                continue
+            for k in kept:
+                k_words = set(k.get("content", "")[:200].split())
+                if not k_words:
+                    continue
+                intersection = len(r_words & k_words)
+                union = len(r_words | k_words)
+                jaccard = intersection / union if union > 0 else 0
+                if jaccard > threshold:
+                    dup = True
+                    break
+            if not dup:
+                kept.append(r)
+        return kept
+
     # ── 强制前置 RAG 检索（逐小节粒度）──
     # 从框架中提取本章的小节列表，每个小节单独检索
     subsections = _find_chapter_subsections(outline_json, chapter_name)
@@ -694,7 +747,7 @@ async def write_chapter(
                 query += f" {' '.join(content_points[:3])}"
             try:
                 async with _rag_sem:
-                    r = await search_kb.ainvoke({"query": query, "top_k": 2})
+                    r = await search_kb.ainvoke({"query": query, "top_k": 5})
                 data = json.loads(r)
                 if data.get("status") == "ok" and data.get("results"):
                     return (sub_title, data["results"])
@@ -708,10 +761,11 @@ async def write_chapter(
         for task in tasks:
             sub_title, results = task.result()
             if results:
+                results = _dedup_results(results)
                 lines = [f"### 小节「{sub_title}」参考资料:"]
                 for j, r in enumerate(results, 1):
                     lines.append(
-                        f"  [源] {r['source']} (相关度:{r['score']})\n  {r['content'][:300]}"
+                        f"  [源] {r['source']} (相关度:{r['score']})\n  {r['content']}"
                     )
                 sub_rag_map[sub_title] = "\n".join(lines)
             else:
@@ -738,13 +792,23 @@ async def write_chapter(
                 f"请编写《{doc_label}》文档中「{chapter_name}」章节下「{sub_title}」小节的内容。"
                 f"{expert_section}\n\n"
                 f"要求:\n"
+                f"- 内容必须极其细致和具体，每个段落都要有实质性内容，不能只写框架标题\n"
                 f"- 内容专业、完整，符合NMPA注册申报要求\n"
                 f"- 所有标准条款引用必须有明确的条款号\n"
                 f"- 使用Markdown格式\n"
-                f"- 数据和参数要具体、可测量\n"
+                f"- 技术参数要具体、可测量、有明确的数值范围\n"
+                f"- 表格要填写完整，不能留\"(描述)\"或\"待填写\"等占位符\n"
                 f"- 针对贴敷式胰岛素泵产品特性编写\n"
+                f"- 生成内容的详细程度要像实际可用于注册申报的正式文档一样\n"
                 f"- 用中文表述 (标准号和必要缩写除外)\n"
-                f"- 只生成本小节内容，不要添加章节标题（如 ## 或 ###）"
+                f"- 只生成本小节内容，不要添加章节标题（如 ## 或 ###）\n"
+                f"\n"
+                f"## 输出结构要求\n"
+                f"请按以下结构组织内容:\n"
+                f"1. 首先用1-2段概述本小节要点（含法规依据和产品适用性）\n"
+                f"2. 然后逐个详细阐述每个关键要求（每个要求至少200字，包含法规条款原文引用、产品参数映射、实施建议）\n"
+                f"3. 如涉及数据/参数对比，以表格形式呈现（至少3列）\n"
+                f"4. 最后用1段总结本小节的合规要点和与贴敷式胰岛素泵的关联性"
             )
 
             user_prompt = (
@@ -766,7 +830,7 @@ async def write_chapter(
                             system_prompt=system_prompt,
                             user_prompt=user_prompt,
                             temperature=0.3,
-                            max_tokens=4096,
+                            max_tokens=8192,
                         ),
                         timeout=300.0,
                     )
@@ -834,12 +898,22 @@ async def write_chapter(
             f"请编写《{doc_label}》文档中「{chapter_name}」章节的完整内容。"
             f"{expert_section}\n\n"
             f"要求:\n"
+            f"- 内容必须极其细致和具体，每个段落都要有实质性内容，不能只写框架标题\n"
             f"- 内容专业、完整，符合NMPA注册申报要求\n"
             f"- 所有标准条款引用必须有明确的条款号\n"
             f"- 使用Markdown格式，标题层级清晰 (### 用于小节)\n"
-            f"- 数据和参数要具体、可测量\n"
+            f"- 技术参数要具体、可测量、有明确的数值范围\n"
+            f"- 表格要填写完整，不能留\"(描述)\"或\"待填写\"等占位符\n"
             f"- 针对贴敷式胰岛素泵产品特性编写\n"
-            f"- 用中文表述 (标准号和必要缩写除外)"
+            f"- 生成内容的详细程度要像实际可用于注册申报的正式文档一样\n"
+            f"- 用中文表述 (标准号和必要缩写除外)\n"
+            f"\n"
+            f"## 输出结构要求\n"
+            f"请按以下结构组织内容:\n"
+            f"1. 首先用1-2段概述本章要点（含法规依据和产品适用性）\n"
+            f"2. 然后逐个详细阐述每个关键要求（每个要求至少200字，包含法规条款原文引用、产品参数映射、实施建议）\n"
+            f"3. 如涉及数据/参数对比，以表格形式呈现（至少3列）\n"
+            f"4. 最后用1段总结本章的合规要点和与贴敷式胰岛素泵的关联性"
         )
 
         user_prompt = (
@@ -864,7 +938,7 @@ async def write_chapter(
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,
                         temperature=0.3,
-                        max_tokens=4096,
+                        max_tokens=8192,
                     ),
                     timeout=300.0,
                 )
@@ -1010,12 +1084,287 @@ async def web_search(query: str, doc_type: str = "design_development_plan") -> s
         "content": web_info[:3000],
     }, ensure_ascii=False)
 
+
+# ── Tool 8: analyze_document_structure ──
+
+@tool
+async def analyze_document_structure(file_id: str = "") -> str:
+    """分析用户上传文档的章节结构和内容概要。
+
+    将文档全文直接送给大模型，让大模型自主识别章节标题、层级关系和内容摘要。
+
+    当用户询问以下问题时必须调用此工具:
+    - "这个文档有哪些章节？"
+    - "第三章讲了什么？"
+    - "帮我梳理一下这个文档的结构"
+    - 任何涉及文档章节、结构、内容概要的问题
+
+    Args:
+        file_id: 可选，指定要分析的附件file_id。为空时分析所有已上传的附件。
+
+    Returns:
+        JSON格式的章节结构，包含每章标题、层级、内容摘要。
+    """
+    from app.services.minimax import _call_minimax_api_raw
+
+    attachments = _current_attachments.get()
+    if not attachments:
+        return json.dumps({
+            "status": "no_attachments",
+            "message": "当前没有上传附件。请先上传Word或PDF文档。",
+            "structures": [],
+        }, ensure_ascii=False)
+
+    # 筛选目标附件
+    target_attachments = attachments
+    if file_id:
+        target_attachments = [a for a in attachments if a.get("file_id") == file_id]
+        if not target_attachments:
+            return json.dumps({
+                "status": "not_found",
+                "message": f"未找到 file_id={file_id} 的附件。",
+                "structures": [],
+            }, ensure_ascii=False)
+
+    all_structures = []
+
+    for att in target_attachments:
+        filename = att.get("filename", "unknown")
+        full_text = att.get("full_text", "")
+
+        if not full_text:
+            all_structures.append({
+                "filename": filename,
+                "file_id": att.get("file_id", ""),
+                "status": "no_text",
+                "message": "该文件无文本内容可供分析",
+            })
+            continue
+
+        # 截取前 12000 字符送给 LLM（兼顾 token 消耗与覆盖范围）
+        text_sample = full_text[:12000]
+
+        system_prompt = """你是一位文档结构分析专家，专精于医疗器械注册文档的章节结构分析。
+
+请分析以下文档全文，直接识别其章节结构。你需要:
+1. 识别所有章节标题及其正确的层级（1-4级）
+2. 修正不规范的编号（如"一."→"一、"、"1 概述"→"1. 概述"）
+3. 对每个章节，用一句话概括其核心内容
+4. 按文档中的出现顺序排列
+
+输出必须为严格JSON格式，不要包含任何其他文字。"""
+
+        user_prompt = f"""请分析文档「{filename}」的章节结构。
+
+文档全文:
+{text_sample}
+
+请输出以下JSON格式:
+```json
+{{
+  "document_title": "文档标题（从内容推断）",
+  "chapters": [
+    {{
+      "level": 1,
+      "title": "章节标题",
+      "summary": "一句话概括本章核心内容（不超过40字）"
+    }}
+  ]
+}}
+```
+
+要求:
+- level: 1=章, 2=节, 3=小节, 4=子小节
+- summary: 用中文，不超过40字
+- 章节按文档中的出现顺序排列
+- 如果文档有目录（TOC），优先参照目录结构"""
+
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _call_minimax_api_raw,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    temperature=0.2,
+                    max_tokens=8192,
+                ),
+                timeout=180.0,
+            )
+
+            if response:
+                # 提取 JSON
+                import re as _re
+                json_text = response.strip()
+                match = _re.search(r'```(?:json)?\s*([\s\S]*?)```', json_text)
+                if match:
+                    json_text = match.group(1).strip()
+                else:
+                    match = _re.search(r'\{[\s\S]*\}', json_text)
+                    if match:
+                        json_text = match.group(0).strip()
+
+                try:
+                    parsed = json.loads(json_text)
+                    parsed["filename"] = filename
+                    parsed["file_id"] = att.get("file_id", "")
+                    parsed["status"] = "ok"
+                    all_structures.append(parsed)
+                except json.JSONDecodeError:
+                    all_structures.append({
+                        "filename": filename,
+                        "file_id": att.get("file_id", ""),
+                        "status": "parse_error",
+                        "raw_response": response[:1000],
+                    })
+            else:
+                all_structures.append({
+                    "filename": filename,
+                    "file_id": att.get("file_id", ""),
+                    "status": "empty_response",
+                    "message": "LLM 返回空结果",
+                })
+
+        except asyncio.TimeoutError:
+            all_structures.append({
+                "filename": filename,
+                "file_id": att.get("file_id", ""),
+                "status": "timeout",
+                "message": "章节分析超时（180秒）",
+            })
+        except Exception as e:
+            all_structures.append({
+                "filename": filename,
+                "file_id": att.get("file_id", ""),
+                "status": "error",
+                "message": f"章节分析异常: {str(e)}",
+            })
+
+    return json.dumps({
+        "status": "ok",
+        "analyzed_count": len(all_structures),
+        "structures": all_structures,
+    }, ensure_ascii=False)
+
+
+# ── Tool 9: ingest_attachment_to_kb ──
+
+@tool
+async def ingest_attachment_to_kb(file_id: str = "") -> str:
+    """将用户上传的附件文档转为向量写入主知识库，使其可被 search_kb 检索。
+
+    调用时机:
+    - 用户说"把这个文档导入知识库"
+    - 用户说"记住这个文档的内容"
+    - 用户上传了重要参考资料，希望后续生成文档时能引用
+    - Agent 判断附件内容对后续工作有价值时，主动建议导入
+
+    Args:
+        file_id: 可选，指定要导入的附件file_id。为空时导入所有已上传的附件。
+
+    Returns:
+        JSON格式的导入结果，包含每个文件的chunk数量和导入状态。
+    """
+    from app.services.rag.ingest import chunk_text
+    from app.services.rag.vector_store import VectorStore
+
+    attachments = _current_attachments.get()
+    if not attachments:
+        return json.dumps({
+            "status": "no_attachments",
+            "message": "当前没有上传附件。请先上传Word或PDF文档。",
+            "results": [],
+        }, ensure_ascii=False)
+
+    # 筛选目标附件
+    target_attachments = attachments
+    if file_id:
+        target_attachments = [a for a in attachments if a.get("file_id") == file_id]
+        if not target_attachments:
+            return json.dumps({
+                "status": "not_found",
+                "message": f"未找到 file_id={file_id} 的附件。",
+                "results": [],
+            }, ensure_ascii=False)
+
+    results = []
+
+    for att in target_attachments:
+        filename = att.get("filename", "unknown")
+        full_text = att.get("full_text", "")
+
+        if not full_text:
+            results.append({
+                "filename": filename,
+                "file_id": att.get("file_id", ""),
+                "status": "no_text",
+                "message": "该文件无文本内容，无法导入",
+            })
+            continue
+
+        # 按段落切分（full_text 已包含 ## 标题标记）
+        paragraphs = []
+        section_title = ""
+        for line in full_text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("## "):
+                section_title = line.lstrip("#").strip()
+            else:
+                paragraphs.append((section_title, line))
+
+        if not paragraphs:
+            paragraphs = [("", full_text)]
+
+        # 复用现有的分块函数
+        chunks = chunk_text(paragraphs)
+
+        # 标记来源
+        for i, chunk in enumerate(chunks):
+            chunk["doc_type"] = "agent_attachment"
+            chunk["source_file"] = filename
+            chunk["chunk_id"] = f"att_{att.get('file_id', '?')}_{i}"
+
+        # 写入主知识库
+        try:
+            vector_store = VectorStore(collection_name="insulin_pump_kb")
+            vector_store.add_chunks(chunks)
+            # 使 BM25 缓存失效
+            VectorStore.invalidate_bm25_cache()
+
+            results.append({
+                "filename": filename,
+                "file_id": att.get("file_id", ""),
+                "status": "ok",
+                "chunk_count": len(chunks),
+                "message": f"「{filename}」已导入知识库，{len(chunks)} 个分块。后续可通过 search_kb 检索到此文档内容。",
+            })
+            print(f"[agent_tools] Ingested '{filename}' → insulin_pump_kb ({len(chunks)} chunks)")
+        except Exception as e:
+            results.append({
+                "filename": filename,
+                "file_id": att.get("file_id", ""),
+                "status": "error",
+                "message": f"导入失败: {str(e)}",
+            })
+
+    success_count = sum(1 for r in results if r["status"] == "ok")
+    return json.dumps({
+        "status": "ok",
+        "total": len(results),
+        "success_count": success_count,
+        "results": results,
+    }, ensure_ascii=False)
+
+
 # ── 工具列表导出 ──
 
 PHASE1_TOOLS = [
     search_kb,
     search_attachment,
     web_search,
+    analyze_document_structure,
+    ingest_attachment_to_kb,
     generate_section,
     revise_section,
     build_docx,

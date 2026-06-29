@@ -181,12 +181,14 @@ DOC_TYPES = [
     "process_validation_plan",  # 工艺验证计划
     "sterilization_validation_protocol",  # 灭菌确认方案
     "sterilization_validation_report",  # 灭菌确认报告
+    "process_validation_report",  # 工艺验证报告 (DHF row 89)
 
     # ========== 五、设计确认阶段 扩充（DHF清单） ==========
     "clinical_trial_plan",  # 临床试验方案
     "clinical_trial_report",  # 临床试验报告
     "usability_test_plan",  # 可用性测试方案
     "usability_test_report",  # 可用性测试报告
+    "design_validation_report",  # 设计确认报告 (DHF row 93)
     # ========== 保留原有兼容类型（映射到新类型） ==========
     "design_output",                     # 设计输出（通用）
     "design_review",                     # 设计评审
@@ -380,12 +382,14 @@ DOC_TYPE_LABELS = {
     "process_validation_plan": "工艺验证计划",
     "sterilization_validation_protocol": "灭菌确认方案",
     "sterilization_validation_report": "灭菌确认报告",
+    "process_validation_report": "工艺验证报告",
 
     # 五、设计确认阶段 扩充（DHF清单）
     "clinical_trial_plan": "临床试验方案",
     "clinical_trial_report": "临床试验报告",
     "usability_test_plan": "可用性测试方案",
     "usability_test_report": "可用性测试报告",
+    "design_validation_report": "设计确认报告",
     # 保留原有兼容类型
     "design_output": "设计输出",
     "design_review": "设计评审",
@@ -485,7 +489,8 @@ DOC_CATEGORIES = {
             "sterilization_residue_test_report", "process_validation_iq_oq_pq",
             "cleaning_validation_report",
             "clinical_trial_plan", "clinical_trial_report",
-            "usability_test_plan", "usability_test_report"
+            "usability_test_plan", "usability_test_report",
+            "design_validation_report"
         ]
     },
     "design_transfer": {
@@ -497,7 +502,7 @@ DOC_CATEGORIES = {
             "manufacturing_sop", "inspection_sop", "equipment_operation_procedures",
             "work_environment_control_doc",
             "process_validation_plan", "sterilization_validation_protocol",
-            "sterilization_validation_report"
+            "sterilization_validation_report", "process_validation_report"
         ]
     },
     "production": {

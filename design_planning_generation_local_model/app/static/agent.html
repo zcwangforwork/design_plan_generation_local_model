@@ -135,6 +135,33 @@
             animation: spin 0.6s linear infinite;
         }
         @keyframes spin { to { transform: rotate(360deg); } }
+        /* RAG search results box */
+        .rag-results-box {
+            align-self: flex-start; max-width: 85%;
+            margin: 4px 0; border: 1px solid #e0e0e0;
+            border-radius: 8px; overflow: hidden;
+            font-size: 12px; background: #fafafa;
+        }
+        .rag-header {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 8px 12px; cursor: pointer; user-select: none;
+            background: #e8eaf6; color: #283593; font-weight: 500;
+        }
+        .rag-header:hover { background: #c5cae9; }
+        .rag-toggle { font-size: 10px; transition: transform 0.2s; }
+        .rag-results-box.collapsed .rag-toggle { transform: rotate(-90deg); }
+        .rag-results-box.collapsed .rag-body { display: none; }
+        .rag-body { padding: 8px 12px; max-height: 400px; overflow-y: auto; }
+        .rag-item {
+            padding: 6px 0; border-bottom: 1px solid #eee;
+        }
+        .rag-item:last-child { border-bottom: none; }
+        .rag-item-header {
+            color: #888; font-size: 11px; margin-bottom: 3px;
+        }
+        .rag-item-content {
+            color: #333; line-height: 1.5; white-space: pre-wrap;
+        }
         .approval-bar {
             display: flex; gap: 8px; padding: 8px 0;
             align-self: flex-start;
@@ -339,9 +366,10 @@
         const urlParams = new URLSearchParams(window.location.search);
         const existingProject = urlParams.get('project');
         const PROJECT_ID = existingProject || ('project_' + Date.now());
-        // 如果有已有项目，更新URL以保持一致
-        if (existingProject && window.location.search) {
-            // URL already has the project param, keep it
+        // 更新URL以保持PROJECT_ID一致（支持页面刷新后恢复）
+        if (!existingProject) {
+            const newUrl = window.location.pathname + '?project=' + PROJECT_ID;
+            window.history.replaceState({}, '', newUrl);
         }
         let isStreaming = false;
         let waitingApproval = null;
@@ -614,6 +642,34 @@
             return div;
         }
 
+        function appendRagResults(data) {
+            const area = document.getElementById('chatArea');
+            const div = document.createElement('div');
+            div.className = 'rag-results-box';
+            const label = data.tool === 'search_attachment' ? '附件检索' : '知识库检索';
+            let html = `<div class="rag-header" onclick="this.parentElement.classList.toggle('collapsed')">
+                <span>📚 ${label}结果: 「${escapeHtml(data.query)}」 (${data.count}条)</span>
+                <span class="rag-toggle">▼</span>
+            </div><div class="rag-body">`;
+            data.results.forEach((r, i) => {
+                html += `<div class="rag-item">
+                    <div class="rag-item-header">#${i+1} · 来源: ${escapeHtml(r.source)} · 相关度: ${(r.score*100).toFixed(1)}%</div>
+                    <div class="rag-item-content">${escapeHtml(r.content)}</div>
+                </div>`;
+            });
+            html += '</div></div>';
+            div.innerHTML = html;
+            area.appendChild(div);
+            area.scrollTop = area.scrollHeight;
+            return div;
+        }
+
+        function escapeHtml(text) {
+            const d = document.createElement('div');
+            d.textContent = text;
+            return d.innerHTML;
+        }
+
         function showApprovalButtons(data) {
             const area = document.getElementById('chatArea');
             const div = document.createElement('div');
@@ -801,6 +857,10 @@ function editAndResume() {
                                 currentTool = null;
                                 break;
 
+                            case 'rag_results':
+                                appendRagResults(data);
+                                break;
+
                             case 'waiting_approval':
                                 showApprovalButtons(data.interrupt_data);
                                 break;
@@ -831,8 +891,9 @@ function editAndResume() {
                 document.getElementById('sendBtn').disabled = false;
                 document.getElementById('userInput').focus();
 
-                // Refresh state sidebar
+                // Refresh state sidebar and attachments
                 fetchState();
+                fetchAttachments();
             }
         }
 
@@ -886,6 +947,9 @@ function editAndResume() {
                                 const el = document.getElementById(`tool-${data.tool}`);
                                 if (el) el.querySelector('.spinner')?.remove();
                                 break;
+                            case 'rag_results':
+                                appendRagResults(data);
+                                break;
                             case 'done':
                                 waitingApproval = null;
                                 if (agentDiv) autoCollapseLongMessage(agentDiv);
@@ -909,6 +973,7 @@ function editAndResume() {
                 isStreaming = false;
                 document.getElementById('sendBtn').disabled = false;
                 fetchState();
+                fetchAttachments();
             }
         }
 
@@ -1007,6 +1072,7 @@ function editAndResume() {
                 document.getElementById('sendBtn').disabled = false;
                 document.getElementById('autoGenBtn').disabled = false;
                 fetchState();
+                fetchAttachments();
             }
         }
 
@@ -1044,8 +1110,9 @@ function editAndResume() {
             area.innerHTML = '';
             appendMessage('agent', '已恢复之前的会话。文档生成进度已加载，可继续操作或直接下载。');
             fetchState();
-            fetchAttachments();
         }
+        // 始终从服务端加载附件列表（新项目也可能已有上传记录）
+        fetchAttachments();
         renderSteps({});
         document.getElementById('userInput').focus();
     </script>
