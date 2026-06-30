@@ -2452,10 +2452,11 @@ class MiniMaxService:
 
         策略：
         1. 将文档按 ## 标题拆分为章节
-        2. 将全部章节 + 用户反馈发给 LLM
-        3. LLM 返回需要修改的章节索引及修改后内容
-        4. 在原文档中用修改后的章节替换对应位置
-        5. 未修改的章节保持原样不变
+        2. 对用户反馈中涉及的内容进行 RAG 检索，获取相关参考资料
+        3. 将全部章节 + 用户反馈 + RAG 上下文发给 LLM
+        4. LLM 返回需要修改的章节索引及修改后内容
+        5. 在原文档中用修改后的章节替换对应位置
+        6. 未修改的章节保持原样不变
 
         Returns:
             (revised_content: str, diff_data: dict|None)
@@ -2472,6 +2473,27 @@ class MiniMaxService:
             diff_data = self._compute_full_diff(current_content, result, feedback)
             return result, diff_data
 
+        # ── RAG 检索：基于用户反馈获取相关知识库参考资料 ──
+        rag_context = ""
+        if self.use_rag:
+            try:
+                doc_label = DOC_TYPE_LABELS.get(doc_type, doc_type)
+                rag_query = f"{doc_label} {feedback[:300]}"
+                rag_chunks, _ = self._rag_retrieve_for_chapter(rag_query, doc_type)
+                if rag_chunks:
+                    lines = ["\n\n【参考范文 - 请严格参照此详细程度、格式和专业深度进行修改】"]
+                    for j, chunk in enumerate(rag_chunks[:8], 1):
+                        source = chunk.get("source_file", chunk.get("source", "未知"))
+                        score = chunk.get("similarity", chunk.get("score", 0))
+                        text = chunk.get("text", chunk.get("content", ""))
+                        lines.append(
+                            f"\n[参考{j}] 来源: {source} (相关度:{score:.2f})\n{text}"
+                        )
+                    rag_context = "".join(lines)
+                    print(f"[revise_content] RAG检索到 {len(rag_chunks[:8])} 条参考资料")
+            except Exception as e:
+                print(f"[revise_content] RAG检索失败，继续无RAG模式: {e}")
+
         # 构建定位+修改的 Prompt
         revision_prompt = self._build_targeted_revision_prompt(
             sections=sections,
@@ -2479,7 +2501,8 @@ class MiniMaxService:
             doc_type=doc_type,
             product_name=product_name,
             product_type=product_type,
-            product_params=product_params
+            product_params=product_params,
+            rag_context=rag_context,
         )
 
         try:
@@ -2554,10 +2577,20 @@ class MiniMaxService:
         doc_type: str,
         product_name: str,
         product_type: str,
-        product_params: str
+        product_params: str,
+        rag_context: str = "",
     ) -> str:
         """构建定位式修订 Prompt — 让 LLM 只输出需要修改的章节"""
         doc_name = DOC_TYPE_LABELS.get(doc_type, doc_type)
+
+        # 获取文档类型专属专家提示词
+        expert_prompt = ""
+        try:
+            from app.services.prompt_engineer import DOC_TYPE_SPECIFIC_PROMPTS
+            expert_prompt = DOC_TYPE_SPECIFIC_PROMPTS.get(doc_type, "")
+        except ImportError:
+            pass
+        expert_section = f"\n\n{expert_prompt}" if expert_prompt else ""
 
         # 构建章节索引列表（只发送标题+摘要，节省 token）
         section_index = []
@@ -2577,7 +2610,7 @@ class MiniMaxService:
             half = max_doc_len // 2
             full_doc = full_doc[:half] + "\n\n...（中间内容省略）...\n\n" + full_doc[-half:]
 
-        prompt = f"""你是医疗器械注册文档编辑专家。你需要根据用户反馈，**对现有文档进行精准的局部修改**。
+        prompt = f"""你是医疗器械注册文档编辑专家。你需要根据用户反馈，**对现有文档进行精准的局部修改**，同时保持修改后章节的详细程度和专业深度不低于原章节。{expert_section}
 
 【产品信息】
 - 产品名称：{product_name}
@@ -2585,12 +2618,20 @@ class MiniMaxService:
 
 【文档类型】{doc_name}
 
+【修改质量要求】
+- 内容必须极其细致和具体，每个段落都要有实质性内容
+- 所有标准条款引用必须有明确的条款号
+- 技术参数要具体、可测量、有明确的数值范围
+- 表格要填写完整，不能留"(描述)"或"待填写"等占位符
+- 修改后内容的详细程度要与首次生成的其他章节保持一致，像实际可用于注册申报的正式文档一样
+- 如果用户指令要求添加新内容，应展开详细描述（每个要点至少200字），而非只加一句话
+
 【章节索引】
 {chr(10).join(section_index)}
 
 【完整文档内容】（共 {len(sections)} 个章节）
 {full_doc}
-
+{rag_context}
 【用户修改意见】
 {feedback}
 
@@ -2722,7 +2763,16 @@ class MiniMaxService:
         """简单全文修订（无章节结构时的回退方案）"""
         doc_name = DOC_TYPE_LABELS.get(doc_type, doc_type)
 
-        prompt = f"""你是医疗器械注册文档编辑专家。请根据用户反馈修改以下文档。
+        # 获取文档类型专属专家提示词
+        expert_prompt = ""
+        try:
+            from app.services.prompt_engineer import DOC_TYPE_SPECIFIC_PROMPTS
+            expert_prompt = DOC_TYPE_SPECIFIC_PROMPTS.get(doc_type, "")
+        except ImportError:
+            pass
+        expert_section = f"\n\n{expert_prompt}" if expert_prompt else ""
+
+        prompt = f"""你是医疗器械注册文档编辑专家。请根据用户反馈修改以下文档，保持修改后内容的详细程度和专业深度不低于原文档。{expert_section}
 
 【产品信息】
 - 产品名称：{product_name}
@@ -2735,7 +2785,14 @@ class MiniMaxService:
 {feedback}
 
 【要求】
-只修改用户意见指出的部分，其余内容原样保留。输出修改后的完整文档（Markdown 格式）。
+- 内容必须极其细致和具体，每个段落都要有实质性内容
+- 所有标准条款引用必须有明确的条款号
+- 技术参数要具体、可测量、有明确的数值范围
+- 表格要填写完整，不能留"(描述)"或"待填写"等占位符
+- 修改后内容的详细程度要与首次生成的其他章节保持一致
+- 如果用户指令要求添加新内容，应展开详细描述（每个要点至少200字）
+- 只修改用户意见指出的部分，其余内容原样保留
+输出修改后的完整文档（Markdown 格式）。
 在文档末尾添加：<!-- 修订说明: {feedback[:80]} -->
 
 请输出："""

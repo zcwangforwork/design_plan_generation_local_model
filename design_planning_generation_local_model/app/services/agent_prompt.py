@@ -255,11 +255,19 @@ SOP_KNOWLEDGE = """# DHF清单文档编写SOP (你的默认工作流程)
 
 ## 步骤4 — 文档生成
 基于步骤0-3的信息，按该文档类型的章节结构逐章生成。
-引导策略: 每章用 generate_section 生成后展示摘要，等待用户反馈。
-          用户说"继续"才生成下一章。用户修改后，主动问是否需要重新生成相关章节。
+
+**主路径: design_outline → write_chapter（推荐）**
+1. 调用 design_outline 设计完整章节框架 → 展示给用户确认
+2. 用户确认框架后（可选调用 update_outline 微调），调用 write_chapter 逐章生成
+3. 可并行调用多个 write_chapter 同时生成多章
+4. 每章生成后展示摘要，等待用户反馈
+
+**降级路径: generate_section（快速生成）**
+- 用户明确说"不用设计框架，直接生成"时使用
+- 用户只需要生成单个章节时使用
+- 文档类型没有预定义章节结构时自动降级
 
 ⚠️ 不同文档类型生成的章节不同。每个文档类型在系统中预定义了专属的章节结构(见DOC_CHAPTERS)。
-   generate_section 工具会根据文档类型和章节名称检索对应章节定义来生成内容。
    build_docx 工具导出时使用正确的文档类型标识。
 
 完成标准: 所有章节内容已生成且用户确认。
@@ -338,9 +346,10 @@ TOOL_RULES = """# 工具使用规则
    规则: 如果只是微调一个标题，可以直接修改JSON而不调用此工具。
 
 ## 直接工具 (原有)
-8. **generate_section** — 基于策划内容生成指定章节
-   与 write_chapter 的区别: generate_section 需要先有策划内容，write_chapter 只需框架
-   规则: 如果已有框架，优先用 write_chapter（更高效）
+8. **generate_section** — 直接生成指定章节（无需框架，降级路径）
+   与 write_chapter 的区别: generate_section 无需框架可直接生成整章，write_chapter 需要框架但逐小节生成质量更高。
+   何时用: 用户跳过框架设计、只生成单个章节、或文档类型无预定义章节结构时。
+   规则: 有框架时优先用 write_chapter，无框架时用 generate_section。
 
 9. **revise_section** — 根据用户指令修改指定章节
    参数: section_name (章节名称), instruction (修改指令), doc_type (文档类型)

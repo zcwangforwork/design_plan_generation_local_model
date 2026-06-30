@@ -457,7 +457,7 @@ async def build_docx(doc_type: str = "", product_name: str = "", markdown: str =
 async def revise_section(section_name: str, instruction: str, doc_type: str = "design_development_plan") -> str:
     """根据用户指令修改指定文档类型的指定章节。
 
-    在现有内容基础上修改，不推翻重写。
+    在现有内容基础上修改，保持与首次生成相同的详细程度和专业深度。
     修改后展示变更摘要。
 
     Args:
@@ -476,21 +476,83 @@ async def revise_section(section_name: str, instruction: str, doc_type: str = "d
 
         doc_label = DOC_TYPE_LABELS.get(doc_type, "设计策划文档")
         expert_prompt = DOC_TYPE_SPECIFIC_PROMPTS.get(doc_type, "")
-        expert_section = f"\n\n# 本文档类型要求\n{expert_prompt}" if expert_prompt else ""
+        expert_section = f"\n\n{expert_prompt}" if expert_prompt else ""
 
+        # ── 获取当前章节内容 ──
+        current_section_content = ""
+        current_markdown = _current_generated_markdown.get()
+        if current_markdown:
+            import re
+            pattern = rf'^## \s*{re.escape(section_name)}\s*$'
+            lines = current_markdown.split('\n')
+            in_section = False
+            section_lines = []
+            for line in lines:
+                if re.match(pattern, line.strip()):
+                    in_section = True
+                    section_lines.append(line)
+                elif in_section and re.match(r'^## ', line.strip()):
+                    break
+                elif in_section:
+                    section_lines.append(line)
+            if section_lines:
+                current_section_content = '\n'.join(section_lines)
+
+        # ── RAG 检索：获取相关知识库参考资料 ──
+        rag_context = ""
+        try:
+            rag_query = f"{doc_label} {section_name} {instruction}"
+            rag_result = await search_kb.ainvoke({"query": rag_query, "top_k": 5})
+            rag_data = json.loads(rag_result)
+            if rag_data.get("status") == "ok" and rag_data.get("results"):
+                lines = ["\n\n# 知识库参考资料（必须优先依据以下内容进行修改）:"]
+                for j, r in enumerate(rag_data["results"], 1):
+                    lines.append(
+                        f"\n[参考{j}] 来源: {r['source']} (相关度:{r['score']})\n{r['content']}"
+                    )
+                rag_context = "".join(lines)
+        except Exception:
+            pass
+
+        # ── 构建高质量修订 prompt（复用 write_chapter 的详细质量要求）──
         system_prompt = f"""你是一位贴敷式胰岛素泵RA文档专家。用户要求修改《{doc_label}》文档中「{section_name}」章节。{expert_section}
 
+要求:
+- 内容必须极其细致和具体，每个段落都要有实质性内容，不能只写框架标题
+- 内容专业、完整，符合NMPA注册申报要求
+- 所有标准条款引用必须有明确的条款号
+- 使用Markdown格式，标题层级清晰 (##, ###)
+- 技术参数要具体、可测量、有明确的数值范围
+- 表格要填写完整，不能留"(描述)"或"待填写"等占位符
+- 针对贴敷式胰岛素泵产品特性编写
+- 修改后内容的详细程度要与首次生成的其他章节保持一致，像实际可用于注册申报的正式文档一样
+- 用中文表述 (标准号和必要缩写除外)
+
 修改规则:
-- 仅修改用户指定的内容，保持其他部分不变
+- 根据用户指令修改内容，但保持修改后章节的详细程度和专业深度不低于原章节
+- 如果用户指令要求添加新内容，应展开详细描述（每个要点至少200字），而非只加一句话
 - 保持Markdown格式和标题层级
 - 如果修改影响了其他章节的参数/引用，在回复末尾用"⚠️ 关联影响:"标注
-- 用中文回复"""
+- 用中文回复
+
+## 输出结构要求
+请按以下结构组织修改后的内容:
+1. 首先用1-2段概述本节要点（含法规依据和产品适用性）
+2. 然后逐个详细阐述每个关键要求（每个要求至少200字，包含法规条款原文引用、产品参数映射、实施建议）
+3. 如涉及数据/参数对比，以表格形式呈现（至少3列）
+4. 最后用1段总结本节的合规要点和与贴敷式胰岛素泵的关联性"""
 
         user_prompt = f"""请修改《{doc_label}》的「{section_name}」章节，修改指令: {instruction}
 
 请在修改后:
-1. 输出修改后的完整章节内容
+1. 输出修改后的完整章节内容（保持与首次生成相同的详细程度）
 2. 在末尾用"📝 修改摘要:"列出具体变更点"""
+
+        # 注入当前章节内容和 RAG 上下文
+        if current_section_content:
+            user_prompt += f"\n\n# 当前章节内容（请在此基础上修改）:\n{current_section_content}"
+        if rag_context:
+            user_prompt += f"\n{rag_context}"
 
         def _do_revise():
             return _call_minimax_api_raw(
