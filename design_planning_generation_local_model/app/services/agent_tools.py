@@ -32,6 +32,17 @@ _current_attachments: contextvars.ContextVar[list[dict]] = contextvars.ContextVa
     'attachments', default=[]
 )
 
+# 产品画像上下文（供 generate_search_query 等工具读取）
+_current_product_classification: contextvars.ContextVar[str] = contextvars.ContextVar(
+    'product_classification', default=''
+)
+_current_product_intended_use: contextvars.ContextVar[str] = contextvars.ContextVar(
+    'product_intended_use', default=''
+)
+_current_confirmed_standards: contextvars.ContextVar[list] = contextvars.ContextVar(
+    'confirmed_standards', default=[]
+)
+
 # write_chapter 完整内容旁路: 工具返回简短摘要，完整内容通过此字典
 # 传递给 _after_tools_node，避免大段内容进入 LLM 对话历史。
 # 使用模块级 dict 而非 contextvar，避免 LangGraph 异步节点切换时
@@ -39,11 +50,21 @@ _current_attachments: contextvars.ContextVar[list[dict]] = contextvars.ContextVa
 _pending_chapter_contents: dict = {}  # {chapter_name: full_content}
 
 
-def set_current_doc_context(doc_type: str, product_name: str, markdown: str) -> None:
+def set_current_doc_context(
+    doc_type: str,
+    product_name: str,
+    markdown: str,
+    product_classification: str = '',
+    product_intended_use: str = '',
+    confirmed_standards: list = None,
+) -> None:
     """由 agent_engine 在每轮开始前调用，同步当前文档上下文"""
     _current_doc_type.set(doc_type)
     _current_product_name.set(product_name)
     _current_generated_markdown.set(markdown)
+    _current_product_classification.set(product_classification or '')
+    _current_product_intended_use.set(product_intended_use or '')
+    _current_confirmed_standards.set(confirmed_standards or [])
 
 
 def set_current_attachments(attachments: list[dict]) -> None:
@@ -59,7 +80,7 @@ def get_pending_chapter_content(chapter_name: str) -> dict:
 # ── Tool 1: search_kb ──
 
 @tool
-async def search_kb(query: str, top_k: int = 5) -> str:
+async def search_kb(query: str, top_k: int = 5, use_rerank: bool = True) -> str:
     """检索贴敷式胰岛素泵知识库 (标准、法规、技术文档、测试报告等)。
 
     当需要查找具体标准条款、技术参数限值、法规要求、同类产品数据时，必须先调用此工具。
@@ -68,6 +89,8 @@ async def search_kb(query: str, top_k: int = 5) -> str:
     Args:
         query: 搜索查询关键词。应为具体的标准号、参数名或技术问题。
         top_k: 返回结果数量，默认5条。
+        use_rerank: 是否启用Cross-Encoder精排（默认开启，提升精确率）。
+                    两阶段检索：粗召回30条→BGE-Reranker精排→Top-K。
 
     Returns:
         JSON格式的检索结果列表，每项包含 content, source, score。
@@ -77,15 +100,25 @@ async def search_kb(query: str, top_k: int = 5) -> str:
 
         def _do_retrieve():
             store = VectorStore()
-            return store.retrieve_hybrid(
-                query=query,
-                top_k=top_k,
-                vector_weight=0.85,
-            )
+            if use_rerank:
+                return store.retrieve_and_rerank(
+                    query=query,
+                    top_k=top_k,
+                    candidate_pool_size=30,
+                    vector_weight=0.85,
+                )
+            else:
+                return store.retrieve_hybrid(
+                    query=query,
+                    top_k=top_k,
+                    vector_weight=0.85,
+                )
 
+        # 精排增加30秒容错（粗召回90s + 精排30s）
+        timeout_sec = 120.0 if use_rerank else 90.0
         results = await asyncio.wait_for(
             asyncio.to_thread(_do_retrieve),
-            timeout=90.0,
+            timeout=timeout_sec,
         )
 
         if not results:
@@ -97,16 +130,19 @@ async def search_kb(query: str, top_k: int = 5) -> str:
 
         formatted = []
         for r in results:
+            # 优先使用精排分数，回退到相似度分数
+            score = r.get("rerank_score", r.get("similarity", 0))
             formatted.append({
                 "content": r.get("text", ""),
                 "source": r.get("source_file", "未知来源"),
-                "score": round(r.get("similarity", 0), 3),
+                "score": round(score, 3),
             })
 
         return json.dumps({
             "status": "ok",
             "query": query,
             "count": len(formatted),
+            "reranked": use_rerank,
             "results": formatted,
         }, ensure_ascii=False)
 
@@ -128,6 +164,166 @@ async def search_kb(query: str, top_k: int = 5) -> str:
             "message": f"知识库检索异常: {str(e)}。请告知用户当前检索遇到问题，可用已有知识先回答。",
             "results": [],
         }, ensure_ascii=False)
+
+
+# ── Tool 1a: generate_search_query ──
+
+async def _generate_search_queries(
+    chapter_name: str,
+    sub_title: str = "",
+    content_points: list = None,
+    intent: str = "",
+    num_queries: int = 3,
+) -> list[str]:
+    """
+    内部函数：调用 LLM 基于产品上下文+章节信息生成针对性检索查询词。
+
+    供 generate_search_query 工具和 write_chapter/generate_section/design_outline 内部复用。
+
+    Args:
+        chapter_name: 章节名（如"设计开发阶段划分"）
+        sub_title: 小节名（可选，逐小节检索时传入）
+        content_points: 内容要点列表（可选）
+        intent: Agent 描述的查询意图（可选，如"查找IEC 62304软件C级测试要求"）
+        num_queries: 生成的查询词数量
+
+    Returns:
+        查询词列表，如 ["IEC 62304 Class C 软件单元测试要求", ...]
+    """
+    from app.services.minimax import _call_minimax_api_raw
+
+    # 收集产品上下文
+    product_name = _current_product_name.get() or "贴敷式胰岛素泵"
+    product_class = _current_product_classification.get()
+    intended_use = _current_product_intended_use.get()
+    standards = _current_confirmed_standards.get()
+    doc_type = _current_doc_type.get()
+
+    context_lines = [f"- 产品名称: {product_name}"]
+    if product_class:
+        context_lines.append(f"- 分类: {product_class}")
+    if intended_use:
+        context_lines.append(f"- 预期用途: {intended_use}")
+    if standards:
+        context_lines.append(f"- 已确认适用标准: {', '.join(standards[:10])}")
+    if doc_type:
+        context_lines.append(f"- 目标文档类型: {doc_type}")
+    context_block = "\n".join(context_lines)
+
+    target = chapter_name
+    if sub_title:
+        target = f"{chapter_name} → {sub_title}"
+
+    points_hint = ""
+    if content_points:
+        points_hint = "\n本节内容要点:\n" + "\n".join(f"- {p}" for p in content_points[:5])
+
+    intent_hint = ""
+    if intent:
+        intent_hint = f"\nAgent查询意图: {intent}"
+
+    system_prompt = f"""你是医疗器械法规标准检索专家。基于以下产品上下文和章节信息，生成 {num_queries} 条精准的知识库检索查询词。
+
+## 产品上下文
+{context_block}
+
+## 当前检索目标
+章节: {target}{points_hint}{intent_hint}
+
+## 任务
+生成 {num_queries} 条检索查询词，每条查询词应：
+1. 包含具体的标准号、参数名、技术术语或法规条款号（不要泛泛而谈）
+2. 与产品上下文紧密结合（如软件C级、贴敷式胰岛素泵、闭环控制等）
+3. 覆盖不同检索维度（如：标准要求类、测试方法类、限值参数类）
+
+## 输出格式（严格JSON）
+{{
+  "queries": ["查询词1", "查询词2", "查询词3"]
+}}
+
+只输出JSON，不要包含其他文字或markdown代码块标记。"""
+
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                _call_minimax_api_raw,
+                system_prompt=system_prompt,
+                user_prompt=f"请生成 {num_queries} 条针对「{target}」的检索查询词。",
+                temperature=0.2,
+                max_tokens=1024,
+            ),
+            timeout=60.0,
+        )
+        if not response:
+            return []
+
+        # 提取JSON
+        import re
+        json_text = response.strip()
+        match = re.search(r'```(?:json)?\s*([\s\S]*?)```', json_text)
+        if match:
+            json_text = match.group(1).strip()
+        else:
+            match = re.search(r'\{[\s\S]*\}', json_text)
+            if match:
+                json_text = match.group(0).strip()
+
+        parsed = json.loads(json_text)
+        queries = parsed.get("queries", [])
+        return [str(q).strip() for q in queries if str(q).strip()][:num_queries]
+    except Exception as e:
+        print(f"[generate_search_query] LLM生成查询失败: {e}")
+        # 回退到简单拼接
+        fallback = " ".join(filter(None, [doc_type, chapter_name, sub_title]))
+        if content_points:
+            fallback += " " + " ".join(content_points[:3])
+        return [fallback] if fallback else []
+
+
+@tool
+async def generate_search_query(
+    chapter_name: str,
+    intent: str = "",
+    num_queries: int = 3,
+) -> str:
+    """基于当前产品上下文和章节信息，生成精准的知识库检索查询词。
+
+    调用此工具后，会返回 2-4 条针对性查询词，每条覆盖不同检索维度
+    （标准要求/测试方法/限值参数）。然后用这些查询词分别调用 search_kb 检索。
+
+    何时调用:
+    - 开始生成新章节前（替代凭直觉拼凑查询词）
+    - 需要查找具体标准条款但不确定用什么关键词时
+    - 用户描述模糊的查询意图时（如"查一下软件测试要求"）
+
+    Args:
+        chapter_name: 章节名或主题，如"设计开发阶段划分"、"软件验证"
+        intent: 查询意图描述（可选），如"查找IEC 62304 C级软件单元测试的具体要求和通过准则"
+        num_queries: 生成的查询词数量，默认3条
+
+    Returns:
+        JSON格式的查询词列表，供后续 search_kb 使用。
+    """
+    queries = await _generate_search_queries(
+        chapter_name=chapter_name,
+        intent=intent,
+        num_queries=num_queries,
+    )
+
+    if not queries:
+        return json.dumps({
+            "status": "error",
+            "message": "查询词生成失败，请直接用章节名或标准号调用 search_kb。",
+            "queries": [],
+        }, ensure_ascii=False)
+
+    return json.dumps({
+        "status": "ok",
+        "chapter_name": chapter_name,
+        "intent": intent,
+        "queries": queries,
+        "usage_hint": "请用上述每条查询词分别调用 search_kb，合并结果后取最相关的作为生成参考。",
+    }, ensure_ascii=False)
 
 
 # ── Tool 1b: search_attachment ──
@@ -304,17 +500,37 @@ async def generate_section(section_name: str, doc_type: str = "design_developmen
 3. 如涉及数据/参数对比，以表格形式呈现（至少3列）
 4. 最后用1段总结本节的合规要点和与贴敷式胰岛素泵的关联性"""
 
-        # RAG 检索: 用章节名 + 文档类型 + 章节内容要点作为查询
+        # RAG 检索: 用 LLM 基于产品上下文+章节信息生成针对性查询词
         rag_context = ""
         try:
-            rag_query = f"{doc_label} {section_name}"
-            if chapter_query:
-                rag_query += f" {chapter_query[:200]}"
-            rag_result = await search_kb.ainvoke({"query": rag_query, "top_k": 5})
-            rag_data = json.loads(rag_result)
-            if rag_data.get("status") == "ok" and rag_data.get("results"):
+            queries = await _generate_search_queries(
+                chapter_name=section_name,
+                intent=chapter_query[:200] if chapter_query else "",
+                num_queries=3,
+            )
+            if not queries:
+                # 回退到原硬编码拼接
+                fallback = f"{doc_label} {section_name}"
+                if chapter_query:
+                    fallback += f" {chapter_query[:200]}"
+                queries = [fallback]
+
+            # 对每条查询词调用 search_kb，合并去重结果
+            merged_results = []
+            seen_keys = set()
+            for q in queries:
+                rag_result = await search_kb.ainvoke({"query": q, "top_k": 5})
+                rag_data = json.loads(rag_result)
+                if rag_data.get("status") == "ok" and rag_data.get("results"):
+                    for item in rag_data["results"]:
+                        key = item.get("content", "")[:100]
+                        if key not in seen_keys:
+                            seen_keys.add(key)
+                            merged_results.append(item)
+
+            if merged_results:
                 lines = ["\n\n# 知识库参考资料（必须优先依据以下内容编写）:"]
-                for j, r in enumerate(rag_data["results"], 1):
+                for j, r in enumerate(merged_results, 1):
                     lines.append(
                         f"\n[参考{j}] 来源: {r['source']} (相关度:{r['score']})\n{r['content']}"
                     )
@@ -649,21 +865,34 @@ async def design_outline(
     agent = _get_outline_agent()
 
     # ── 强制前置 RAG 检索 ──
+    # 用 LLM 基于产品上下文+章节信息生成针对性查询词，替代硬编码 query
     rag_context = ""
     try:
-        rag_result = await search_kb.ainvoke({
-            "query": f"{doc_type} 章节结构 标准要求",
-            "top_k": 5,
-        })
-        rag_data = json.loads(rag_result)
-        if rag_data.get("status") == "ok" and rag_data.get("results"):
-            rag_parts = []
-            for i, r in enumerate(rag_data["results"], 1):
-                rag_parts.append(
-                    f"[参考{i}] 来源: {r['source']} (相关度: {r['score']})\n{r['content']}"
-                )
+        queries = await _generate_search_queries(
+            chapter_name=f"{doc_type} 章节结构设计",
+            intent="查找该文档类型的标准章节结构要求和适用法规",
+            num_queries=3,
+        )
+        if not queries:
+            queries = [f"{doc_type} 章节结构 标准要求"]
+        merged_results = []
+        seen_keys = set()
+        for q in queries:
+            rag_result = await search_kb.ainvoke({"query": q, "top_k": 5})
+            rag_data = json.loads(rag_result)
+            if rag_data.get("status") == "ok" and rag_data.get("results"):
+                for item in rag_data["results"]:
+                    key = item.get("content", "")[:100]
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        merged_results.append(item)
+        if merged_results:
+            rag_parts = [
+                f"[参考{i}] 来源: {r['source']} (相关度: {r['score']})\n{r['content']}"
+                for i, r in enumerate(merged_results, 1)
+            ]
             rag_context = "\n\n".join(rag_parts)
-            print(f"[agent_tools] RAG for outline: {len(rag_data['results'])} results")
+            print(f"[agent_tools] RAG for outline: {len(merged_results)} results (from {len(queries)} queries)")
     except Exception as e:
         print(f"[agent_tools] RAG failed for outline: {e}")
 
@@ -804,18 +1033,38 @@ async def write_chapter(
         async def _search_subsection(sub: dict):
             sub_title = sub.get("title", "")
             content_points = sub.get("content_points", [])
-            query = f"{doc_type} {chapter_name} {sub_title}"
-            if content_points:
-                query += f" {' '.join(content_points[:3])}"
+            # 用 LLM 基于产品上下文+章节信息生成针对性查询词（替代硬编码拼接）
+            queries = await _generate_search_queries(
+                chapter_name=chapter_name,
+                sub_title=sub_title,
+                content_points=content_points,
+                num_queries=3,
+            )
+            if not queries:
+                # 回退到简单拼接
+                fallback = " ".join(filter(None, [doc_type, chapter_name, sub_title]))
+                if content_points:
+                    fallback += " " + " ".join(content_points[:3])
+                queries = [fallback] if fallback else []
+
+            # 对每条查询词调用 search_kb，合并去重结果
+            merged_results = []
+            seen_sources = set()
             try:
                 async with _rag_sem:
-                    r = await search_kb.ainvoke({"query": query, "top_k": 5})
-                data = json.loads(r)
-                if data.get("status") == "ok" and data.get("results"):
-                    return (sub_title, data["results"])
+                    for q in queries:
+                        r = await search_kb.ainvoke({"query": q, "top_k": 5})
+                        data = json.loads(r)
+                        if data.get("status") == "ok" and data.get("results"):
+                            for item in data["results"]:
+                                # 按内容前100字符去重
+                                key = item.get("content", "")[:100]
+                                if key not in seen_sources:
+                                    seen_sources.add(key)
+                                    merged_results.append(item)
             except Exception:
                 pass
-            return (sub_title, [])
+            return (sub_title, merged_results)
 
         tasks = [asyncio.create_task(_search_subsection(s)) for s in subsections]
         await asyncio.gather(*tasks)
@@ -936,22 +1185,35 @@ async def write_chapter(
 
     else:
         # ── 回退：框架无小节信息时，整体生成章节 ──
+        # 用 LLM 生成针对性查询词，替代硬编码 query
         rag_context = ""
         try:
-            rag_result = await search_kb.ainvoke({
-                "query": f"{doc_type} {chapter_name}",
-                "top_k": 5,
-            })
-            rag_data = json.loads(rag_result)
-            if rag_data.get("status") == "ok" and rag_data.get("results"):
-                rag_parts = []
-                for i, r in enumerate(rag_data["results"], 1):
-                    rag_parts.append(
-                        f"[参考{i}] 来源: {r['source']} (相关度: {r['score']})\n{r['content']}"
-                    )
+            queries = await _generate_search_queries(
+                chapter_name=chapter_name,
+                intent=f"查找 {doc_type} 文档中 {chapter_name} 章节的标准要求和法规依据",
+                num_queries=3,
+            )
+            if not queries:
+                queries = [f"{doc_type} {chapter_name}"]
+            merged_results = []
+            seen_keys = set()
+            for q in queries:
+                rag_result = await search_kb.ainvoke({"query": q, "top_k": 5})
+                rag_data = json.loads(rag_result)
+                if rag_data.get("status") == "ok" and rag_data.get("results"):
+                    for item in rag_data["results"]:
+                        key = item.get("content", "")[:100]
+                        if key not in seen_keys:
+                            seen_keys.add(key)
+                            merged_results.append(item)
+            if merged_results:
+                rag_parts = [
+                    f"[参考{i}] 来源: {r['source']} (相关度: {r['score']})\n{r['content']}"
+                    for i, r in enumerate(merged_results, 1)
+                ]
                 rag_context = "\n\n".join(rag_parts)
                 print(f"[agent_tools] Fallback RAG for '{chapter_name}': "
-                      f"{len(rag_data['results'])} results")
+                      f"{len(merged_results)} results (from {len(queries)} queries)")
         except Exception as e:
             print(f"[agent_tools] RAG failed for '{chapter_name}': {e}")
 
@@ -1308,6 +1570,177 @@ async def analyze_document_structure(file_id: str = "") -> str:
     }, ensure_ascii=False)
 
 
+# ── Tool 8b: outline_from_attachment ──
+
+@tool
+async def outline_from_attachment(
+    file_id: str = "",
+    doc_type: str = "design_development_plan",
+    product_name: str = "贴敷式胰岛素泵",
+) -> str:
+    """基于上传附件的章节结构生成文档框架（附件优先路径）。
+
+    当用户上传参考文档并希望按附件结构生成新文档时调用。
+    输出与 design_outline 完全兼容的格式，后续可直接调用 write_chapter 逐章生成。
+
+    与 design_outline 的区别:
+    - design_outline 由 LLM 自主设计框架（基于标准法规）
+    - outline_from_attachment 复用附件原有章节结构，LLM 仅补全小节和内容要点
+
+    何时用: 用户上传了附件 + 明确选择"按附件结构生成"时。
+    降级: 附件无可识别章节时返回 error，Agent 应回退到 design_outline。
+
+    Args:
+        file_id: 可选，指定要参照的附件 file_id。为空时自动取第一个有章节结构的附件。
+        doc_type: 目标文档类型标识，用于调整小节以适配目标文档类型特有维度。
+        product_name: 产品名称，用于生成 doc_title。
+
+    Returns:
+        JSON 字符串，格式与 design_outline 一致:
+        {"doc_title": "...", "chapters": [{"id", "title", "description",
+         "key_standards", "subsections": [{"title", "content_points"}]}]}
+        失败时返回 {"status": "error", "message": "..."}
+    """
+    from app.services.minimax import _call_minimax_api_raw
+    from app.services.doc_types import DOC_TYPE_LABELS
+
+    doc_label = DOC_TYPE_LABELS.get(doc_type, doc_type)
+
+    # Step 1: 从 _current_attachments 取目标附件
+    attachments = _current_attachments.get()
+    if not attachments:
+        return json.dumps({
+            "status": "error",
+            "message": "当前没有上传附件。请先上传参考文档，或改用 design_outline 自主设计框架。",
+        }, ensure_ascii=False)
+
+    att = None
+    if file_id:
+        att = next((a for a in attachments if a.get("file_id") == file_id), None)
+    if not att:
+        # 取第一个有 full_text 的附件
+        att = next((a for a in attachments if a.get("full_text")), None)
+    if not att:
+        return json.dumps({
+            "status": "error",
+            "message": "未找到可用的附件（所有附件均无文本内容）。请改用 design_outline。",
+        }, ensure_ascii=False)
+
+    filename = att.get("filename", "unknown")
+    full_text = att.get("full_text", "")
+    if not full_text:
+        return json.dumps({
+            "status": "error",
+            "message": f"附件「{filename}」无文本内容（可能是空文件或提取失败）。请改用 design_outline。",
+        }, ensure_ascii=False)
+
+    # Step 2: 截取附件全文送给 LLM
+    # 使用更大窗口（50000 字符，约覆盖 3-5 万字文档），
+    # 避免短窗口（如 analyze_document_structure 的 12000）导致长文档章节识别不完整
+    text_sample = full_text[:50000]
+    if len(full_text) > 50000:
+        print(f"[agent_tools] outline_from_attachment: full_text truncated "
+              f"({len(full_text)} -> 50000 chars) for '{filename}'")
+
+    # Step 3: 一步 LLM 调用 — 直接从附件全文识别章节结构并补全 subsections + content_points
+    # 不再依赖 analyze_document_structure 的两步流程，避免中间格式转换损失和短窗口截断
+    system_prompt = f"""你是医疗器械注册文档框架分析专家。请分析附件全文，识别其完整的章节结构，
+并输出与 design_outline 兼容的框架JSON。
+
+## 任务
+1. 通读附件全文，识别所有章节标题及其层级关系
+2. 按文档中的出现顺序，提取每一章（level=1 的标题）
+3. 为每章补全 subsections（小节）和 content_points（内容要点）
+4. 小节从附件原文中识别（如 1.1、1.2 等子标题），无明确子标题时根据内容归纳
+
+## 关键约束
+- **必须保留附件原始章节顺序与标题**，不得增删章节或重命名
+- 必须识别出附件的**所有**章节，不得遗漏（即使章节在文档末尾）
+- 每个章节至少2个小节，最多4个小节
+- 每个小节至少2条 content_points，最多4条
+- content_points 应从附件全文中提炼具体要点，不得编造
+- 目标文档类型为「{doc_label}」（doc_type={doc_type}），description 中可注明与该文档类型的关联
+- description 控制在1-2句话，概括本章主要内容
+- key_standards 从全文推断引用的标准，无则留空数组
+
+## 章节识别策略
+1. 优先识别明确的章节编号（如"1."、"第一章"、"一、"等）
+2. 识别 Markdown 标题（# ## ### ####）
+3. 识别 Word 样式标题（如"1.1 目的"）
+4. 如有目录（TOC），优先参照目录
+5. 合并连续无标题段落为"概述"小节
+
+## 输出格式（严格JSON，无其他文字）
+{{
+  "doc_title": "附件推断的文档标题",
+  "chapters": [{{
+    "id": 1,
+    "title": "第X章 章节标题（保留附件原标题）",
+    "description": "本章主要内容概括",
+    "key_standards": ["GB XXXX", "ISO XXXX"],
+    "subsections": [
+      {{"title": "X.1 小节标题", "content_points": ["要点1", "要点2"]}}
+    ]
+  }}]
+}}
+
+只输出 JSON 对象，不要包含 markdown 代码块标记（```）或任何其他文字。"""
+
+    user_prompt = f"""请分析以下附件全文，识别完整的章节结构并补全 subsections 和 content_points。
+
+## 附件文件名
+{filename}
+
+## 附件全文
+{text_sample}"""
+
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                _call_minimax_api_raw,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.2,
+                max_tokens=16384,
+            ),
+            timeout=300.0,
+        )
+    except asyncio.TimeoutError:
+        return json.dumps({
+            "status": "error",
+            "message": "附件框架识别超时（300秒）。请稍后重试，或改用 design_outline。",
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"附件框架识别失败: {str(e)}。请改用 design_outline。",
+        }, ensure_ascii=False)
+
+    if not response:
+        return json.dumps({
+            "status": "error",
+            "message": "LLM 返回空结果，附件框架识别失败。请改用 design_outline。",
+        }, ensure_ascii=False)
+
+    # 复用 _extract_json 提取并清理 JSON
+    outline_str = _extract_json(response)
+
+    # 校验输出可解析
+    try:
+        parsed = json.loads(outline_str)
+        if not parsed.get("chapters"):
+            raise ValueError("输出缺少 chapters 字段")
+    except (json.JSONDecodeError, ValueError) as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"附件框架识别输出格式无效: {str(e)}。请改用 design_outline。",
+        }, ensure_ascii=False)
+
+    print(f"[agent_tools] outline_from_attachment: "
+          f"{len(parsed.get('chapters', []))} chapters from attachment '{att.get('filename', '?')}'")
+    return outline_str
+
+
 # ── Tool 9: ingest_attachment_to_kb ──
 
 @tool
@@ -1427,10 +1860,12 @@ PHASE1_TOOLS = [
     web_search,
     analyze_document_structure,
     ingest_attachment_to_kb,
+    generate_search_query,
     generate_section,
     revise_section,
     build_docx,
     design_outline,
+    outline_from_attachment,
     write_chapter,
     update_outline,
 ]

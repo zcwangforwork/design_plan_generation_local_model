@@ -434,6 +434,9 @@ def extract_text_from_file(file_path: str) -> List[Tuple[str, str]]:
     """
     根据文件扩展名选择合适的提取方法
 
+    当环境变量 USE_MINERU=true 且 MinerU SDK 已安装时，优先使用 MinerU 云端解析；
+    MinerU 失败或未启用时回退到本地解析器（python-docx / pdfplumber / textract 等）。
+
     Args:
         file_path: 文件路径
 
@@ -442,6 +445,21 @@ def extract_text_from_file(file_path: str) -> List[Tuple[str, str]]:
     """
     ext = os.path.splitext(file_path)[1].lower()
 
+    # MinerU 优先路径（opt-in）
+    try:
+        from app.services.mineru_service import (
+            is_mineru_enabled, is_file_supported_by_mineru, extract_text_with_mineru
+        )
+        if is_mineru_enabled() and is_file_supported_by_mineru(file_path):
+            paragraphs = extract_text_with_mineru(file_path)
+            if paragraphs:
+                return paragraphs
+            # MinerU 返回空（SDK 缺失/网络失败/不支持格式）→ 回退到本地解析器
+            print(f"  [MinerU] 回退到本地解析器: {os.path.basename(file_path)}")
+    except Exception as e:
+        print(f"  [MinerU] 调用异常，回退本地: {e}")
+
+    # 本地解析器路径
     if ext == '.docx':
         return extract_text_from_docx(file_path)
     elif ext == '.pdf':
@@ -455,7 +473,9 @@ def extract_text_from_file(file_path: str) -> List[Tuple[str, str]]:
     elif ext == '.md':
         return extract_text_from_md(file_path)
     else:
-        print(f"  [SKIP] 不支持的文件格式: {ext}")
+        # MinerU 扩展格式（.ppt/.pptx/.xls/.html/图片等）若到达此处
+        # 说明 MinerU 未启用或失败且无本地解析器
+        print(f"  [SKIP] 不支持的文件格式: {ext}（启用 MinerU 可解析此格式）")
         return []
 
 
@@ -552,6 +572,17 @@ def get_supported_files(root_dir: str) -> List[str]:
     """递归获取目录下所有支持的文件"""
     supported_files = []
     supported_exts = ['.docx', '.pdf', '.doc', '.txt', '.xlsx', '.md']
+
+    # MinerU 启用时追加扩展格式
+    try:
+        from app.services.mineru_service import is_mineru_enabled, is_mineru_sdk_available
+        if is_mineru_enabled() and is_mineru_sdk_available():
+            supported_exts.extend([
+                '.ppt', '.pptx', '.xls', '.html', '.htm',
+                '.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif',
+            ])
+    except Exception:
+        pass
 
     for root, dirs, files in os.walk(root_dir):
         # 跳过隐藏目录

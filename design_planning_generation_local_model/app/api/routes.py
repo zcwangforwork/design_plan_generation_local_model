@@ -366,7 +366,7 @@ async def get_doc_types():
 
 @router.post("/upload")
 async def upload_attachment(
-    file: UploadFile = File(..., description="附件文件 (.docx/.pdf/.txt)"),
+    file: UploadFile = File(..., description="附件文件 (.docx/.pdf/.txt 等，启用 MinerU 后扩展支持 .doc/.ppt/.pptx/.xls/.xlsx/图片/.html)"),
     persist: bool = Form(False, description="是否存入知识库供后续复用")
 ):
     """
@@ -761,21 +761,10 @@ async def agent_get_document(project_id: str):
     generated = values.get("generated_sections", {}) or {}
     product_name = values.get("product_name", "") or "未命名产品"
 
-    # 章节排序: 先放文档信息类章节，再放技术领域章节
-    priority_order = [
-        "封面", "文档信息", "产品画像", "标准适用性清单",
-        "性能要求", "安全要求", "软件要求", "硬件要求",
-        "EMC要求", "电磁兼容性", "生物相容性", "包装要求",
-        "标签要求", "网络安全", "可用性",
-    ]
-    ordered_sections = []
-    remaining = dict(generated)
-    for key in priority_order:
-        if key in remaining:
-            ordered_sections.append({"title": key, "content": remaining.pop(key)})
-    # 剩余未排序章节
-    for key in sorted(remaining.keys()):
-        ordered_sections.append({"title": key, "content": remaining[key]})
+    # 章节顺序: 按 generated_sections 字典的插入顺序（即首次生成顺序）输出
+    # 与 Agent build_docx 工具 (_sync_doc_context) 的行为保持一致
+    # 修订/重新生成同名小节时 dict 顺序自动保留，避免重排导致顺序错乱
+    ordered_sections = [{"title": name, "content": content} for name, content in generated.items()]
 
     return {
         "success": True,
@@ -826,22 +815,10 @@ async def agent_download_document(project_id: str):
     if not generated:
         raise HTTPException(status_code=400, detail="尚未生成任何章节，请先在Agent对话中生成文档")
 
-    # 组装Markdown文档
-    priority_order = [
-        "封面", "文档信息", "产品画像", "标准适用性清单",
-        "性能要求", "安全要求", "软件要求", "硬件要求",
-        "EMC要求", "电磁兼容性", "生物相容性", "包装要求",
-        "标签要求", "网络安全", "可用性",
-    ]
-    remaining = dict(generated)
-    ordered_parts = []
-    for key in priority_order:
-        if key in remaining:
-            ordered_parts.append(remaining.pop(key))
-    for key in sorted(remaining.keys()):
-        ordered_parts.append(remaining[key])
-
-    full_markdown = "\n\n".join(ordered_parts)
+    # 章节顺序: 按 generated_sections 字典的插入顺序（即首次生成顺序）输出
+    # 与 Agent build_docx 工具 (_sync_doc_context) 的行为保持一致
+    # 修订/重新生成同名小节时 dict 顺序自动保留，避免重排导致顺序错乱
+    full_markdown = "\n\n".join(generated.values())
 
     # 读取实际的 doc_type，非硬编码
     doc_type = values.get("doc_type", "design_development_plan")
@@ -925,9 +902,9 @@ async def agent_upload_attachment(
         doc_type="agent_attachment",
     )
 
-    # 轮询等待提取完成（最长30秒）
+    # 轮询等待提取完成（最长5分钟，适配 MinerU GPU 首次加载模型 + 多页推理耗时）
     import asyncio
-    for _ in range(60):
+    for _ in range(600):
         status = get_extract_status(task_id)
         if status is None:
             raise HTTPException(status_code=500, detail="提取任务丢失")
@@ -937,7 +914,7 @@ async def agent_upload_attachment(
             raise HTTPException(status_code=500, detail=f"文件提取失败: {status.get('message', '未知错误')}")
         await asyncio.sleep(0.5)
     else:
-        raise HTTPException(status_code=500, detail="文件提取超时，请重试")
+        raise HTTPException(status_code=500, detail="文件提取超时（超过5分钟），请重试或使用更小的文档")
 
     # 获取提取后的完整文本（从 extract_tasks 内存中读取，提取完成后需重新获取）
     from app.services.attachment_service import extract_tasks
@@ -971,6 +948,7 @@ async def agent_upload_attachment(
     except Exception:
         state_values = dict(create_initial_state())
 
+    attachments = list(state_values.get("attachments", []) or [])
     attachments.append({
         "file_id": task_id,
         "filename": file.filename,

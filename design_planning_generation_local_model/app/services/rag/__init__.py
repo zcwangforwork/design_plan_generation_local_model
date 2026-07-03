@@ -7,6 +7,7 @@ RAG Service - 检索增强生成模块
 
 from app.services.rag.vector_store import VectorStore
 from app.services.rag.embedder import Embedder
+from app.services.rag.reranker import Reranker
 from app.services.rag.rag_prompt import build_rag_prompt
 
-__all__ = ["VectorStore", "Embedder", "build_rag_prompt"]
+__all__ = ["VectorStore", "Embedder", "Reranker", "build_rag_prompt"]

@@ -585,6 +585,79 @@ class VectorStore:
             print(f"    [VectorStore] BM25 检索失败: {e}")
             return {}
 
+    def retrieve_and_rerank(
+        self,
+        query: str,
+        doc_type: Optional[str] = None,
+        top_k: int = 5,
+        candidate_pool_size: int = 30,
+        similarity_threshold: float = 0.3,
+        vector_weight: float = 0.85,
+        min_rerank_score: float = 0.0,
+    ) -> list[dict]:
+        """
+        两阶段检索：粗召回 + Cross-Encoder 精排
+
+        阶段1 — 粗召回 (高召回率):
+          - 向量检索 n_results=candidate_pool_size (权重: vector_weight)
+          - BM25 检索 top_k=candidate_pool_size (权重: 1-vector_weight)
+          - 加权融合去重
+
+        阶段2 — 精排 (高精确率):
+          - Cross-Encoder (BGE-Reranker-v2-m3) 对候选池逐条打分
+          - 按精排分数降序排列，返回 top_k
+
+        Args:
+            query: 查询文本
+            doc_type: 文档类型过滤（可选）
+            top_k: 精排后返回数量（最终输出）
+            candidate_pool_size: 粗召回候选池大小（建议 20-40）
+            similarity_threshold: 粗召回最低相似度阈值
+            vector_weight: 向量检索权重
+            min_rerank_score: 精排最低分数阈值（0-1），0=不过滤
+
+        Returns:
+            精排后的检索结果列表
+        """
+        t_start = time.time()
+
+        # ── 阶段0: 预加载 Reranker 模型 ──
+        # 必须在 BM25 加载 9622 文档之前加载 reranker 模型到 GPU，
+        # 否则 BM25 大规模内存分配后再初始化 PyTorch+CUDA 会触发 segfault
+        from app.services.rag.reranker import Reranker
+        reranker = Reranker()
+        _ = reranker.model  # 触发模型加载
+
+        # ── 阶段1: 粗召回 ──
+        candidates = self.retrieve_hybrid(
+            query=query,
+            doc_type=doc_type,
+            top_k=candidate_pool_size,
+            similarity_threshold=similarity_threshold,
+            vector_weight=vector_weight,
+        )
+
+        if not candidates:
+            print(f"[TwoStage] 粗召回无结果，跳过精排")
+            return []
+
+        print(f"[TwoStage] 粗召回完成: {len(candidates)} 候选 ({time.time() - t_start:.1f}s)")
+
+        # ── 阶段2: Cross-Encoder 精排 ──
+        t_rerank = time.time()
+        results = reranker.rerank_with_threshold(
+            query=query,
+            chunks=candidates,
+            top_k=top_k,
+            min_score=min_rerank_score,
+        )
+
+        print(f"[TwoStage] 精排完成: {len(results)} 结果 "
+              f"({time.time() - t_rerank:.1f}s), "
+              f"总耗时 {time.time() - t_start:.1f}s")
+
+        return results
+
     def count(self) -> int:
         """返回所有查询 collection 中的文档块总数"""
         total = 0

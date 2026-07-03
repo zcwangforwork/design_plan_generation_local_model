@@ -550,6 +550,39 @@ DOC_CATEGORIES = {
     }
 }
 
-SUPPORTED_UPLOAD_FORMATS = [".docx", ".pdf", ".txt"]
+# 基础上传格式（始终支持，使用本地解析器）
+_BASE_UPLOAD_FORMATS = [".docx", ".pdf", ".txt"]
+
+# MinerU 启用时可额外支持的格式
+_MINERU_EXTRA_FORMATS = [".doc", ".ppt", ".pptx", ".xls", ".xlsx",
+                         ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif",
+                         ".html", ".htm"]
+
+
+def _compute_supported_upload_formats():
+    """根据 MinerU 启用状态动态计算支持的上传格式列表
+
+    注意：此处只检查 USE_MINERU 环境变量，不触发 SDK 导入。
+    SDK 检测会在实际解析时延迟执行（mineru_service.is_mineru_sdk_available）。
+    避免在模块加载阶段导入 mineru_vl_utils/transformers 等重依赖。
+    """
+    formats = list(_BASE_UPLOAD_FORMATS)
+    try:
+        from app.services.mineru_service import is_mineru_enabled
+        if is_mineru_enabled():
+            formats.extend(_MINERU_EXTRA_FORMATS)
+    except Exception:
+        pass
+    # 去重保序
+    seen = set()
+    unique = []
+    for ext in formats:
+        if ext not in seen:
+            seen.add(ext)
+            unique.append(ext)
+    return unique
+
+
+SUPPORTED_UPLOAD_FORMATS = _compute_supported_upload_formats()
 MAX_UPLOAD_SIZE_MB = 10
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024

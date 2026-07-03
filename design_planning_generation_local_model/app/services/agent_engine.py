@@ -219,17 +219,17 @@ async def _after_tools_node(state: AgentState) -> dict:
             except Exception:
                 pass
 
-        # ── 新增: design_outline 结果处理 ──
-        if tool_name == "design_outline":
+        # ── 新增: design_outline / outline_from_attachment 结果处理 ──
+        if tool_name in ("design_outline", "outline_from_attachment"):
             outline = str(tool_msg.content)
             try:
                 json.loads(outline)
                 outline_data = outline
                 outline_status = "draft"
-                print(f"[agent_engine] outline stored "
+                print(f"[agent_engine] outline stored via {tool_name} "
                       f"({len(outline)} chars)")
             except json.JSONDecodeError:
-                print("[agent_engine] design_outline returned invalid JSON")
+                print(f"[agent_engine] {tool_name} returned invalid JSON")
 
         # ── 新增: write_chapter 结果处理 ──
         if tool_name == "write_chapter":
@@ -279,6 +279,9 @@ def _sync_doc_context(state: AgentState,
 
     doc_type = state.get("doc_type", "design_development_plan")
     product_name = state.get("product_name", "贴敷式胰岛素泵")
+    product_classification = state.get("product_classification", "")
+    product_intended_use = state.get("product_intended_use", "")
+    confirmed_standards = state.get("confirmed_standards", [])
     sections = generated_sections or state.get("generated_sections", {})
 
     # 组装完整 Markdown
@@ -287,7 +290,14 @@ def _sync_doc_context(state: AgentState,
         parts.append(f"# {name}\n\n{content}\n\n")
     full_md = "\n".join(parts)
 
-    set_current_doc_context(doc_type, product_name, full_md)
+    set_current_doc_context(
+        doc_type,
+        product_name,
+        full_md,
+        product_classification=product_classification,
+        product_intended_use=product_intended_use,
+        confirmed_standards=confirmed_standards,
+    )
 
 
 def _sync_attachment_context(state: AgentState) -> None:

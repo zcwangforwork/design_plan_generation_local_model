@@ -3,6 +3,11 @@ QMS Document Generator - FastAPI Application
 医疗器械质量体系文档生成工具
 """
 
+# 必须在任何 import torch / pyarrow / sentence_transformers 之前设置，
+# 避免 torch 与 pyarrow 的 Intel OpenMP DLL 冲突（Windows access violation）
+import os as _os
+_os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 from dotenv import load_dotenv
 load_dotenv()
 
