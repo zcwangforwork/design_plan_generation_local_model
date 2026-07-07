@@ -597,7 +597,8 @@ def get_supported_files(root_dir: str) -> List[str]:
 def ingest_document(
     file_path: str,
     vector_store: VectorStore,
-    force_doc_type: Optional[str] = None
+    force_doc_type: Optional[str] = None,
+    pre_parsed_paragraphs: Optional[List[Tuple[str, str]]] = None,
 ) -> int:
     """
     摄入单个文档到向量库
@@ -606,6 +607,8 @@ def ingest_document(
         file_path: 文件路径
         vector_store: 向量存储
         force_doc_type: 强制指定文档类型
+        pre_parsed_paragraphs: 预解析的段落列表，传入时跳过 extract_text_from_file
+            避免对同一文件重复解析（尤其是 MinerU 等耗时解析器）
 
     Returns:
         成功摄入的 chunk 数量
@@ -618,11 +621,14 @@ def ingest_document(
             print(f"  跳过: {os.path.basename(file_path)} (无法识别文档类型)")
             return 0
 
-    try:
-        paragraphs = extract_text_from_file(file_path)
-    except Exception as e:
-        print(f"  读取失败: {os.path.basename(file_path)} - {e}")
-        return 0
+    if pre_parsed_paragraphs is not None:
+        paragraphs = pre_parsed_paragraphs
+    else:
+        try:
+            paragraphs = extract_text_from_file(file_path)
+        except Exception as e:
+            print(f"  读取失败: {os.path.basename(file_path)} - {e}")
+            return 0
 
     if not paragraphs:
         print(f"  空文档: {os.path.basename(file_path)}")

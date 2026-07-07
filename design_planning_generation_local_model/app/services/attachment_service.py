@@ -68,7 +68,13 @@ def _do_extract(task_id: str, file_path: str, persist: bool, doc_type: str):
             try:
                 from app.services.rag.vector_store import VectorStore
                 vector_store = VectorStore(collection_name="uploads")
-                chunk_count = ingest_document(file_path, vector_store, force_doc_type=doc_type)
+                # 传入已解析的 paragraphs，避免 ingest_document 内部重复调用
+                # extract_text_from_file（MinerU 等解析器单次调用即数十秒）
+                chunk_count = ingest_document(
+                    file_path, vector_store,
+                    force_doc_type=doc_type,
+                    pre_parsed_paragraphs=paragraphs,
+                )
                 extract_tasks[task_id]["persisted"] = True
                 extract_tasks[task_id]["chunk_count"] = chunk_count
             except Exception as e:
