@@ -16,6 +16,7 @@ Cross-Encoder 重排序模块
 from typing import Optional
 import os
 import threading
+import pathlib
 
 # 使用 HuggingFace 镜像，避免直连 huggingface.co 超时
 # 必须在 import FlagEmbedding / transformers 之前设置
@@ -23,6 +24,19 @@ if not os.environ.get("HF_ENDPOINT"):
     os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 # 离线时禁用遥测，减少网络请求
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+# 检测模型是否已本地缓存，若已缓存则启用离线模式，避免 DNS 解析失败导致的重试
+# (hf-mirror.com 在某些网络环境下 DNS 解析会超时，每次加载重试5次浪费~30秒)
+_RERANKER_MODEL_NAME = 'BAAI/bge-reranker-v2-m3'
+_HF_CACHE_DIR = pathlib.Path.home() / ".cache" / "huggingface" / "hub"
+_MODEL_CACHE_DIR = _HF_CACHE_DIR / f"models--{_RERANKER_MODEL_NAME.replace('/', '--')}"
+
+if _MODEL_CACHE_DIR.exists() and _MODEL_CACHE_DIR.is_dir():
+    # 模型已缓存，启用离线模式，跳过所有网络请求
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    _OFFLINE_MODE = True
+else:
+    _OFFLINE_MODE = False
 
 
 class Reranker:
@@ -60,7 +74,8 @@ class Reranker:
             use_fp16=True,
             devices=['cuda:0'],
         )
-        print(f"[Reranker] 已加载 {self._model_name} 到 GPU (FP16)")
+        offline_tag = " [OFFLINE]" if _OFFLINE_MODE else ""
+        print(f"[Reranker] 已加载 {self._model_name} 到 GPU (FP16){offline_tag}")
         return self._model
 
     def rerank(
