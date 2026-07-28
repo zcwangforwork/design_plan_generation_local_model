@@ -530,6 +530,191 @@ async def agent_resume(
     )
 
 
+@router.post("/agent/projects/{project_id}/summarize")
+async def agent_summarize(
+    project_id: str,
+    mode: str = Form(..., description='精简模式: "words" 字数模式 | "ratio" 比例模式'),
+    target: float = Form(..., description="目标值: words 模式为字数(int); ratio 模式为压缩比例(0.1-1.0)"),
+    section_name: str = Form("", description="指定章节名，为空时精简全部章节"),
+    doc_type: str = Form("", description="文档类型，为空时从state自动读取"),
+):
+    """对已生成文档的小节内容进行精简，用精简后内容替换原小节。
+
+    独立API手动触发，不经过Agent对话循环，直接调用工具函数并更新state。
+
+    事件类型 (SSE):
+    - start: 精简开始，包含总章节数
+    - section_start: 单章节开始处理
+    - section_done: 单章节处理完成，包含字数对比
+    - done: 全部完成
+    - error: 异常
+    """
+    import json
+    from app.services.agent_engine import get_agent
+    from app.services.agent_tools import (
+        set_current_doc_context,
+        summarize_section,
+        get_pending_chapter_content,
+    )
+
+    async def event_stream():
+        try:
+            # 参数校验
+            if mode not in ("words", "ratio"):
+                yield f"data: {json.dumps({'type': 'error', 'message': f'mode 必须为 words 或 ratio, 当前为 {mode}'}, ensure_ascii=False)}\n\n"
+                return
+
+            if mode == "ratio":
+                if not (0.1 <= float(target) <= 1.0):
+                    yield f"data: {json.dumps({'type': 'error', 'message': f'ratio 模式下 target 应在 0.1~1.0 之间, 当前为 {target}'}, ensure_ascii=False)}\n\n"
+                    return
+            else:
+                if int(target) < 100:
+                    yield f"data: {json.dumps({'type': 'error', 'message': f'words 模式下 target 应不小于 100, 当前为 {target}'}, ensure_ascii=False)}\n\n"
+                    return
+
+            agent = get_agent()
+            config = {"configurable": {"thread_id": project_id}}
+
+            existing = await agent.aget_state(config)
+            if not existing or not existing.values:
+                yield f"data: {json.dumps({'type': 'error', 'message': '项目不存在或尚未开始, 请先生成文档'}, ensure_ascii=False)}\n\n"
+                return
+
+            state = existing.values
+            generated_sections = state.get("generated_sections", {}) or {}
+            if not generated_sections:
+                yield f"data: {json.dumps({'type': 'error', 'message': '尚未生成任何章节, 请先生成文档'}, ensure_ascii=False)}\n\n"
+                return
+
+            actual_doc_type = doc_type or state.get("doc_type", "design_development_plan")
+            product_name = state.get("product_name", "贴敷式胰岛素泵")
+
+            # 确定要精简的章节列表
+            if section_name:
+                if section_name not in generated_sections:
+                    yield f"data: {json.dumps({'type': 'error', 'message': f'章节「{section_name}」不存在, 可用章节: {list(generated_sections.keys())}'}, ensure_ascii=False)}\n\n"
+                    return
+                target_sections = [section_name]
+            else:
+                target_sections = list(generated_sections.keys())
+
+            # 字数模式下按章节数均分预算
+            if mode == "words":
+                total_target = int(target)
+                per_section_target = max(int(total_target / len(target_sections)), 200)
+            else:
+                per_section_target = float(target)
+
+            start_event = {
+                'type': 'start',
+                'mode': mode,
+                'target': target,
+                'per_section_target': per_section_target,
+                'total_sections': len(target_sections),
+                'section_names': target_sections,
+            }
+            yield f"data: {json.dumps(start_event, ensure_ascii=False)}\n\n"
+
+            # 顺序处理各章节（避免并发触发API限流）
+            new_sections = dict(generated_sections)
+            total_orig = 0
+            total_new = 0
+            success_count = 0
+
+            for i, name in enumerate(target_sections):
+                section_start_event = {
+                    'type': 'section_start',
+                    'section_name': name,
+                    'index': i + 1,
+                    'total': len(target_sections),
+                }
+                yield f"data: {json.dumps(section_start_event, ensure_ascii=False)}\n\n"
+
+                # 每次循环前同步 _current_generated_markdown（包含已精简章节的最新内容）
+                parts = []
+                for n, c in new_sections.items():
+                    parts.append(f"# {n}\n\n{c}\n\n")
+                full_md = "\n".join(parts)
+                set_current_doc_context(
+                    actual_doc_type,
+                    product_name,
+                    full_md,
+                    product_classification=state.get("product_classification", ""),
+                    product_intended_use=state.get("product_intended_use", ""),
+                    confirmed_standards=state.get("confirmed_standards", []),
+                )
+
+                # 调用 summarize_section 工具
+                result_str = await summarize_section.ainvoke({
+                    "section_name": name,
+                    "mode": mode,
+                    "target": per_section_target,
+                    "doc_type": actual_doc_type,
+                })
+
+                try:
+                    data = json.loads(result_str)
+                except json.JSONDecodeError:
+                    data = {"status": "error", "message": "工具返回非JSON"}
+
+                # 从旁路读取精简后完整内容
+                pending = get_pending_chapter_content(name)
+                new_content = pending.get("full_content", "")
+
+                section_orig = data.get("orig_total_chars", 0)
+                section_new = data.get("new_total_chars", 0)
+                total_orig += section_orig
+                total_new += section_new
+
+                if data.get("status") == "ok" and new_content:
+                    new_sections[name] = new_content
+                    success_count += 1
+                    # 每章完成后立即更新state（让前端可以实时查看）
+                    await agent.aupdate_state(config, {"generated_sections": new_sections})
+
+                section_done_event = {
+                    'type': 'section_done',
+                    'section_name': name,
+                    'index': i + 1,
+                    'status': data.get("status", "error"),
+                    'orig_chars': section_orig,
+                    'new_chars': section_new,
+                    'subsections_count': data.get("subsections_count", 0),
+                    'success_count': data.get("success_count", 0),
+                    'failed_count': data.get("failed_count", 0),
+                    'message': data.get("message", "") if data.get("status") != "ok" else "",
+                }
+                yield f"data: {json.dumps(section_done_event, ensure_ascii=False)}\n\n"
+
+            # 最终再更新一次state（确保所有章节都写入）
+            await agent.aupdate_state(config, {"generated_sections": new_sections})
+
+            done_event = {
+                'type': 'done',
+                'total_sections': len(target_sections),
+                'success_count': success_count,
+                'failed_count': len(target_sections) - success_count,
+                'total_orig_chars': total_orig,
+                'total_new_chars': total_new,
+                'compression_ratio': round(total_new / total_orig, 3) if total_orig else 0,
+            }
+            yield f"data: {json.dumps(done_event, ensure_ascii=False)}\n\n"
+
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': f'精简异常: {str(e)}'}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.post("/agent/projects/{project_id}/auto-generate")
 async def agent_auto_generate(
     project_id: str,
@@ -960,7 +1145,15 @@ async def agent_upload_attachment(
     })
 
     # 更新Agent状态
-    await agent.aupdate_state(config, {"attachments": attachments})
+    # 用 try/except 包裹：aupdate_state 在某些 LangGraph 版本下仍可能抛错，
+    # 把错误信息返回到响应体方便前端定位，同时打印完整 traceback 到终端。
+    import traceback as _tb
+    try:
+        await agent.aupdate_state(config, {"attachments": attachments}, as_node="after_tools")
+    except Exception as e:
+        err_tb = _tb.format_exc()
+        print(f"[agent_upload_attachment] aupdate_state 失败:\n{err_tb}")
+        raise HTTPException(status_code=500, detail=f"状态更新失败: {type(e).__name__}: {e}")
 
     return {
         "success": True,
@@ -1027,7 +1220,13 @@ async def agent_delete_attachment(project_id: str, file_id: str):
     if len(attachments) == original_count:
         raise HTTPException(status_code=404, detail="附件不存在")
 
-    await agent.aupdate_state(config, {"attachments": attachments})
+    import traceback as _tb
+    try:
+        await agent.aupdate_state(config, {"attachments": attachments}, as_node="after_tools")
+    except Exception as e:
+        err_tb = _tb.format_exc()
+        print(f"[agent_delete_attachment] aupdate_state 失败:\n{err_tb}")
+        raise HTTPException(status_code=500, detail=f"状态更新失败: {type(e).__name__}: {e}")
 
     return {
         "success": True,

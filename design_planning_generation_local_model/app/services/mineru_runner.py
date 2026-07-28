@@ -30,6 +30,18 @@ sys.path.insert(0, str(project_root))
 # 必须在任何 torch/transformers 相关 import 之前设置
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+# Windows 子进程 stdout/stderr 默认 cp936/gbk 编码，无法输出 ₹/✓ 等非 GBK 字符，
+# 会导致 print(json.dumps(..., ensure_ascii=False)) 抛 UnicodeEncodeError 子进程退出码 1，
+# 父进程收到空输出回退本地解析器。强制 utf-8 编码，errors="replace" 保证不会因编码再次崩溃。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):
+    # Python<3.7 或 stdout 已被替换时 fallback：用 TextIOWrapper 包一层
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
 
 def main():
     if len(sys.argv) < 2:

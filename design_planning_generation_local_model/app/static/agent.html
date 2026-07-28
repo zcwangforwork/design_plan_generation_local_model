@@ -329,6 +329,29 @@
         </div>
     </div>
 
+    <!-- Summarize dialog -->
+    <div class="dialog-overlay" id="summarizeDialog">
+        <div class="dialog-box">
+            <h3>✂️ 精简文档内容</h3>
+            <p style="font-size:12px;color:#999;margin-bottom:8px">对已生成文档的每个 ### 小节由 LLM 精简，用精简后内容替换原小节。严格保留法规条款号、技术参数、表格数据和核心结论。</p>
+            <label>精简范围</label>
+            <select id="sumRange">
+                <option value="">全部章节</option>
+            </select>
+            <label>精简模式</label>
+            <select id="sumMode" onchange="onSumModeChange()">
+                <option value="ratio">比例模式（按压缩比例）</option>
+                <option value="words">字数模式（按目标字数）</option>
+            </select>
+            <label id="sumTargetLabel">压缩比例 (0.1-1.0，0.5 表示压缩到 50%)</label>
+            <input id="sumTarget" type="number" value="0.5" step="0.1" min="0.1" max="1.0">
+            <div class="dialog-btns">
+                <button class="btn-cancel" onclick="closeSummarizeDialog()">取消</button>
+                <button class="btn-start" id="btnStartSummarize" onclick="startSummarize()">开始精简</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Main: Chat Area -->
     <div class="main">
         <div class="main-header">
@@ -336,6 +359,7 @@
             <span class="badge" id="projectBadge">新项目</span>
             <span style="flex:1"></span>
             <button id="autoGenBtn" onclick="showAutoGenDialog()" style="padding:6px 14px;background:#4caf50;color:#fff;border:none;border-radius:6px;font-size:12px;cursor:pointer;margin-right:12px">⚡ 一键生成</button>
+            <button id="summarizeBtn" onclick="showSummarizeDialog()" style="padding:6px 14px;background:#ff9800;color:#fff;border:none;border-radius:6px;font-size:12px;cursor:pointer;margin-right:12px;display:none">✂ 精简文档</button>
             <a href="#" id="reviewLink" style="font-size:12px;color:#1976d2;text-decoration:none;margin-right:16px;display:none">审阅文档</a>
             <a href="#" id="downloadLink" style="font-size:12px;color:#1976d2;text-decoration:none;margin-right:16px;display:none" onclick="downloadDocument()">下载文档</a>
             <a href="/" style="font-size:12px;color:#999;text-decoration:none">旧版表单 →</a>
@@ -737,6 +761,159 @@ function editAndResume() {
             window.open('/api/agent/projects/' + PROJECT_ID + '/download', '_blank');
         }
 
+        // ========== 精简文档功能 ==========
+        function showSummarizeDialog() {
+            // 动态填充章节列表
+            const sel = document.getElementById('sumRange');
+            sel.innerHTML = '<option value="">全部章节</option>';
+            const sections = window._generatedSections || [];
+            sections.forEach(name => {
+                const opt = document.createElement('option');
+                opt.value = name;
+                opt.textContent = name;
+                sel.appendChild(opt);
+            });
+            document.getElementById('summarizeDialog').style.display = 'flex';
+            onSumModeChange();
+        }
+
+        function closeSummarizeDialog() {
+            document.getElementById('summarizeDialog').style.display = 'none';
+        }
+
+        function onSumModeChange() {
+            const mode = document.getElementById('sumMode').value;
+            const label = document.getElementById('sumTargetLabel');
+            const input = document.getElementById('sumTarget');
+            if (mode === 'ratio') {
+                label.textContent = '压缩比例 (0.1-1.0，0.5 表示压缩到 50%)';
+                input.type = 'number';
+                input.value = 0.5;
+                input.step = '0.1';
+                input.min = '0.1';
+                input.max = '1.0';
+            } else {
+                label.textContent = '目标字数 (每章目标字数，按小节比例分配)';
+                input.type = 'number';
+                input.value = 2000;
+                input.step = '100';
+                input.min = '200';
+                input.max = '20000';
+            }
+        }
+
+        async function startSummarize() {
+            const mode = document.getElementById('sumMode').value;
+            const target = parseFloat(document.getElementById('sumTarget').value);
+            const sectionName = document.getElementById('sumRange').value;
+
+            // 参数校验
+            if (mode === 'ratio' && (target < 0.1 || target > 1.0)) {
+                alert('比例模式下 target 应在 0.1~1.0 之间');
+                return;
+            }
+            if (mode === 'words' && (target < 200)) {
+                alert('字数模式下 target 应不小于 200');
+                return;
+            }
+
+            closeSummarizeDialog();
+
+            // 在聊天区显示精简任务开始
+            const summaryLabel = sectionName ? `章节「${sectionName}」` : '全部章节';
+            const modeLabel = mode === 'ratio' ? `压缩到 ${target * 100}%` : `每章目标 ${target} 字`;
+            appendMessage('user', `✂️ 精简文档：${summaryLabel}，模式：${modeLabel}`);
+
+            const agentDiv = appendMessage('agent', `<div>⏳ 精简任务启动中...</div>`);
+            document.getElementById('summarizeBtn').disabled = true;
+
+            try {
+                const formData = new FormData();
+                formData.append('mode', mode);
+                formData.append('target', target);
+                formData.append('section_name', sectionName);
+
+                const response = await fetch(`/api/agent/projects/${PROJECT_ID}/summarize`, {
+                    method: 'POST',
+                    body: formData,
+                });
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                let progressHtml = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        let data;
+                        try { data = JSON.parse(line.slice(6)); } catch (e) { continue; }
+
+                        switch (data.type) {
+                            case 'start':
+                                progressHtml = `<div style="margin-bottom:8px">📋 精简任务已启动</div>` +
+                                    `<div style="font-size:12px;color:#666;margin-bottom:6px">模式: ${data.mode} | 总章节: ${data.total_sections} | 每章目标: ${data.per_section_target}</div>` +
+                                    `<div id="sumProgressList"></div>`;
+                                agentDiv.innerHTML = progressHtml;
+                                break;
+
+                            case 'section_start':
+                                const list = document.getElementById('sumProgressList');
+                                if (list) {
+                                    const item = document.createElement('div');
+                                    item.id = `sum-prog-${data.index}`;
+                                    item.style.cssText = 'padding:4px 0;font-size:12px;color:#555';
+                                    item.innerHTML = `<span style="color:#999">[${data.index}/${data.total}]</span> ⏳ 正在精简「${data.section_name}」...`;
+                                    list.appendChild(item);
+                                }
+                                break;
+
+                            case 'section_done':
+                                const item = document.getElementById(`sum-prog-${data.index}`);
+                                if (item) {
+                                    const ratio = data.orig_chars > 0 ? Math.round(data.new_chars / data.orig_chars * 100) : 0;
+                                    const icon = data.status === 'ok' ? '✅' : '⚠️';
+                                    const subInfo = data.subsections_count > 0
+                                        ? `（${data.success_count}/${data.subsections_count} 小节成功）`
+                                        : '';
+                                    item.innerHTML = `<span style="color:#999">[${data.index}/${data.total}]</span> ${icon} 「${data.section_name}」 ${data.orig_chars}→${data.new_chars} 字 (${ratio}%) ${subInfo}`;
+                                    item.style.color = data.status === 'ok' ? '#2e7d32' : '#d32f2f';
+                                }
+                                break;
+
+                            case 'done':
+                                const totalRatio = data.total_orig_chars > 0
+                                    ? Math.round(data.total_new_chars / data.total_orig_chars * 100)
+                                    : 0;
+                                agentDiv.innerHTML += `<div style="margin-top:10px;padding:8px;background:#e8f5e9;border-radius:6px;font-size:13px">` +
+                                    `🎉 精简完成！${data.success_count}/${data.total_sections} 章节成功，` +
+                                    `总计 ${data.total_orig_chars} → ${data.total_new_chars} 字 (${totalRatio}%)` +
+                                    `</div>`;
+                                break;
+
+                            case 'error':
+                                agentDiv.innerHTML += `<div style="margin-top:8px;padding:6px;background:#ffebee;color:#c62828;border-radius:4px;font-size:12px">❌ ${data.message}</div>`;
+                                break;
+                        }
+                        document.getElementById('chatArea').scrollTop = document.getElementById('chatArea').scrollHeight;
+                    }
+                }
+            } catch (e) {
+                agentDiv.innerHTML += `<div style="color:#c62828;font-size:12px;margin-top:8px">❌ 精简请求失败: ${e.message}</div>`;
+            } finally {
+                document.getElementById('summarizeBtn').disabled = false;
+                // 刷新状态以反映精简后的章节内容
+                setTimeout(() => fetchState(), 500);
+            }
+        }
+
         function showError(msg) {
             const area = document.getElementById('chatArea');
             const div = document.createElement('div');
@@ -1087,6 +1264,10 @@ function editAndResume() {
                     const hasSections = sections.length > 0;
                     document.getElementById('downloadLink').style.display = hasSections ? 'inline' : 'none';
                     document.getElementById('reviewLink').style.display = hasSections ? 'inline' : 'none';
+                    // 精简按钮：仅在有已生成章节时显示
+                    document.getElementById('summarizeBtn').style.display = hasSections ? 'inline-block' : 'none';
+                    // 缓存当前章节列表供精简对话框使用
+                    window._generatedSections = sections;
                     // Capture current doc_type label for quick download box
                     const docType = data.state?.document_generation?.doc_type || 'design_development_plan';
                     const docLabels = {

@@ -858,3 +858,294 @@ MinerU 启用 GPU 后，首次加载模型 + 多页推理可能超过原 30 秒�
 - 附件上传接口 `/api/agent/upload/{project_id}` 的同步等待时间从 30 秒延长到 5 分钟。
 - 足以覆盖 GPU 首次加载模型（10-30秒）+ 中等文档推理（10-50页 × 1-5秒/页）。
 - 超过 5 分钟的极大文档仍会超时，届时可考虑改异步上传方案。
+
+## 2026-07-23 - Bug 修复：附件上传 LangGraph Ambiguous Update 错误
+
+### 上下文
+- 触发现象：上传 xlsx 文件（`upload_6eca3966-8ec.xlsx`）时，MinerU 解析成功（3 段落，3258 字符），向量化成功（3/3），但最后状态更新步骤抛 `langgraph.errors.InvalidUpdateError: Ambiguous update, specify as_node`，HTTP 500。
+- 错误链路：`app/api/routes.py:1148 agent_upload_attachment -> agent.aupdate_state(config, {"attachments": attachments})`。
+
+### Analysis
+- Topic: LangGraph `aupdate_state` 在无 `as_node` 时的归属节点推断
+- Finding: `AgentState`（`app/services/agent_state.py:17`）用 `TypedDict(total=False)`，所有字段可选；`attachments` 字段（`agent_state.py:68`）声明为 `list[dict]`，**无 reducer**（不像 `messages` 用 `add_messages`），默认行为是覆盖。图（`agent_engine.py:342-369`）4 个节点（agent/pre_tools/tools/after_tools）的返回 dict 都不显式输出 `attachments`，但 LangGraph 1.x 在 total=False 的 schema 下无法唯一推断归属节点，抛 ambiguous。
+- Decision: 给两处 `aupdate_state` 调用（上传 `routes.py:1148`、删除 `routes.py:1215`）显式传 `as_node="agent"`，跳过自动推断，直接把 `attachments` 当作 agent 节点输出覆盖到 checkpoint。`as_node` 值选用 `"agent"` 因为它是图中的核心节点，且 `_sync_attachment_context`（`agent_engine.py:321-326`）本就在该节点入口读取 attachments，逻辑自洽。
+
+### File Edited
+- File: `app/api/routes.py`
+- Change:
+  - line 1148（上传附件）：`aupdate_state(config, {"attachments": attachments})` -> `aupdate_state(config, {"attachments": attachments}, as_node="agent")`，并补充 3 行注释说明原因
+  - line 1215（删除附件）：同样补 `as_node="agent"`
+- Result: Success - 语法验证通过（`python -c "import ast; ast.parse(...)"` -> SYNTAX OK）
+- 备注：另外两处 `aupdate_state`（`routes.py:674`、`routes.py:691`，更新 `generated_sections`）暂未改：`_after_tools_node` 节点显式返回 `generated_sections`（`agent_engine.py:282`），LangGraph 应能唯一推断；如后续也报 ambiguous 再同法修复。
+
+### Next Steps
+- 用户重新上传 xlsx 验证 500 错误是否消除。
+- 验证附件删除接口（DELETE `/api/agent/projects/{id}/attachments/{file_id}`）也正常。
+- 若运行后发现 `generated_sections` 相关接口也报 ambiguous，再补 `as_node` 修复。
+
+## 2026-07-23 - Bug 修复：as_node="agent" 触发路由 + MinerU 子进程 gbk 编码崩溃
+
+### 上下文
+- 上一轮修复（as_node="agent"）后重启服务再测，xlsx 上传仍 500，但错误变了：
+  - `ValueError: No messages found in input state to tool_edge: {'attachments': [...], 'messages': []}`
+  - 堆栈：`aupdate_state -> abulk_update_state -> aperform_superstep -> run.ainvoke -> _aroute -> tools_condition -> ValueError`
+- 日志同时显示 MinerU 子进程崩溃：`UnicodeEncodeError: 'gbk' codec can't encode character '\u20b9'`（₹ 印度卢比），MinerU 回退到本地解析器。
+
+### Analysis
+- Topic 1: as_node="agent" 为何触发 tools_condition
+- Finding 1: 查 LangGraph 文档（https://docs.langchain.com/oss/python/langgraph/use-time-travel#from-a-specific-node）确认：`update_state(values, as_node=X)` 会用 X 节点的 writer 链应用更新，**writer 链包含该节点后面的条件路由 path 函数**（因为路由依赖节点输出）。agent 节点后面是 `add_conditional_edges("agent", tools_condition, ...)`（agent_engine.py:354-361），所以 writer 链包含 tools_condition。aupdate_state 内部执行 writer 链时触发 tools_condition，它检查 `messages[-1].tool_calls`，但只传了 attachments（messages 为空）-> ValueError。
+- Decision 1: 改用 `as_node="after_tools"`。after_tools 节点后面是无条件边 `add_edge("after_tools", "agent")`（agent_engine.py:368），writer 链不含路由函数，不会触发 tools_condition；也不会触发 LLM 调用（aupdate_state 只写 checkpoint，不执行下一 superstep）。下次 ainvoke 时从 agent 节点恢复，会读到最新 attachments（符合预期）。这也解释了 routes.py:674/691 的 `aupdate_state({"generated_sections": ...})` 不报错：`_after_tools_node` 显式输出 generated_sections（agent_engine.py:282），LangGraph 无 as_node 时能唯一推断到 after_tools 节点。
+
+- Topic 2: MinerU 子进程 gbk 编码崩溃
+- Finding 2: mineru_runner.py:62 `print(json.dumps(result, ensure_ascii=False))` 在 Windows 子进程中执行，stdout 默认 gbk/cp936 编码，无法编码 `\u20b9`（₹）等非 GBK 字符，抛 UnicodeEncodeError，子进程退出码 1，父进程收到空输出回退本地解析器。
+- Decision 2: 在 mineru_runner.py 开头（import 后）`sys.stdout.reconfigure(encoding="utf-8", errors="replace")` + stderr 同样处理。父进程 `_decode_subprocess_output`（mineru_service.py:105-120）已支持 utf-8 解码，兼容。带 try/except 兜底 Python<3.7 用 io.TextIOWrapper 替换。
+
+### File Edited
+- File 1: `app/api/routes.py`
+  - line 1148-1154（上传附件）：`as_node="agent"` -> `as_node="after_tools"`，注释扩充解释为何不能用 agent
+  - line 1217（删除附件）：同样 `as_node="agent"` -> `as_node="after_tools"`
+  - Result: Success - 语法验证 SYNTAX OK
+
+- File 2: `app/services/mineru_runner.py`
+  - line 24-32：import 后新增 stdout/stderr reconfigure 为 utf-8，带 try/except 兜底
+  - Result: Success - 语法验证 SYNTAX OK
+
+### Next Steps
+- 用户重启服务，重新上传包含 ₹ 等非 GBK 字符的 xlsx，验证：
+  1. MinerU 子进程不再因编码崩溃（应看到"[MinerU] 解析完成"而非"回退到本地解析器"）
+  2. 上传接口返回 200 + success:true
+  3. 附件删除接口也正常
+- 若 generated_sections 相关接口（routes.py:674/691）后续也报 ambiguous，再补 as_node
+
+## 2026-07-23 15:23:54 - Bug 修复（重新应用）：MinerU gbk 编码崩溃 + aupdate_state ambiguous（源码丢失后重新落地）
+
+### 上下文
+- 用户报告上传 xlsx/docx 附件时 500 错误，日志显示两类问题：
+  1. `[MinerU] 子进程退出码 1 ... UnicodeEncodeError: 'gbk' codec can't encode character '\u20b9'/'\u2713'`，MinerU 回退本地解析器
+  2. `langgraph.errors.InvalidUpdateError: Ambiguous update, specify as_node` at `routes.py:1148`
+- 排查发现：2026-07-23 早前两轮修复（日志第 862-918 行）的决策正确，但**当前源码中修复未生效**--`mineru_runner.py` 无 stdout reconfigure，`routes.py:1148/1215` 无 `as_node`。与该项目 7 月 10 日出现的"源码丢失"现象吻合，需重新应用。
+
+### Analysis
+- Topic 1: MinerU 子进程编码
+- Finding 1: `mineru_runner.py:62 print(json.dumps(result, ensure_ascii=False))` 在 Windows 子进程执行，stdout 默认 cp936/gbk，无法编码 ₹(U+20B9)/✓(U+2713) 等字符 -> UnicodeEncodeError -> 子进程退出码 1 -> 父进程 `_decode_subprocess_output` 收到空输出回退本地解析器。
+- Decision 1: 在 import 后、main() 前 `sys.stdout.reconfigure(encoding="utf-8", errors="replace")` + stderr 同样，带 try/except 兜底 Python<3.7 用 `io.TextIOWrapper` 替换。父进程已支持 utf-8 解码，兼容。
+
+- Topic 2: aupdate_state as_node 选型
+- Finding 2: `AgentState` 为 `TypedDict(total=False)`，`attachments` 字段无 reducer，4 节点（agent/pre_tools/tools/after_tools）都不显式输出 attachments，LangGraph 无 as_node 时无法唯一推断归属 -> ambiguous。不能用 `as_node="agent"`：agent 节点后接 `add_conditional_edges("agent", tools_condition, ...)`（agent_engine.py:354-361），writer 链会触发 tools_condition 检查 `messages[-1].tool_calls`，只传 attachments 时 messages 为空 -> `ValueError: No messages found in input state to tool_edge`。
+- Decision 2: 用 `as_node="after_tools"`。after_tools 节点后是无条件边 `add_edge("after_tools", "agent")`（agent_engine.py:368），writer 链不含路由函数，不触发 tools_condition；aupdate_state 只写 checkpoint 不执行下一 superstep，下次 ainvoke 从 agent 节点恢复会读到最新 attachments。
+
+### File Edited
+- File 1: `app/services/mineru_runner.py` L33-43
+  - Change: import 后新增 stdout/stderr reconfigure 为 utf-8（errors="replace"），带 try/except 兜底 io.TextIOWrapper
+  - Result: Success - `python -c "import ast; ast.parse(...)"` -> SYNTAX OK
+
+- File 2: `app/api/routes.py` L1148, L1215
+  - Change: 两处 `aupdate_state(config, {"attachments": attachments})` -> `aupdate_state(config, {"attachments": attachments}, as_node="after_tools")`（replace_all 一次命中两处）
+  - Result: Success - SYNTAX OK
+
+### Next Steps
+- 用户重启 FastAPI 服务，重新上传含 ₹/✓ 等非 GBK 字符的 xlsx/docx 验证：
+  1. 日志应显示"[MinerU] 解析完成"而非"回退到本地解析器"
+  2. 上传接口返回 200 + success:true（不再 500 ambiguous）
+  3. 附件删除接口（DELETE）也正常
+- 若 generated_sections 相关接口（routes.py:674/691）后续报 ambiguous，同法补 `as_node="after_tools"`
+
+## 2026-07-23 15:45:00 - 诊断增强：aupdate_state 加 try/except 暴露真实错误
+
+### 上下文
+- 用户重启服务后重新上传 xlsx/docx 仍 500，但终端只显示 `[MinerU] 开始解析` + `500 Internal Server Error`，无 traceback。
+- 用户在浏览器 Network 面板看到 `{"detail":"Method Not Allowed"}`，但这是 405 响应（看错了请求，不是那个 500 POST）。
+- 排查确认：服务确实从正确目录运行（PID 25524, `run.py` 在修复目录），无自定义异常处理器，LangGraph 版本 1.2.5。
+- 无法确认 500 根因：可能是 aupdate_state 仍报错（但无 traceback），或 HTTPException（文件提取失败/超时）。
+
+### Analysis
+- Topic: 为何看不到 500 的真实错误
+- Finding: routes.py 的 `aupdate_state` 调用无 try/except。如果是未捕获异常，FastAPI 会打印 ASGI traceback 到终端；如果是 HTTPException（如"文件提取失败"），不打印 traceback 只返回响应体。用户可能看漏了 traceback 或是 HTTPException。
+- Decision: 给上传和删除两处 `aupdate_state` 加 try/except，同时 `print(traceback)` 到终端 + `raise HTTPException(500, detail=f"状态更新失败: {type(e).__name__}: {e}")` 返回到响应体。这样无论用户看终端还是浏览器都能看到具体错误。
+
+### File Edited
+- File: `app/api/routes.py`
+  - L1147-1157（上传附件）：aupdate_state 包 try/except，print traceback + HTTPException 返回错误详情
+  - L1223-1231（删除附件）：同上
+  - Result: Success - SYNTAX OK
+
+### Next Steps
+- 服务 reload=True 自动重载，用户等几秒后重新上传附件
+- 这次 500 时查看浏览器 Network -> Response 标签页，会看到 `{"detail":"状态更新失败: ErrorType: message"}` 具体错误
+- 或查看终端，会看到 `[agent_upload_attachment] aupdate_state 失败:` + 完整 traceback
+- 根据真实错误再定位根因
+
+## 2026-07-24 - Bug 修复：精简文档比例模式无法压缩到目标比例
+
+### 上下文
+- 用户报告：精简文档时规定一个比例（如 0.5 = 压缩到 50%），实际无法精简到对应字数比例，结果往往远超目标。
+- 代码链路：`summarize_document` -> `summarize_section` -> `_summarize_one_subsection`（agent_tools.py:1528+）
+
+### Analysis
+- Topic: 比例模式为何压缩不到位
+- Finding: `_summarize_one_subsection` 有 4 个叠加问题：
+  1. **Prompt 太宽松**（原 line 1556）：`目标字数约 {target_chars} 字（允许±15%偏差）` - "约"和"±15%偏差"给 LLM 过冲许可
+  2. **重试条件太严**（原 line 1621）⭐主因：`if new_chars > target_chars * 1.5 and new_chars > orig_chars * 0.8` - 两条件同时满足才重试。例：原文500字、比例0.5、目标250字，LLM返回350字(70%)：350 > 375? 否 -> 不重试，70%被静默接受
+  3. **只重试一次**（原 line 1622-1647）：即使触发重试也只一次，第二次仍过冲直接接受
+  4. **无硬截断兜底**：所有 LLM 尝试失败后无按句子边界截断的兜底
+- Decision: 修改 `_summarize_one_subsection`（1 文件约 60 行）：
+  1. Prompt 收紧：`严格控制在 {target_chars} 字以内，最多不超过 {hard_limit} 字`（hard_limit = target × 1.15）
+  2. 重试条件放宽：`new_chars > target_chars * 1.2`（超目标 20% 就重试，去掉 `and orig_chars * 0.8`）
+  3. 迭代重试：最多 3 轮（2 次重试），每轮 prompt 更激进，temperature 降至 0.1，只在比上轮更好时接受
+  4. 硬截断兜底：3 轮后仍超 `target × 1.3`，调用新增的 `_truncate_at_boundary` 按句子边界（。！？；\n）截断
+
+### File Edited
+- File: `app/services/agent_tools.py`
+  - 新增 `_truncate_at_boundary(text, max_chars)` 函数（在 `_count_chinese_chars` 后）：按句子边界截断，保留表格/代码块完整性，目标 max_chars × 1.15 以内
+  - 修改 `_summarize_one_subsection`：
+    - L1589: 新增 `hard_limit = int(target_chars * 1.15)`
+    - L1594: prompt 从"约 target_chars 字（±15%偏差）"改为"严格控制在 target_chars 字以内，最多不超过 hard_limit 字"
+    - L1626: user_prompt 同步收紧
+    - L1655-1700: 单次重试改为 3 轮迭代重试（超 target×1.2 重试，每轮更激进，temperature=0.1，只在更好时接受）
+    - L1702-1709: 新增硬截断兜底（3 轮后仍超 target×1.3 调用 _truncate_at_boundary）
+  - Result: Success - SYNTAX OK
+
+### Impact
+- 比例模式精度提升：从"LLM 返回 70% 却被接受"变为"3 轮迭代 + 硬截断保证不超过 target×1.3"
+- 温度从 0.2 降至 0.1（重试轮）：减少 LLM 随机性，提高压缩一致性
+- 硬截断兜底保证最坏情况下也不会超 target×1.3（之前可能超 target×1.5 甚至不压缩）
+- summarize_document 和 summarize_section 均受益（都调用 _summarize_one_subsection）
+
+### Next Steps
+- 用户重启服务后测试比例模式精简（如 ratio=0.5），查看终端日志的 `compression_ratio` 是否接近 0.5
+- 若 LLM 在 3 轮内达标，不会触发硬截断（理想情况）
+- 若 LLM 持续过冲，会看到 `第N轮精简不足` + `硬截断兜底` 日志
+- 如硬截断导致内容不完整，可考虑调整截断边界策略或增大 target×1.3 阈值
+
+## 2026-07-24 - 诊断增强：精简功能所有小节 100% 失败，加错误日志暴露根因
+
+### 上下文
+- 用户测试比例模式精简（ratio=0.3, 8 章节），所有章节 `0/N 小节成功`，字数 `19164 -> 19164 (100%)`，完全没压缩。
+- 意味着所有 `_summarize_one_subsection` 调用都返回了 error status，回退保留原文。
+- 检查发现 Ollama 服务正常运行（`http://localhost:11435`），`qwen3.5:122b` 模型可用。
+- 根因不明：异常处理器和空响应分支都**静默吞掉错误**，不打印任何信息。
+
+### Analysis
+- Topic: 为何所有小节精简都失败
+- Finding: `_summarize_one_subsection`（agent_tools.py:1580+）有 3 个静默失败路径：
+  1. LLM 空响应（line 1642-1646）：`if not response: return error` 无 print
+  2. asyncio.TimeoutError（line 1711-1715）：返回 error 无 print
+  3. 通用 Exception（line 1716-1720）：返回 error 无 print
+- 可能原因（需终端日志确认）：
+  a. **180s 超时**：qwen3.5:122b 是 122B 参数大模型，4 并发（Semaphore(4)）可能不够，每请求可能超 180s
+  b. **空响应**：模型返回空内容或响应格式不符
+  c. **API 错误**：连接/解析异常
+- Decision: 给 3 个静默失败路径都加 print，暴露真实错误。用户重跑后终端会显示具体失败原因。
+
+### File Edited
+- File: `app/services/agent_tools.py`
+  - L1642-1650（空响应分支）：加 print 显示小节名、目标字数、原文字数、Ollama URL 和模型名
+  - L1715-1726（TimeoutError 分支）：加 print 显示小节名和目标字数
+  - L1727-1733（Exception 分支）：加 print 显示小节名、错误类型和消息
+  - Result: Success - SYNTAX OK
+
+### Next Steps
+- 用户重新运行精简（ratio 模式），查看终端日志：
+  - `[summarize_section] LLM空响应` -> API 返回空，检查 Ollama 模型配置
+  - `[summarize_section] LLM超时(180秒)` -> 122B 模型太慢，考虑增大超时或降并发
+  - `[summarize_section] LLM调用异常` -> 其他错误，根据类型定位
+  - `[_call_minimax_api_raw] 3次尝试后仍失败` -> API 连接/响应错误
+- 根据真实错误决定下一步：增大超时 / 降并发 / 换模型 / 修响应解析
+## 2026-07-24 11:25:00 - Analysis
+- Topic: 比例模式下无法压缩到目标比例的根因分析
+- Finding: 在 app/services/agent_tools.py 找到 5 个根因叠加：
+  1. [关键] _summarize_one_subsection:1588 + summarize_section:1845 固定 80 字保底，对短小节破坏比例（如 100 字小节 ratio=0.3 → 实际 80%）
+  2. [关键] _summarize_one_subsection:1637/1681 max_tokens 下限 2048 过高，小目标时 LLM 输出空间远超 3× target
+  3. [中] _summarize_one_subsection:1664/1700 + _truncate_at_boundary:1538 硬截断阈值 1.3× / 1.15× 偏高
+  4. [中] summarize_section:1894 失败小节保留原文且无再平衡机制（如 5 节中 1 节失败时总比例从 0.3 变 0.44）
+  5. [弱] 系统 prompt "必须保留法规条款/技术参数/表格" 与激进压缩（ratio<0.5）冲突
+- Decision: 推荐方案 A 最小修复（80字保底改比例化保底 + max_tokens 收紧 + 硬截断阈值降到 1.15 + 失败再平衡）
+
+## 2026-07-24 11:35:00 - File Edited
+- File: `E:\nrf_sample_codes\working_team_work\public\project\git_project\design_plan_generation_local_model\design_planning_generation_local_model\app\services\agent_tools.py`
+- Change: 修复比例模式无法压缩到目标比例的 bug，4 个修改点：
+  1. L1585-1597 _summarize_one_subsection 函数签名增加 is_ratio_mode/aggressive 参数；80 字保底改为 min(40, 原字数×0.9) 比例化保底
+  2. L1631-1641 system_prompt 在 aggressive 模式下追加 '紧急要求' 强化指令段
+  3. L1643-1656 max_tokens：is_ratio_mode=True 时用 max(int(target*2), 256) 替代 2048 下限（避免小目标时 LLM 输出过大）
+  4. L1685-1732 重试/硬截断阈值从 1.2×/1.3× 收紧到 1.15×
+  5. L1538-1556 _truncate_at_boundary 内部 limit 从 1.15 改为 1.05
+  6. L1857-1880 summarize_section ratio 模式目标分配：80 字保底改为 min(40, oc×0.9) 比例化保底，并传 is_ratio_mode=True
+  7. L1881-1962 增加 '比例模式失败再平衡' 逻辑：当 new_total > orig_total×ratio×1.15 时对超目标 15% 的小节触发二次精简（aggressive=True）
+- Result: Success - 语法验证 OK，pytest 38/38 通过
+
+## 2026-07-24 11:35:00 - File Edited
+- File: `E:\nrf_sample_codes\working_team_work\public\project\git_project\design_plan_generation_local_model\design_planning_generation_local_model\tests\test_summarize.py`
+- Change: 1) 更新 2 个旧测试反映新行为（test_min_target_chars_enforced: 80→3 比例化保底；test_words_mode_allocates_budget_proportionally: 适配 '严格控制在 N 字' prompt 格式）；2) 新增 6 个 TestRatioModeFixes 回归测试：短小节不被扩展、max_tokens 收紧、硬截断阈值、失败再平衡、aggressive prompt 强化、整体偏差 < 15%
+- Result: Success - pytest 38/38 通过（含 6 个新测试）
+## 2026-07-24 11:30:00 - Bash Command Executed
+- Command: `python -c "import ast; ast.parse(open(r'E:\nrf_sample_codes\working_team_work\public\project\git_project\design_plan_generation_local_model\design_planning_generation_local_model\app\services\agent_tools.py', encoding='utf-8').read()); print('SYNTAX OK')"`
+- Working Dir: `E:\nrf_sample_codes\working_team_work\code_writer`
+- Purpose: 验证修复后 agent_tools.py 语法
+- Result: Success - SYNTAX OK（conda 激活线程有 gbk 解码噪音但不影响结果）
+
+## 2026-07-24 11:31:00 - Bash Command Executed
+- Command: `python -m pytest tests/test_summarize.py -v --tb=short`
+- Working Dir: `E:\nrf_sample_codes\working_team_work\public\project\git_project\design_plan_generation_local_model\design_planning_generation_local_model`
+- Purpose: 跑现有 test_summarize 测试，验证修复无 regression
+- Result: 30/30 PASS（最初 2 个失败后已更新旧测试断言）
+
+## 2026-07-24 11:35:00 - Bash Command Executed
+- Command: `python -m pytest tests/ -v --tb=short --ignore=tests/test_agent.py`
+- Working Dir: `E:\nrf_sample_codes\working_team_work\public\project\git_project\design_plan_generation_local_model\design_planning_generation_local_model`
+- Purpose: 跑全量测试（test_agent.py 排除因需要 Ollama 在线）
+- Result: 72/72 PASS（test_summarize 38 + test_attachment 20 + test_prompt_eval + test_rerank_ab + test_agent_search）
+
+
+## 2026-07-24 16:19:38 - Bug 修复：精简文档功能字数未变化（LLM num_predict 太小返回空响应）
+
+### 上下文
+- 用户报告："选择精简文档后，字数没有改变"
+- 上轮 7-24 加了 print 错误日志后跑测试：所有章节 0/N 小节成功，总字数 19164 → 19164 (100%)，完全没压缩
+- 检查 Ollama 服务正常（`http://localhost:11435`），`qwen3.5:122b` 模型可用
+- 实际根因未明
+
+### Analysis
+- Topic: 为何所有小节精简都返回 error status，LLM 输出为空
+- Finding: 用 curl 直接测试 Ollama `/api/chat` 接口，**实测 qwen3.5:122b 模型存在严重 num_predict bug**：
+  - num_predict=200/400/1024/2048/4096 → done_reason="length"，content **完全为空**，但 eval_count 达到 num_predict 上限
+  - num_predict=16384/32768/不设（默认）→ done_reason="stop"，content 正常返回 58-68 字
+  - 实测：qwen3.5:122b 在 num_predict < 16384 时会消耗所有 tokens 但不输出可见内容（疑似 thinking/reasoning tokens 占用全部预算，无余量输出 visible content）
+  - 对比测试：deepseek-r1:70b 用相同 prompt 正常返回 93 字（done_reason="stop"）
+- Decision: 选定方案 1（提高 num_predict 上限）：
+  1. `app/services/minimax.py` `_call_minimax_api_raw`: 默认 `max_tokens` 4096 → 16384
+  2. `app/services/agent_tools.py` `_summarize_one_subsection`: 比例模式上限 4096 → 16384；非比例模式上限 8192 → 16384
+  3. `tests/test_summarize.py::test_max_tokens_tightened_in_ratio_mode`: 更新断言 400→16384
+- 备选方案：切换 deepseek-r1:70b 模型（用户已选方案1）
+
+### File Edited
+- File 1: `app/services/minimax.py` L21-41
+  - Change: `_call_minimax_api_raw` 参数 `max_tokens: int = 4096` → `max_tokens: int = 16384`，docstring 补充说明
+  - Result: Success - SYNTAX OK
+- File 2: `app/services/agent_tools.py` L1647-1656
+  - Change: `_summarize_one_subsection` max_tok 计算：
+    - 旧：比例 `min(max(int(target_chars * 2), 256), 4096)` / 非比例 `min(max(target_chars * 3, 2048), 8192)`
+    - 新：比例 `min(max(int(target_chars * 3), 16384), 16384)` / 非比例 `min(max(target_chars * 3, 16384), 16384)`
+    - 加注释说明 qwen3.5:122b thinking tokens 占用
+  - Result: Success - SYNTAX OK
+- File 3: `tests/test_summarize.py` L709-751
+  - Change: `test_max_tokens_tightened_in_ratio_mode` 断言更新为 max_tokens ∈ [16384, 16384]（不再 <=512）
+  - Result: Success
+
+### Verification
+- 单元测试：38/38 全部通过（`pytest tests/test_summarize.py -v`）
+- 真实 LLM 调用测试：`_summarize_one_subsection` ratio mode (target=200字)
+  - 旧 (max_tokens=200-4096): status=error, LLM空响应
+  - 新 (max_tokens=16384): **status=ok, orig_chars=170 → new_chars=121** ✅ 字数真正减少
+
+### Impact
+- 精简功能恢复正常：所有小节能成功生成精简内容
+- 副作用：单次 LLM 调用时间从 ~3s 增加到 ~55s（要等够 16384 tokens 预算），但这是 qwen3.5:122b 模型本身特性
+- 4 并发（`_llm_semaphore`）保持不变，8 章节 5 小节/章 ≈ 40 调用 / 4 并发 ≈ 10 批 × 55s ≈ 9 分钟（用户需耐心等待）
+
+### Next Steps
+- 用户重启服务（FastAPI 有 reload=True 应自动重载）后测试精简
+- 终端应能看到 `[summarize_section] '章节名': N/N subsections summarized, X -> Y chars (Z%)` 而非 `LLM空响应`
+- 比例模式（如 ratio=0.3）应能看到总比例接近 0.3（±15%）
+- 若 LLM 仍然很慢（每个小节 55s），可考虑：
+  - 减少 `_llm_semaphore` 并发（4 → 2）防止 OOM
+  - 或切换到 deepseek-r1:70b（响应 32.9s/93字，比 qwen3.5:122b 快 40%）

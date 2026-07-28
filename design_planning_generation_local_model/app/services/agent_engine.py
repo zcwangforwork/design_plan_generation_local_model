@@ -247,6 +247,24 @@ async def _after_tools_node(state: AgentState) -> dict:
                 print(f"[agent_engine] Subagent wrote '{chapter_name}' "
                       f"({len(content)} chars)")
 
+        # ── 新增: summarize_section 结果处理 ──
+        # 与 write_chapter 类似：从 _pending_chapter_contents 旁路读取精简后完整内容，
+        # 用精简后内容替换 generated_sections[section_name]
+        if tool_name == "summarize_section":
+            section_name = tool_args.get("section_name", "")
+            if section_name:
+                from app.services.agent_tools import get_pending_chapter_content
+                pending = get_pending_chapter_content(section_name)
+                content = pending.get("full_content", "")
+                if content:
+                    generated_sections[section_name] = content
+                    sections_updated = True
+                    print(f"[agent_engine] Summarized '{section_name}' "
+                          f"({len(content)} chars)")
+                else:
+                    print(f"[agent_engine] summarize_section '{section_name}': "
+                          f"no pending content (旁路为空，可能工具失败)")
+
         # ── 新增: update_outline 结果处理 ──
         if tool_name == "update_outline":
             outline = str(tool_msg.content)

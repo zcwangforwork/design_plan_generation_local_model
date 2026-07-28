@@ -927,7 +927,20 @@ async def design_outline(
 
 
 def _find_chapter_subsections(outline_json: str, chapter_name: str) -> list[dict]:
-    """从框架JSON中查找指定章节的小节列表。
+    """从框架JSON中查找指定章节的小节列表（支持4级层级 schema）。
+
+    支持两种 schema:
+    - 旧 schema: chapters[].subsections[] (2级，仅 ###)
+    - 新 schema: chapters[].sections[].subsections[].sub_subsections[] (4级)
+
+    返回扁平化的 leaf 小节列表，每个元素:
+    {
+        "title": "X.Y.Z 标题",         # 不含 markdown 标记
+        "level": 3 | 4 | 5,              # ### / #### / #####
+        "content_points": [...],          # 该小节的要点
+        "parent_path": "X > X.Y",         # 父级标题路径（用于上下文）
+        "markdown_prefix": "### " | "#### " | "##### ",
+    }
 
     支持模糊匹配：去除"第X章"前缀后比较，也支持章节标题包含关系。
     """
@@ -943,19 +956,63 @@ def _find_chapter_subsections(outline_json: str, chapter_name: str) -> list[dict
     # 标准化：去除"第X章"前缀
     name_clean = re.sub(r'^第[一二三四五六七八九十\d]+章\s*', '', chapter_name).strip()
 
+    target_chapter = None
     for ch in chapters:
         title = ch.get("title", "")
         title_clean = re.sub(r'^第[一二三四五六七八九十\d]+章\s*', '', title).strip()
-        # 精确匹配、包含匹配
         if (name_clean == title_clean
                 or name_clean in title_clean
                 or title_clean in name_clean
                 or chapter_name == title
                 or chapter_name in title
                 or title in chapter_name):
-            return ch.get("subsections", [])
-    return []
+            target_chapter = ch
+            break
 
+    if not target_chapter:
+        return []
+
+    # 收集 leaf 小节
+    leaf_subs = []
+
+    def _add_leaf(title: str, level: int, content_points: list, parent_path: str):
+        prefix_map = {3: "### ", 4: "#### ", 5: "##### "}
+        leaf_subs.append({
+            "title": title,
+            "level": level,
+            "content_points": content_points or [],
+            "parent_path": parent_path,
+            "markdown_prefix": prefix_map.get(level, "### "),
+        })
+
+    # 新 schema: chapters[].sections[].subsections[].sub_subsections[]
+    sections = target_chapter.get("sections", [])
+    if sections:
+        for sec in sections:
+            sec_title = sec.get("title", "")
+            sec_path = sec_title
+            subsects = sec.get("subsections", [])
+            for sub in subsects:
+                sub_title = sub.get("title", "")
+                sub_path = f"{sec_path} > {sub_title}" if sec_path else sub_title
+                sub_subsects = sub.get("sub_subsections", [])
+                if sub_subsects:
+                    # 有子小节，sub 是父级，leaf 在 sub_subsections
+                    for ssub in sub_subsects:
+                        ssub_title = ssub.get("title", "")
+                        ssub_path = f"{sub_path} > {ssub_title}" if sub_path else ssub_title
+                        _add_leaf(ssub_title, 5, ssub.get("content_points", []), ssub_path)
+                else:
+                    # 无子小节，sub 本身就是 leaf (level 4)
+                    _add_leaf(sub_title, 4, sub.get("content_points", []), sub_path)
+        return leaf_subs
+
+    # 旧 schema: chapters[].subsections[]
+    old_subsects = target_chapter.get("subsections", [])
+    for sub in old_subsects:
+        sub_title = sub.get("title", "")
+        _add_leaf(sub_title, 3, sub.get("content_points", []), "")
+    return leaf_subs
 
 @tool
 async def write_chapter(
@@ -1098,32 +1155,47 @@ async def write_chapter(
                     f"- {p}" for p in content_points
                 )
 
+            parent_path = sub.get("parent_path", "")
+            level = sub.get("level", 3)
+            markdown_prefix = sub.get("markdown_prefix", "### ")
+
+            context_hint = ""
+            if parent_path:
+                context_hint = f"（层级位置：{parent_path}）"
+
             system_prompt = (
                 f"你是一位贴敷式胰岛素泵RA文档专家。"
-                f"请编写《{doc_label}》文档中「{chapter_name}」章节下「{sub_title}」小节的内容。"
+                f"请编写《{doc_label}》文档中「{chapter_name}」章节下「{sub_title}」小节的内容{context_hint}。"
                 f"{expert_section}\n\n"
+                f"## 写作风格（参考《产品技术要求》和《软件需求规范》：精简+短句）\n"
+                f"\n"
                 f"要求:\n"
-                f"- 内容必须极其细致和具体，每个段落都要有实质性内容，不能只写框架标题\n"
-                f"- 内容专业、完整，符合NMPA注册申报要求\n"
+                f"- **每个要点 1-3 句话，单句 30-80 字，绝对不写长段落**\n"
+                f"- 大量使用 `- 项目符号` 列表项表达并列规则/参数\n"
+                f"- 每个要点风格如 \"支持X功能\"/\"参数：Y\"/\"协议：Z\"\n"
+                f"- 涉及多个数值参数时用小表格呈现（2-10 行 × 2-6 列），不要写大表格\n"
                 f"- 所有标准条款引用必须有明确的条款号\n"
-                f"- 使用Markdown格式\n"
                 f"- 技术参数要具体、可测量、有明确的数值范围\n"
                 f"- 表格要填写完整，不能留\"(描述)\"或\"待填写\"等占位符\n"
                 f"- 针对贴敷式胰岛素泵产品特性编写\n"
-                f"- 生成内容的详细程度要像实际可用于注册申报的正式文档一样\n"
                 f"- 用中文表述 (标准号和必要缩写除外)\n"
-                f"- 只生成本小节内容，不要添加章节标题（如 ## 或 ###）\n"
+                f"- 只生成本小节正文，不要添加章节标题（如 ## 或 ###）\n"
                 f"\n"
-                f"## 输出结构要求\n"
-                f"请按以下结构组织内容:\n"
-                f"1. 首先用1-2段概述本小节要点（含法规依据和产品适用性）\n"
-                f"2. 然后逐个详细阐述每个关键要求（每个要求至少200字，包含法规条款原文引用、产品参数映射、实施建议）\n"
-                f"3. 如涉及数据/参数对比，以表格形式呈现（至少3列）\n"
-                f"4. 最后用1段总结本小节的合规要点和与贴敷式胰岛素泵的关联性"
+                f"## 禁止事项\n"
+                f"- **禁止写概述段、引入段、铺垫段**\n"
+                f"- **禁止写总结段、归纳段、结尾段**\n"
+                f"- **禁止写\"本小节将介绍...\"/\"综上所述...\"等过渡句**\n"
+                f"- **禁止把同一要点展开成完整段落**\n"
+                f"\n"
+                f"## 输出结构示例（参考《产品技术要求》风格）\n"
+                f"直接写要点/列表/小表格，第一行就是实质内容（不是标题）。\n"
+                f"\n"
+                f"## 字数约束\n"
+                f"本小节总字数控制在 200-500 字之间。**宁少勿多**。"
             )
 
             user_prompt = (
-                f"请编写「{chapter_name}」→「{sub_title}」小节的内容。"
+                f"请编写「{chapter_name}」->「{sub_title}」小节的内容。"
                 f"{points_hint}\n\n"
                 f"文档框架参考:\n{outline_json}"
             )
@@ -1141,27 +1213,27 @@ async def write_chapter(
                             system_prompt=system_prompt,
                             user_prompt=user_prompt,
                             temperature=0.3,
-                            max_tokens=8192,
+                            max_tokens=2048,
                         ),
                         timeout=300.0,
                     )
                 if response:
-                    return (sub_title, response)
+                    return (sub_title, markdown_prefix, response)
                 else:
-                    return (sub_title, "[错误] 无法生成小节内容。")
+                    return (sub_title, markdown_prefix, "[错误] 无法生成小节内容。")
             except asyncio.TimeoutError:
-                return (sub_title, "[错误] 生成小节超时（300秒）。")
+                return (sub_title, markdown_prefix, "[错误] 生成小节超时（300秒）。")
             except Exception as e:
-                return (sub_title, f"[错误] 生成小节异常: {str(e)}")
+                return (sub_title, markdown_prefix, f"[错误] 生成小节异常: {str(e)}")
 
         gen_tasks = [asyncio.create_task(_gen_subsection(s)) for s in subsections]
         await asyncio.gather(*gen_tasks)
 
-        # 组装章节完整内容
+        # 组装章节完整内容（按 level 使用 ### / #### / #####）
         parts = [f"## {chapter_name}\n\n"]
         for task in gen_tasks:
-            sub_title, content = task.result()
-            parts.append(f"### {sub_title}\n\n{content}\n\n")
+            sub_title, markdown_prefix, content = task.result()
+            parts.append(f"{markdown_prefix}{sub_title}\n\n{content}\n\n")
         full_content = "".join(parts)
 
         # 统计小节生成结果
@@ -1221,23 +1293,27 @@ async def write_chapter(
             f"你是一位贴敷式胰岛素泵RA文档专家。"
             f"请编写《{doc_label}》文档中「{chapter_name}」章节的完整内容。"
             f"{expert_section}\n\n"
+            f"## 写作风格（参考《产品技术要求》和《软件需求规范》：精简+短句+多层结构）\n"
+            f"\n"
             f"要求:\n"
-            f"- 内容必须极其细致和具体，每个段落都要有实质性内容，不能只写框架标题\n"
-            f"- 内容专业、完整，符合NMPA注册申报要求\n"
+            f"- **每个要点 1-3 句话，单句 30-80 字，绝对不写长段落**\n"
+            f"- 大量使用 `- 项目符号` 列表项表达并列规则/参数\n"
+            f"- 每个要点风格如 \"支持X功能\"/\"参数：Y\"/\"协议：Z\"\n"
+            f"- 涉及多个数值参数时用小表格呈现（2-10 行 × 2-6 列）\n"
+            f"- 使用 4 级层级 Markdown: ## (章) -> ### (节) -> #### (小节) -> ##### (子小节)\n"
             f"- 所有标准条款引用必须有明确的条款号\n"
-            f"- 使用Markdown格式，标题层级清晰 (### 用于小节)\n"
             f"- 技术参数要具体、可测量、有明确的数值范围\n"
             f"- 表格要填写完整，不能留\"(描述)\"或\"待填写\"等占位符\n"
             f"- 针对贴敷式胰岛素泵产品特性编写\n"
-            f"- 生成内容的详细程度要像实际可用于注册申报的正式文档一样\n"
             f"- 用中文表述 (标准号和必要缩写除外)\n"
             f"\n"
-            f"## 输出结构要求\n"
-            f"请按以下结构组织内容:\n"
-            f"1. 首先用1-2段概述本章要点（含法规依据和产品适用性）\n"
-            f"2. 然后逐个详细阐述每个关键要求（每个要求至少200字，包含法规条款原文引用、产品参数映射、实施建议）\n"
-            f"3. 如涉及数据/参数对比，以表格形式呈现（至少3列）\n"
-            f"4. 最后用1段总结本章的合规要点和与贴敷式胰岛素泵的关联性"
+            f"## 禁止事项\n"
+            f"- **禁止写概述段、引入段、铺垫段**\n"
+            f"- **禁止写总结段、归纳段、结尾段**\n"
+            f"- **禁止把同一要点展开成完整段落**\n"
+            f"\n"
+            f"## 字数约束\n"
+            f"整章总字数控制在 800-2000 字之间。**宁少勿多**。"
         )
 
         user_prompt = (
@@ -1262,7 +1338,7 @@ async def write_chapter(
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,
                         temperature=0.3,
-                        max_tokens=8192,
+                        max_tokens=4096,
                     ),
                     timeout=300.0,
                 )
@@ -1328,6 +1404,724 @@ async def update_outline(
             "status": "error",
             "message": f"框架更新失败: {str(e)}",
         }, ensure_ascii=False)
+
+
+# ── Tool 6b: summarize_section ──
+# 小节精简工具：对已生成章节中的每个 ### 小节内容做 LLM 精简，
+# 用精简后内容替换原小节。支持字数模式（按原字数比例分配预算）和比例模式。
+# 完整内容通过 _pending_chapter_contents 旁路传递，避免大段内容进入 LLM 对话历史。
+
+# 摘要子代理实例（懒加载）
+_summary_agent = None
+
+
+def _get_summary_agent():
+    """懒加载摘要子代理实例"""
+    global _summary_agent
+    if _summary_agent is None:
+        from app.services.subagents import create_summary_agent
+        _summary_agent = create_summary_agent()
+    return _summary_agent
+
+
+def _split_chapter_into_subsections(chapter_content: str) -> list[dict]:
+    """将章节内容按 ### / #### / ##### 小节拆分（支持4级层级）
+
+    Args:
+        chapter_content: 章节完整内容，以 `## {章节名}` 开头
+
+    Returns:
+        list of {"header": "## 章节名", "subsections": [{"title": "### 小节标题", "body": "小节正文"}]}
+        每遇到 ### / #### / ##### 开头的行即开启一个新小节（保持向后兼容：
+        仅含 ### 的旧文档行为不变；含 #### / ##### 的新4级结构会被拆分为更细粒度小节）
+        若无任何小节标题，subsections 为空列表（调用方应走整章节精简回退路径）
+    """
+    if not chapter_content:
+        return [{"header": "", "subsections": []}]
+
+    lines = chapter_content.split("\n")
+    header_lines = []      # ## 章节标题及其后的空行
+    subsections = []
+
+    # 提取章节标题（## 开头）部分
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if stripped.startswith("## ") and not stripped.startswith("### "):
+            # 章节标题行
+            header_lines.append(line)
+            i += 1
+            # 收集章节标题后的空行（直到第一个 ### / #### / ##### 或正文开始）
+            while i < len(lines):
+                s = lines[i].strip()
+                if s == "":
+                    header_lines.append(lines[i])
+                    i += 1
+                elif s.startswith("### ") or s.startswith("#### ") or s.startswith("##### "):
+                    break
+                else:
+                    # 章节标题后直接是正文（无小节），整体作为单一小节
+                    break
+            break
+        else:
+            # 非 ## 开头（异常情况），作为 header 保留
+            header_lines.append(line)
+            i += 1
+
+    # 收集 ### / #### / ##### 小节
+    body_lines = lines[i:]
+    current_title = None
+    current_body = []
+
+    for line in body_lines:
+        stripped = line.strip()
+        is_subsection_heading = (
+            stripped.startswith("### ")
+            or stripped.startswith("#### ")
+            or stripped.startswith("##### ")
+        )
+
+        if is_subsection_heading:
+            # 新小节开始，保存前一小节
+            if current_title is not None:
+                subsections.append({
+                    "title": current_title,
+                    "body": "\n".join(current_body).strip(),
+                })
+            current_title = stripped
+            current_body = []
+        else:
+            if current_title is not None:
+                current_body.append(line)
+            else:
+                # ### 之前的非空行（已在 header 收集过空行），忽略
+                pass
+
+    # 收集最后一个小节
+    if current_title is not None:
+        subsections.append({
+            "title": current_title,
+            "body": "\n".join(current_body).strip(),
+        })
+
+    return [{
+        "header": "\n".join(header_lines).rstrip(),
+        "subsections": subsections,
+    }]
+
+
+def _count_chinese_chars(text: str) -> int:
+    """统计有效字符数（中文+英文字符，排除空白和markdown标记）
+
+    用于估算小节内容长度，作为字数预算分配依据。
+    """
+    if not text:
+        return 0
+    import re
+    # 去除 markdown 标记符号和空白
+    cleaned = re.sub(r'[#*_`>\-\[\]\(\)\|]', '', text)
+    cleaned = re.sub(r'\s+', '', cleaned)
+    return len(cleaned)
+
+
+def _truncate_at_boundary(text: str, max_chars: int) -> str:
+    """按句子/段落边界截断文本，使字数不超过 max_chars 的 1.05 倍。
+
+    优先在句子边界（。！？；\\n）截断，保留表格和代码块完整性。
+    用于 LLM 精简后仍超目标时的硬截断兜底。
+    修复：原 1.15× 上限偏高，比例模式下应更紧凑。
+    """
+    if not text or max_chars <= 0:
+        return text
+
+    current = _count_chinese_chars(text)
+    if current <= max_chars * 1.05:
+        return text  # 已经达标
+
+    # 逐句累加，在不超过 max_chars * 1.05 的前提下找最佳截断点
+    import re
+    sentences = re.split(r'(?<=[。！？；\n])', text)
+
+    result_parts = []
+    accumulated = 0
+    limit = int(max_chars * 1.05)
+
+    for sent in sentences:
+        if not sent:
+            continue
+        sent_chars = _count_chinese_chars(sent)
+        if accumulated + sent_chars > limit and result_parts:
+            break
+        result_parts.append(sent)
+        accumulated += sent_chars
+
+    if not result_parts:
+        # 所有句子都太长，硬截断
+        return text[:max_chars * 2]
+
+    return "".join(result_parts).rstrip()
+
+
+async def _summarize_one_subsection(
+    sub_title: str,
+    sub_body: str,
+    target_chars: int,
+    chapter_name: str,
+    doc_label: str,
+    is_ratio_mode: bool = False,
+    aggressive: bool = False,
+) -> tuple[str, str, dict]:
+    """对单个小节调用 LLM 精简
+
+    Args:
+        sub_title: 小节标题行（含 ### 前缀）
+        sub_body: 小节正文（不含标题行）
+        target_chars: 目标字数
+        chapter_name: 所属章节名（用于 prompt 上下文）
+        doc_label: 文档类型标签
+        is_ratio_mode: 是否为比例模式（影响 max_tokens 计算，避免小目标时 LLM 输出过大）
+        aggressive: 是否为激进模式（二次精简时启用，更严格的 prompt 和 max_tokens）
+
+    Returns:
+        (sub_title, 精简后正文, 统计信息dict)
+        失败时返回 (sub_title, 原sub_body, {"status": "error", ...})
+    """
+    from app.services.minimax import _call_minimax_api_raw
+
+    orig_chars = _count_chinese_chars(sub_body)
+    # 比例化保底：下限 40（避免被压成 0），但不超过原文 90%（避免扩展破坏比例）
+    # 修复固定 80 字保底对短小节导致 ratio 反向扩展的问题
+    if target_chars < 40:
+        target_chars = min(40, int(orig_chars * 0.9)) if orig_chars > 0 else 40
+    hard_limit = int(target_chars * 1.15)  # 硬上限：目标+15%（修复：原 1.15×→1.3× 区间太宽）
+
+    system_prompt = f"""你是医疗器械注册文档的小节内容精简专家。
+
+## 任务
+精简以下小节内容，**严格控制在 {target_chars} 字以内，最多不超过 {hard_limit} 字**。
+本小节属于《{doc_label}》文档「{chapter_name}」章节。
+
+## 精简规则
+
+### 必须保留（不可删除/篡改）
+- 所有法规标准条款号（如 "ISO 13485 §7.3.2"、"GB 9706.224-2021 第4章"）
+- 所有具体技术参数和数值（如 "0.05 U/h"、"IPX8"、"3-7天"）
+- 表格中的数据行（保留表格，可精简表格周围说明文字）
+- 核心结论和合规判定语句
+- 关键术语首次出现时的定义
+
+### 可以精简
+- 重复表述的同一观点（合并为一句）
+- 过度展开的背景介绍（压缩为一句）
+- 冗长的过渡句和铺垫（删除）
+- 同一标准的多条引用（合并为一条带多个条款号）
+- 非关键的示例和说明性文字
+
+### 禁止
+- 编造原文没有的数据、条款号或参数
+- 删除任何法规标准引用
+- 改变技术参数的数值或单位
+- 增加原文没有的新观点或新结论
+
+## 输出格式
+- 直接输出精简后的 Markdown 正文
+- 不要输出小节标题（### XXX），只输出正文
+- 不要输出任何解释、前言、总结
+- 保留原有的 Markdown 格式（表格、列表、加粗等）""" + (
+    """
+
+## ⚠️ 紧急要求：必须严格控制字数
+你之前的精简尝试未达标，现在必须**更激进地**精简。
+- 大胆合并同义句、删除所有过渡性描述、削减举例说明
+- 表格只保留表头和必要数据行，删除解释列
+- 法规条款号可保留但删除其后的展开说明
+- 再次严格控制在 {target_chars} 字以内（最多 {hard_limit} 字）"""
+    if aggressive else ""
+)
+
+    user_prompt = f"""请精简以下小节内容（必须控制在 {target_chars} 字以内，最多 {hard_limit} 字）：
+
+{sub_body}"""
+
+    try:
+        # qwen3.5:122b 模型存在 thinking tokens 占用：实测 num_predict < 16384 时
+        # 模型会消耗所有 tokens 但 content 为空，done_reason="length"。
+        # 因此下限和上限都至少 16384，否则空响应 → 精简失败。
+        # 比例模式小目标时：max_tok 应 = target*3 (中文字 1字≈1.5 token) + 16384 thinking 预算
+        # 非比例模式：max_tok 应 = target*3 + 16384 thinking 预算
+        if is_ratio_mode:
+            max_tok = min(max(int(target_chars * 3), 16384), 16384)
+        else:
+            max_tok = min(max(target_chars * 3, 16384), 16384)
+        async with _llm_semaphore:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _call_minimax_api_raw,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    temperature=0.2 if not aggressive else 0.1,
+                    max_tokens=max_tok,
+                ),
+                timeout=180.0,
+            )
+
+        if not response:
+            print(f"[summarize_section] LLM空响应: 小节='{sub_title}', "
+                  f"目标={target_chars}字, 原文={orig_chars}字 "
+                  f"(检查 Ollama {os.getenv('OLLAMA_BASE_URL', 'http://localhost:11435')} "
+                  f"模型 {os.getenv('OLLAMA_MODEL', 'qwen3.5:122b')} 是否正常)")
+            return (sub_title, sub_body, {
+                "status": "error", "reason": "LLM空响应",
+                "orig_chars": orig_chars, "new_chars": orig_chars,
+            })
+
+        # 清理响应：移除可能误加的 ### 标题行
+        cleaned = response.strip()
+        # 若 LLM 误加了 ### 开头，移除第一行
+        if cleaned.startswith("### "):
+            lines = cleaned.split("\n", 1)
+            cleaned = lines[1].strip() if len(lines) > 1 else cleaned
+
+        new_chars = _count_chinese_chars(cleaned)
+
+        # 迭代精简：若结果超目标 15%，最多重试 2 轮（共 3 轮），每轮更激进
+        # 修复：原 1.2× 阈值过宽，比例模式下允许 20% 偏差导致总比例偏离目标
+        max_rounds = 3
+        for round_idx in range(1, max_rounds):
+            if new_chars <= target_chars * 1.15:
+                break  # 已达标（目标+15%以内）
+            print(f"[summarize_section] 第{round_idx}轮精简不足: "
+                  f"{new_chars}字 > 目标{target_chars}字×1.15={int(target_chars*1.15)}字，重试")
+            retry_user_prompt = f"""上一轮精简后为 {new_chars} 字，仍超出目标 {target_chars} 字。
+请**更激进地**精简以下内容，必须控制在 {target_chars} 字以内（最多 {hard_limit} 字）。
+大胆删除重复表述、冗长背景、过渡句，只保留核心结论、法规条款号和技术参数：
+
+{cleaned}"""
+            try:
+                async with _llm_semaphore:
+                    retry_response = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _call_minimax_api_raw,
+                            system_prompt=system_prompt,
+                            user_prompt=retry_user_prompt,
+                            temperature=0.1,
+                            max_tokens=max_tok,
+                        ),
+                        timeout=180.0,
+                    )
+                if retry_response:
+                    retry_cleaned = retry_response.strip()
+                    if retry_cleaned.startswith("### "):
+                        lines = retry_cleaned.split("\n", 1)
+                        retry_cleaned = lines[1].strip() if len(lines) > 1 else retry_cleaned
+                    retry_chars = _count_chinese_chars(retry_cleaned)
+                    # 只在比上一轮更好的时候接受
+                    if retry_chars < new_chars:
+                        cleaned = retry_cleaned
+                        new_chars = retry_chars
+            except Exception as e:
+                print(f"[summarize_section] 第{round_idx}轮重试失败: {e}")
+                break
+
+        # 硬截断兜底：3 轮后仍超目标 15%，按句子边界截断
+        # 修复：原阈值 1.3× 偏高，会让最终结果超出目标
+        if new_chars > target_chars * 1.15:
+            truncated = _truncate_at_boundary(cleaned, target_chars)
+            if truncated and _count_chinese_chars(truncated) < new_chars:
+                print(f"[summarize_section] 硬截断兜底: {new_chars} -> "
+                      f"{_count_chinese_chars(truncated)} 字")
+                cleaned = truncated
+                new_chars = _count_chinese_chars(cleaned)
+
+        return (sub_title, cleaned, {
+            "status": "ok",
+            "orig_chars": orig_chars,
+            "new_chars": new_chars,
+            "target_chars": target_chars,
+        })
+
+    except asyncio.TimeoutError:
+        print(f"[summarize_section] LLM超时(180秒): 小节='{sub_title}', 目标={target_chars}字")
+        return (sub_title, sub_body, {
+            "status": "error", "reason": "LLM超时（180秒）",
+            "orig_chars": orig_chars, "new_chars": orig_chars,
+        })
+    except Exception as e:
+        print(f"[summarize_section] LLM调用异常: 小节='{sub_title}', "
+              f"错误={type(e).__name__}: {e}")
+        return (sub_title, sub_body, {
+            "status": "error", "reason": str(e),
+            "orig_chars": orig_chars, "new_chars": orig_chars,
+        })
+
+
+@tool
+async def summarize_section(
+    section_name: str,
+    mode: str = "ratio",
+    target: float = 0.5,
+    doc_type: str = "",
+) -> str:
+    """对已生成章节中的每个小节内容进行精简，用精简后内容替换原小节。
+
+    支持两种模式：
+    - 字数模式 (mode="words"): target 为目标字数（int），按各小节原字数比例分配预算
+    - 比例模式 (mode="ratio"): target 为压缩比例（float 0.1~1.0），每小节按原字数×比例精简
+
+    精简由 LLM 完成，严格保留法规条款号、技术参数、表格数据和核心结论。
+    单个小节精简失败时保留原文，不影响其他小节。
+
+    调用时机:
+    - 用户说"精简/总结/压缩 XX 章节内容"时
+    - 用户要求"把这一章缩短到 XXX 字"时
+    - 文档生成完成后用户要求缩短整体内容时
+
+    Args:
+        section_name: 要精简的章节名称（必须已存在于 generated_sections 中）
+        mode: 精简模式，"words"（字数模式）或 "ratio"（比例模式）
+        target: 目标值。mode="words" 时为 int 字数；mode="ratio" 时为 float 比例（0.1~1.0）
+        doc_type: 文档类型标识，用于prompt上下文。为空时自动从上下文获取。
+
+    Returns:
+        JSON格式结果，包含精简前后字数对比、各小节状态。完整精简内容通过旁路传递给
+        _after_tools_node，不进入LLM对话历史。
+    """
+    try:
+        from app.services.doc_types import DOC_TYPE_LABELS
+
+        # 从上下文获取 doc_type 和当前 generated_sections
+        if not doc_type:
+            doc_type = _current_doc_type.get()
+        doc_label = DOC_TYPE_LABELS.get(doc_type, doc_type) if doc_type else "设计策划文档"
+
+        # 参数校验
+        if mode not in ("words", "ratio"):
+            return json.dumps({
+                "status": "error",
+                "message": f'参数 mode 必须为 "words" 或 "ratio"，当前为 "{mode}"',
+            }, ensure_ascii=False)
+
+        if mode == "ratio":
+            if not (0.1 <= float(target) <= 1.0):
+                return json.dumps({
+                    "status": "error",
+                    "message": f"比例模式下 target 应在 0.1~1.0 之间，当前为 {target}",
+                }, ensure_ascii=False)
+        else:
+            if int(target) < 100:
+                return json.dumps({
+                    "status": "error",
+                    "message": f"字数模式下 target 应不小于 100 字，当前为 {target}",
+                }, ensure_ascii=False)
+
+        # 读取当前章节内容
+        current_markdown = _current_generated_markdown.get()
+        if not current_markdown:
+            return json.dumps({
+                "status": "error",
+                "message": "当前没有已生成的文档内容。请先生成至少一个章节。",
+            }, ensure_ascii=False)
+
+        # 从完整 markdown 中提取指定章节内容
+        # 章节内容格式：# {章节名}\n\n{章节正文}\n\n
+        # 其中章节正文以 ## {章节名} 开头
+        import re
+        chapter_pattern = rf'^# \s*{re.escape(section_name)}\s*$'
+        lines = current_markdown.split("\n")
+        in_chapter = False
+        chapter_lines = []
+        for line in lines:
+            if re.match(chapter_pattern, line.strip()):
+                in_chapter = True
+                continue  # 跳过 # 章节名 这一行（generated_sections 存的是 ## 开头的内容）
+            elif in_chapter and re.match(r'^# ', line.strip()):
+                # 遇到下一个 # 章节，结束
+                break
+            elif in_chapter:
+                chapter_lines.append(line)
+
+        chapter_content = "\n".join(chapter_lines).strip()
+        if not chapter_content:
+            return json.dumps({
+                "status": "error",
+                "message": f'未找到章节「{section_name}」。请确认章节名称正确，且该章节已生成。',
+                "available_sections": list(_get_section_names_from_markdown(current_markdown)),
+            }, ensure_ascii=False)
+
+        # 拆分小节
+        parsed = _split_chapter_into_subsections(chapter_content)
+        if not parsed or not parsed[0]["subsections"]:
+            # 回退：无 ### 小节，整体作为一个小节精简
+            header = chapter_content.split("\n", 1)[0] if "\n" in chapter_content else ""
+            subsections = [{"title": "### 概述", "body": chapter_content}]
+            parsed = [{"header": header, "subsections": subsections}]
+            print(f"[summarize_section] No ### subsections found in '{section_name}', "
+                  f"treating whole chapter as single subsection")
+
+        subsections = parsed[0]["subsections"]
+        header = parsed[0]["header"]
+        sub_count = len(subsections)
+
+        # 计算每个小节的目标字数
+        orig_chars_list = [_count_chinese_chars(s["body"]) for s in subsections]
+        orig_total = sum(orig_chars_list) or 1  # 避免除0
+
+        targets = []
+        ratio = float(target) if mode == "ratio" else None
+        if mode == "ratio":
+            # 比例化保底：下限 40（避免小节被压成 0），但不超过原文 90%（防扩展破坏比例）
+            # 修复：原固定 80 字保底对短小节导致 ratio 反向扩展（如 50 字小节 ratio=0.5 → 实际 160%）
+            for oc in orig_chars_list:
+                raw_target = int(oc * ratio)
+                if raw_target < 40 and oc > 0:
+                    targets.append(min(40, int(oc * 0.9)))
+                else:
+                    targets.append(max(raw_target, 40))
+        else:  # words
+            total_target = int(target)
+            for oc in orig_chars_list:
+                # 按原字数比例分配，保底80字
+                allocated = max(int(total_target * oc / orig_total), 80)
+                targets.append(allocated)
+
+        print(f"[summarize_section] '{section_name}': {sub_count} subsections, "
+              f"mode={mode}, target={target}, orig_total={orig_total}")
+
+        # 并行精简各小节
+        gen_tasks = [
+            asyncio.create_task(_summarize_one_subsection(
+                sub_title=s["title"],
+                sub_body=s["body"],
+                target_chars=targets[i],
+                chapter_name=section_name,
+                doc_label=doc_label,
+                is_ratio_mode=(mode == "ratio"),
+            ))
+            for i, s in enumerate(subsections)
+        ]
+        await asyncio.gather(*gen_tasks)
+
+        # 组装精简后章节内容（暂存以便失败再平衡）
+        assembled = []  # [(sub_title, new_body, stat_dict, subsection_ref)]
+        new_total = 0
+        for i, task in enumerate(gen_tasks):
+            sub_title, new_body, stat = task.result()
+            new_total += stat["new_chars"]
+            if stat["status"] == "ok":
+                assembled.append((sub_title, new_body, {
+                    "title": sub_title,
+                    "orig_chars": stat["orig_chars"],
+                    "new_chars": stat["new_chars"],
+                    "target_chars": stat.get("target_chars", targets[i]),
+                    "status": "ok",
+                }, subsections[i]))
+            else:
+                # 失败保留原文
+                assembled.append((sub_title, subsections[i]["body"], {
+                    "title": sub_title,
+                    "orig_chars": stat["orig_chars"],
+                    "new_chars": stat["orig_chars"],
+                    "target_chars": targets[i],
+                    "status": "error",
+                    "reason": stat.get("reason", "unknown"),
+                }, subsections[i]))
+
+        # ────────── 比例模式失败再平衡 ──────────
+        # 修复：失败小节和超目标小节会拉高总比例，超出目标 15% 时触发二次精简
+        if mode == "ratio" and ratio is not None and new_total > orig_total * ratio * 1.15:
+            need_retry = [
+                (i, t, b, s) for i, (t, b, s, _) in enumerate(assembled)
+                if s.get("status") == "ok" and s.get("new_chars", 0) > s.get("target_chars", 0) * 1.15
+            ]
+            if need_retry:
+                print(f"[summarize_section] 比例模式触发再平衡: "
+                      f"new_total={new_total}, orig_total={orig_total}, "
+                      f"当前比例={new_total/orig_total:.1%} > 目标 {ratio:.1%}×1.15="
+                      f"{ratio*1.15:.1%}, 二次精简 {len(need_retry)} 节")
+                # 收集"原文"和"上次精简结果"用于二次精简
+                retry_tasks = [
+                    asyncio.create_task(_summarize_one_subsection(
+                        sub_title=t,
+                        sub_body=b,  # 用上次精简结果继续精简（已经是较短版本）
+                        target_chars=s.get("target_chars", targets[i]),
+                        chapter_name=section_name,
+                        doc_label=doc_label,
+                        is_ratio_mode=True,
+                        aggressive=True,  # 启用激进模式
+                    ))
+                    for i, t, b, s in need_retry
+                ]
+                await asyncio.gather(*retry_tasks)
+                # 合并二次精简结果
+                for (i, t, _, s), task in zip(need_retry, retry_tasks):
+                    sub_title, new_body, stat = task.result()
+                    if stat["status"] == "ok":
+                        assembled[i] = (sub_title, new_body, {
+                            "title": sub_title,
+                            "orig_chars": s.get("orig_chars", stat["orig_chars"]),
+                            "new_chars": stat["new_chars"],
+                            "target_chars": stat.get("target_chars", s.get("target_chars")),
+                            "status": "ok",
+                        }, subsections[i])
+                # 重新计算 new_total
+                new_total = sum(item[2].get("new_chars", 0) for item in assembled)
+                print(f"[summarize_section] 再平衡完成: new_total={new_total}, "
+                      f"新比例={new_total/orig_total:.1%}")
+
+        # 最终组装 parts / sub_stats
+        parts = [header + "\n\n"] if header else []
+        success_count = 0
+        failed_count = 0
+        sub_stats = []
+        for sub_title, new_body, stat, _ in assembled:
+            if stat.get("status") == "ok":
+                success_count += 1
+            else:
+                failed_count += 1
+            parts.append(f"{sub_title}\n\n{new_body}\n\n")
+            sub_stats.append(stat)
+
+        full_content = "".join(parts).rstrip() + "\n"
+
+        # 通过旁路传递完整精简后内容（避免进入LLM对话历史）
+        _pending_chapter_contents[section_name] = full_content
+
+        print(f"[summarize_section] '{section_name}': "
+              f"{success_count}/{sub_count} subsections summarized, "
+              f"{orig_total} -> {new_total} chars "
+              f"({(new_total/orig_total*100) if orig_total else 0:.1f}%)")
+
+        return json.dumps({
+            "status": "ok",
+            "section_name": section_name,
+            "mode": mode,
+            "target": target,
+            "subsections_count": sub_count,
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "orig_total_chars": orig_total,
+            "new_total_chars": new_total,
+            "compression_ratio": round(new_total / orig_total, 3) if orig_total else 0,
+            "subsections": sub_stats,
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"精简章节「{section_name}」时异常: {str(e)}",
+        }, ensure_ascii=False)
+
+
+def _get_section_names_from_markdown(markdown: str) -> list[str]:
+    """从完整 markdown 中提取所有 # 一级章节名"""
+    import re
+    if not markdown:
+        return []
+    names = []
+    for line in markdown.split("\n"):
+        m = re.match(r'^#\s+(.+?)\s*$', line)
+        if m:
+            names.append(m.group(1).strip())
+    return names
+
+
+@tool
+async def summarize_document(
+    mode: str = "ratio",
+    target: float = 0.5,
+    doc_type: str = "",
+) -> str:
+    """对已生成的所有章节进行批量精简（每章每小节分别精简）。
+
+    内部循环调用 summarize_section 处理每个章节。失败章节不影响其他章节。
+
+    调用时机:
+    - 用户说"精简整个文档"/"压缩整篇文档"时
+    - 用户要求"把全文缩短到 XXXX 字"时
+
+    Args:
+        mode: 精简模式，"words"（字数模式）或 "ratio"（比例模式）
+        target: 目标值。words 模式为总目标字数（按章节小节数比例分配）；
+                ratio 模式为压缩比例（0.1~1.0）
+        doc_type: 文档类型标识，为空时自动从上下文获取
+
+    Returns:
+        JSON格式结果，包含每个章节的精简状态汇总。
+    """
+    try:
+        current_markdown = _current_generated_markdown.get()
+        if not current_markdown:
+            return json.dumps({
+                "status": "error",
+                "message": "当前没有已生成的文档内容。请先生成至少一个章节。",
+            }, ensure_ascii=False)
+
+        section_names = _get_section_names_from_markdown(current_markdown)
+        if not section_names:
+            return json.dumps({
+                "status": "error",
+                "message": "未找到任何章节。请先生成文档。",
+            }, ensure_ascii=False)
+
+        # 字数模式下，按章节数平均分配总字数预算
+        section_targets = []
+        if mode == "words":
+            total_target = int(target)
+            per_section = max(int(total_target / len(section_names)), 200)
+            for name in section_names:
+                section_targets.append((name, per_section))
+        else:
+            for name in section_names:
+                section_targets.append((name, target))
+
+        # 顺序处理各章节（避免并发过多导致API限流）
+        results = []
+        success_count = 0
+        for name, t in section_targets:
+            summary_result = await summarize_section.ainvoke({
+                "section_name": name,
+                "mode": mode,
+                "target": t,
+                "doc_type": doc_type,
+            })
+            try:
+                data = json.loads(summary_result)
+                if data.get("status") == "ok":
+                    success_count += 1
+                results.append({
+                    "section_name": name,
+                    "status": data.get("status", "error"),
+                    "orig_chars": data.get("orig_total_chars", 0),
+                    "new_chars": data.get("new_total_chars", 0),
+                    "subsections_count": data.get("subsections_count", 0),
+                    "success_count": data.get("success_count", 0),
+                    "failed_count": data.get("failed_count", 0),
+                    "message": data.get("message", "") if data.get("status") != "ok" else "",
+                })
+            except json.JSONDecodeError:
+                results.append({
+                    "section_name": name,
+                    "status": "error",
+                    "message": "工具返回非JSON",
+                })
+
+        return json.dumps({
+            "status": "ok" if success_count > 0 else "error",
+            "mode": mode,
+            "target": target,
+            "total_sections": len(section_names),
+            "success_count": success_count,
+            "failed_count": len(section_names) - success_count,
+            "results": results,
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"批量精简异常: {str(e)}",
+        }, ensure_ascii=False)
+
 
 
 # ── Tool 7: web_search ──
@@ -1868,4 +2662,6 @@ PHASE1_TOOLS = [
     outline_from_attachment,
     write_chapter,
     update_outline,
+    summarize_section,
+    summarize_document,
 ]
