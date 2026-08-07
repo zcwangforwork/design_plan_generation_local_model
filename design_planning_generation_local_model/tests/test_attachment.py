@@ -119,27 +119,33 @@ class TestGeneratorWithAttachment:
         assert "attachment_content" in params
 
     def test_resolve_attachments_empty(self):
-        """空附件参数应返回空字符串"""
+        """空附件参数应返回空字符串和空列表"""
         from app.services.generator import DocumentGenerator
         gen = DocumentGenerator()
-        result = gen._resolve_attachments(None, None)
-        assert result == ""
+        merged, texts = gen._resolve_attachments(None, None)
+        assert merged == ""
+        assert texts == []
 
     def test_resolve_attachments_content_only(self):
-        """仅有attachment_content时应直接返回"""
+        """仅有attachment_content时应返回合并字符串和单元素列表"""
         from app.services.generator import DocumentGenerator
         gen = DocumentGenerator()
-        result = gen._resolve_attachments(None, "测试附件内容")
-        assert "测试附件内容" in result
+        merged, texts = gen._resolve_attachments(None, "test attachment content")
+        assert "test attachment content" in merged
+        assert len(texts) == 1
+        assert "test attachment content" in texts[0]
 
     def test_resolve_attachments_both(self):
         """同时有file_ids和attachment_content时应合并"""
         from app.services.generator import DocumentGenerator
         gen = DocumentGenerator()
-        with patch("app.services.generator.resolve_attachment_content", return_value="来自向量库的内容"):
-            result = gen._resolve_attachments(["file123"], "直接传入的文本")
-            assert "来自向量库的内容" in result
-            assert "直接传入的文本" in result
+        with patch("app.services.generator.resolve_attachment_texts", return_value=["from vector store"]):
+            merged, texts = gen._resolve_attachments(["file123"], "direct text")
+            assert "from vector store" in merged
+            assert "direct text" in merged
+            assert len(texts) == 2
+            assert "from vector store" in texts[0]
+            assert "direct text" in texts[1]
 
 
 # ==================== 向后兼容回归测试 ====================
@@ -247,9 +253,304 @@ class TestCrossCollectionRetrieval:
     """跨collection检索测试"""
 
     def test_minimax_accepts_attachment_content(self):
-        """MinimaxService方法应接受attachment_content参数"""
+        """MinimaxService方法应接受attachment_content和attachment_texts参数"""
         from app.services.minimax import MiniMaxService
         import inspect
         sig = inspect.signature(MiniMaxService.generate_content_with_fallback)
         params = list(sig.parameters.keys())
         assert "attachment_content" in params
+        assert "attachment_texts" in params
+
+
+# ==================== Multi-attachment Quota Allocation Tests ====================
+
+class TestAllocateAttachmentQuota:
+    """Test the _allocate_attachment_quota helper method"""
+
+    def _get_svc(self):
+        from app.services.minimax import MiniMaxService
+        return MiniMaxService(api_key="test_key")
+
+    def test_empty_list(self):
+        """Empty attachment list returns empty list"""
+        svc = self._get_svc()
+        result = svc._allocate_attachment_quota([], total_budget=3000)
+        assert result == []
+
+    def test_single_attachment(self):
+        """Single attachment gets full budget"""
+        svc = self._get_svc()
+        text = "A" * 5000
+        result = svc._allocate_attachment_quota([text], total_budget=3000)
+        assert len(result) == 1
+        assert len(result[0]) == 3000
+
+    def test_two_attachments_proportional(self):
+        """Two attachments get proportional allocation with min guarantee"""
+        svc = self._get_svc()
+        text1 = "A" * 2000
+        text2 = "B" * 8000
+        result = svc._allocate_attachment_quota([text1, text2], total_budget=3000, min_per=500)
+        assert len(result) == 2
+        # text1 is 20% of total, text2 is 80%
+        # proportional: text1=600, text2=2400
+        # min_per=500, so both are above min
+        assert len(result[0]) >= 500  # at least min_per
+        assert len(result[1]) >= 500
+        assert result[0].startswith("A")
+        assert result[1].startswith("B")
+
+    def test_min_per_guarantee(self):
+        """Small attachment still gets min_per chars"""
+        svc = self._get_svc()
+        text1 = "X" * 100  # very small
+        text2 = "Y" * 10000
+        result = svc._allocate_attachment_quota([text1, text2], total_budget=3000, min_per=500)
+        assert len(result) == 2
+        # text1 is only 100 chars, so gets all 100
+        assert len(result[0]) == 100
+        # text2 gets the rest
+        assert len(result[1]) > 0
+
+    def test_five_attachments_equal_split(self):
+        """N > 4 triggers equal split"""
+        svc = self._get_svc()
+        texts = [chr(65 + i) * 10000 for i in range(5)]
+        result = svc._allocate_attachment_quota(texts, total_budget=3000, min_per=500)
+        assert len(result) == 5
+        per = 3000 // 5  # 600
+        for r in result:
+            assert len(r) == per
+
+    def test_empty_text_filtered(self):
+        """Empty/whitespace texts are filtered"""
+        svc = self._get_svc()
+        result = svc._allocate_attachment_quota(["", "  ", "A" * 1000], total_budget=3000)
+        assert len(result) == 3  # same length as input
+        assert result[0] == ""
+        assert result[1] == ""
+        # single non-empty gets full text (but capped at its length = 1000)
+        assert len(result[2]) == 1000
+
+    def test_all_empty(self):
+        """All empty texts returns list of empty strings"""
+        svc = self._get_svc()
+        result = svc._allocate_attachment_quota(["", ""], total_budget=3000)
+        assert result == ["", ""]
+
+
+# ==================== Multi-attachment Injection Tests ====================
+
+class TestMultiAttachmentInjection:
+    """Test multi-attachment injection in prompt builders"""
+
+    def _get_svc(self):
+        from app.services.minimax import MiniMaxService
+        return MiniMaxService(api_key="test_key")
+
+    def test_single_attachment_falls_back(self):
+        """Single attachment (len==1) uses old logic via attachment_content"""
+        svc = self._get_svc()
+        prompt = svc._build_section_prompt(
+            index=1,
+            chapter_name="test_chapter",
+            section_name="test_section",
+            section_query="test query",
+            chunks=[],
+            uploads_chunks=[],
+            web_info="",
+            doc_type="sop",
+            product_name="test",
+            product_type="test",
+            product_params="",
+            attachment_content="single attachment content",
+            attachment_texts=["single attachment content"],
+            total_sections=1,
+            all_chapter_names=[]
+        )
+        # Should contain the old-style label (single attachment path)
+        assert "single attachment content" in prompt
+
+    def test_multi_attachment_first_section_quota(self):
+        """Multi-attachment first section uses quota allocation"""
+        svc = self._get_svc()
+        text1 = "A" * 2000
+        text2 = "B" * 2000
+        prompt = svc._build_section_prompt(
+            index=1,
+            chapter_name="test_chapter",
+            section_name="test_section",
+            section_query="test query",
+            chunks=[],
+            uploads_chunks=[],
+            web_info="",
+            doc_type="sop",
+            product_name="test",
+            product_type="test",
+            product_params="",
+            attachment_content="",
+            attachment_texts=[text1, text2],
+            total_sections=1,
+            all_chapter_names=[]
+        )
+        # Both attachments should be represented in the prompt
+        assert "A" in prompt
+        assert "B" in prompt
+        # Should have multi-attachment label
+        assert "---" in prompt
+
+    def test_multi_attachment_subsequent_section_rag(self):
+        """Multi-attachment subsequent section uses per-attachment RAG"""
+        svc = self._get_svc()
+        text1 = "keyword1 is here in this paragraph\nanother paragraph"
+        text2 = "keyword2 is here in this paragraph\nanother one"
+        prompt = svc._build_section_prompt(
+            index=2,  # subsequent section
+            chapter_name="test_chapter",
+            section_name="test_section",
+            section_query="keyword1 keyword2",
+            chunks=[],
+            uploads_chunks=[],
+            web_info="",
+            doc_type="sop",
+            product_name="test",
+            product_type="test",
+            product_params="",
+            attachment_content="",
+            attachment_texts=[text1, text2],
+            total_sections=2,
+            all_chapter_names=[]
+        )
+        # Should contain relevant paragraphs from both attachments
+        assert "keyword1" in prompt or "keyword2" in prompt
+
+    def test_attachment_texts_none_falls_back(self):
+        """attachment_texts=None uses old logic"""
+        svc = self._get_svc()
+        prompt = svc._build_section_prompt(
+            index=1,
+            chapter_name="test_chapter",
+            section_name="test_section",
+            section_query="test query",
+            chunks=[],
+            uploads_chunks=[],
+            web_info="",
+            doc_type="sop",
+            product_name="test",
+            product_type="test",
+            product_params="",
+            attachment_content="fallback content",
+            attachment_texts=None,
+            total_sections=1,
+            all_chapter_names=[]
+        )
+        assert "fallback content" in prompt
+
+    def test_empty_attachment_skipped(self):
+        """Empty attachment texts are skipped in multi-attachment path"""
+        svc = self._get_svc()
+        prompt = svc._build_section_prompt(
+            index=1,
+            chapter_name="test_chapter",
+            section_name="test_section",
+            section_query="test query",
+            chunks=[],
+            uploads_chunks=[],
+            web_info="",
+            doc_type="sop",
+            product_name="test",
+            product_type="test",
+            product_params="",
+            attachment_content="",
+            attachment_texts=["real content", "", "  "],
+            total_sections=1,
+            all_chapter_names=[]
+        )
+        # Only the non-empty attachment should be in the prompt
+        assert "real content" in prompt
+
+
+# ==================== Outline From Attachment Multi Tests ====================
+
+class TestOutlineFromAttachmentMulti:
+    """Test outline_from_attachment with multiple attachments"""
+
+    def test_outline_uses_all_attachments(self):
+        """Multiple attachments should all be included"""
+        from app.services.agent_tools import set_current_attachments, outline_from_attachment
+        import json
+
+        attachments = [
+            {"file_id": "f1", "filename": "doc1.txt", "full_text": "Content from doc1 " * 100},
+            {"file_id": "f2", "filename": "doc2.txt", "full_text": "Content from doc2 " * 100},
+        ]
+        set_current_attachments(attachments)
+
+        captured_prompt = {}
+
+        def mock_call(*args, **kwargs):
+            captured_prompt['system'] = kwargs.get('system_prompt', '')
+            captured_prompt['user'] = kwargs.get('user_prompt', '')
+            return '{"doc_title": "test", "chapters": [{"id": 1, "title": "ch1", "description": "d", "key_standards": [], "subsections": [{"title": "s1", "content_points": ["p1"]}]}]}'
+
+        with patch("app.services.minimax._call_minimax_api_raw", side_effect=mock_call):
+            import asyncio
+            result = asyncio.run(outline_from_attachment.ainvoke(
+                {"file_id": "", "doc_type": "sop", "product_name": "test"}
+            ))
+            # User prompt should contain both filenames
+            if captured_prompt.get('user'):
+                assert "doc1.txt" in captured_prompt['user']
+                assert "doc2.txt" in captured_prompt['user']
+
+        set_current_attachments([])
+
+    def test_outline_single_attachment_unchanged(self):
+        """Single attachment should still work"""
+        from app.services.agent_tools import set_current_attachments, outline_from_attachment
+        import json
+
+        attachments = [
+            {"file_id": "f1", "filename": "single.txt", "full_text": "Single doc content " * 100},
+        ]
+        set_current_attachments(attachments)
+
+        def mock_call(*args, **kwargs):
+            return '{"doc_title": "test", "chapters": [{"id": 1, "title": "ch1", "description": "d", "key_standards": [], "subsections": [{"title": "s1", "content_points": ["p1"]}]}]}'
+
+        with patch("app.services.minimax._call_minimax_api_raw", side_effect=mock_call):
+            import asyncio
+            result = asyncio.run(outline_from_attachment.ainvoke(
+                {"file_id": "", "doc_type": "sop", "product_name": "test"}
+            ))
+            assert result is not None
+
+        set_current_attachments([])
+
+    def test_outline_file_id_specified(self):
+        """file_id specified should use only that attachment"""
+        from app.services.agent_tools import set_current_attachments, outline_from_attachment
+
+        attachments = [
+            {"file_id": "f1", "filename": "doc1.txt", "full_text": "Content from doc1 " * 100},
+            {"file_id": "f2", "filename": "doc2.txt", "full_text": "Content from doc2 " * 100},
+        ]
+        set_current_attachments(attachments)
+
+        captured_prompt = {}
+
+        def mock_call(*args, **kwargs):
+            captured_prompt['user'] = kwargs.get('user_prompt', '')
+            return '{"doc_title": "test", "chapters": [{"id": 1, "title": "ch1", "description": "d", "key_standards": [], "subsections": [{"title": "s1", "content_points": ["p1"]}]}]}'
+
+        with patch("app.services.minimax._call_minimax_api_raw", side_effect=mock_call):
+            import asyncio
+            result = asyncio.run(outline_from_attachment.ainvoke(
+                {"file_id": "f2", "doc_type": "sop", "product_name": "test"}
+            ))
+            # Should only contain doc2, not doc1
+            if captured_prompt.get('user'):
+                assert "doc2.txt" in captured_prompt['user']
+                assert "doc1.txt" not in captured_prompt['user']
+
+        set_current_attachments([])

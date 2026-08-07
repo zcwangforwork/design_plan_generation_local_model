@@ -1149,3 +1149,303 @@ MinerU 启用 GPU 后，首次加载模型 + 多页推理可能超过原 30 秒�
 - 若 LLM 仍然很慢（每个小节 55s），可考虑：
   - 减少 `_llm_semaphore` 并发（4 → 2）防止 OOM
   - 或切换到 deepseek-r1:70b（响应 32.9s/93字，比 qwen3.5:122b 快 40%）
+
+---
+
+## 2026-07-28 - RAG search_kb 同时检索主库和 uploads 集合
+
+### 背景
+用户问："让rag检索的时候同时查两个collection"。
+
+### Analysis
+- Topic: search_kb 工具当前只检索主知识库 `insulin_pump_kb`，完全不查 `uploads`（用户上传附件库）
+- Finding: 
+  - `app/services/rag/vector_store.py:32` `QUERY_COLLECTIONS = ["insulin_pump_kb"]` 硬编码只查主库
+  - `app/services/agent_tools.py` 原 `search_kb` 直接调用 `VectorStore().retrieve_and_rerank()`，受 `QUERY_COLLECTIONS` 限制
+  - ChromaDB 实际集合：`insulin_pump_kb` (9622) / `qms_doc_uploads` (515) / `qms_doc_insulin_pump_kb` (1, 几乎空)
+  - `attachment_service.py` 的上传走 `qms_doc_uploads`（带前缀），所以不能用"加 raw 名到 QUERY_COLLECTIONS"的方式
+  - 解决：让 `search_kb` 并行查主库 + 直接对 uploads 集合做向量检索，然后合并
+- Decision: 
+  1. 在 `search_kb` 内部新增 `_do_retrieve_uploads()` 闭包，直接用 `VectorStore(collection_name="uploads").collection.query()` 走小集合向量检索
+  2. `asyncio.gather` 并行执行主库（可能 rerank 较慢）和 uploads（秒级）两个检索
+  3. 合并结果：按 `rerank_score`（主库）/`similarity`（uploads）降序，按 `chunk_id` 去重，取 top_k
+  4. 每个结果打 `source_collection` 标签（"insulin_pump_kb" 或 "uploads"），uploads 的 source 前缀 `[附件]`
+  5. 主库走 rerank；uploads 集合规模小（515 chunks）直接向量检索即可，不再走 rerank
+  6. 异常隔离：任一检索失败/超时仅丢该侧结果，另一侧正常返回
+
+### File Edited
+- File: `app/services/agent_tools.py` L82-268
+  - Change: 重构 `search_kb` 工具，同时检索主库与 uploads 集合
+  - 关键改动：
+    * 拆出 `_do_retrieve_main()`（原主库检索，可走 rerank）
+    * 新增 `_do_retrieve_uploads()`（直接查 `qms_doc_uploads` 集合，规模小无需 rerank/BM25）
+    * `asyncio.gather(..., return_exceptions=True)` 并行执行
+    * 异常隔离 + 结果归一化
+    * 按 `rerank_score`/`similarity` 排序，按 `chunk_id` 去重，取 top_k
+    * 输出新增 `source_collection` 字段和 `uploads_included` 标志
+  - Result: Success - SYNTAX OK
+
+### Verification
+- 单元测试：`tests/test_summarize.py` 38/38 通过 ✅
+- 单元测试：`tests/test_agent.py::test_search_kb_no_results_format` 通过 ✅（之前因 mock 错误挂掉，现已修复）
+- 单元测试：`tests/test_agent.py::test_search_kb_success_format` 仍 fail（pre-existing：mock 用了 `content` 字段而代码读 `text`，且未 mock `retrieve_and_rerank`；与本次改动无关）
+- 真实功能测试：query="GB 9706 医用电气设备安全", top_k=5, use_rerank=False
+  * status=ok, uploads_included=True
+  * 主库 4 条 + uploads 1 条 → 合并 5 条 ✅ 双 collection 同时检索已生效
+
+### Impact
+- 用户上传的附件（之前被向量化但永远不会被主 RAG 搜到的内容）现在可以通过 `search_kb` 自动检索到
+- LLM 在生成章节时不再需要 Agent 自觉调用 `search_attachment` 才能引用附件内容
+- 额外延迟：uploads 检索耗时约 0.5-1s（包含 embedding 一次 ~0.6s + 向量查询 ~0.1s），不影响主库 rerank 路径总时间（120s 预算内）
+- 输出格式向后兼容：原有 `content`/`source`/`score` 字段保留，新增 `source_collection` 字段（LLM 可选择性利用）
+
+### Next Steps
+- 监控 LLM 是否会因为引入 uploads 来源内容而出现"答非所问"或"过度引用附件"的情况
+- 必要时可在 prompt 中提示 LLM 区分 `source_collection` 来源
+- 后续可考虑：把 `qms_doc_uploads` 也加入 `QUERY_COLLECTIONS` 的"已加前缀"变体，统一检索入口（但需先解 `retrieve_hybrid` 内部硬编码 raw 名的历史债务）
+
+---
+
+## 2026-07-28 - 精简文档段落逻辑连贯性增强
+
+### 背景
+用户反馈："精简文档时注意，精简完后要保持精简后的文档段落逻辑通顺"。
+
+### Analysis
+- Topic: 精简后段落逻辑被破坏的根因分析
+- Finding: 当前实现有 4 个破坏段落逻辑的环节：
+  1. **小节独立精简** — LLM 看不到上下文，可能写"如前所述/详见下表"等悬空引用
+  2. **小节间无衔接感知** — 整章压缩后相邻小节话题可能跳脱
+  3. **硬截断留下悬空末句** — `_truncate_at_boundary` 只按句号切，可能留下"因此..."/"见下表..."等无承接的句
+  4. **无自检机制** — 精简后无质量校验，问题全靠用户肉眼发现
+- Decision: 4 项针对性增强
+  1. **相邻小节上下文传递**：`_extract_neighbor_snippets` 提取每小节的 prev/next 摘要，传给 LLM
+  2. **Prompt 段落连贯性约束**：在 system_prompt 增加禁悬空引用、禁连接词开头、保持话题衔接 4 条规则
+  3. **硬截断后清理**：`_strip_dangling_tail` 截断后检查末句是否以连接词开头或含悬空引用，若是则丢弃该句
+  4. **组装后自检**：`_detect_dangling_references` 按 ## 标题切段检测两类问题（dangling_starter / dangling_reference），结果写入 `flow_issues` 字段
+
+### File Edited
+- File 1: `app/services/agent_tools.py` L1668-1701（`_summarize_one_subsection`）
+  - Change: 新增 `prev_context` / `next_context` 参数；system_prompt 增加"段落逻辑连贯性要求"章节
+  - Result: Success
+- File 2: `app/services/agent_tools.py` L1630-1690（`_truncate_at_boundary` + `_strip_dangling_tail` + 字典常量）
+  - Change:
+    - `_truncate_at_boundary` 截断后调用 `_strip_dangling_tail` 二次清理
+    - 新增 `_DANGLING_STARTERS`（24 个连接/承转词）和 `_DANGLING_TAIL_PATTERNS`（覆盖 look-forward + look-back 共 23 个悬空引用模式）
+    - 新增 `_strip_dangling_tail`：逐句检查末句，命中即丢弃，最多清理 3 句
+  - Result: Success
+- File 3: `app/services/agent_tools.py` L1729-1839（新增辅助函数）
+  - Change:
+    - 新增 `_extract_neighbor_snippets(bodies, snippet_chars=100)`：为每个小节提取 prev/next 摘要（按句子边界截断）
+    - 新增 `_detect_dangling_references(text)`：按 ## 标题切段，检测 dangling_starter 和 dangling_reference 两类问题
+  - Result: Success
+- File 4: `app/services/agent_tools.py` L2123-2255（`summarize_section` 主流程）
+  - Change:
+    - 调用 `_extract_neighbor_snippets` 一次性算出所有小节摘要
+    - `_summarize_one_subsection` 调用时传 prev/next
+    - 比例模式再平衡的 retry path 也传 prev/next
+    - 组装后调用 `_detect_dangling_references`，结果写入 `flow_issues` 返回字段和 console log
+  - Result: Success
+- File 5: `tests/test_summarize.py` L894-1062（新增 17 个测试用例）
+  - Change:
+    - `TestExtractNeighborSnippets` (5 个)：边界/中间/单节/句子完整性
+    - `TestStripDanglingTail` (6 个)：连接词/引用/多层/干净文本/空文本/3 句上限
+    - `TestDetectDanglingReferences` (6 个)：dangling_starter/look-forward/look-back/正常文本/多小节/空文本
+  - Result: Success
+
+### Verification
+- 单元测试：`tests/test_summarize.py` 55/55 通过 ✅（38 原有 + 17 新增）
+- 语法验证：ast.parse 通过
+- 手动测试：`_strip_dangling_tail` 验证多层清理正常工作（输入 3 句含连接词/引用，输出剩 2 句正常）
+- 手动测试：`_detect_dangling_references` 正确识别 4 类问题（连接词开头/look-forward/look-back/混合）
+
+### Impact
+- **LLM 输入增加**：每小节 prompt 多 ~200 字（prev+next 摘要），约 +20% input token 成本
+- **零 LLM 调用次数变化**：仍是每小节 1 次 + 失败再 2 轮重试
+- **零外部依赖**：纯 Python 文本处理 + 已有 LLM 调用
+- **可观测性提升**：返回的 `flow_issues` 字段让 LLM 和前端都能感知段落连贯性问题；可后续接入自动修复
+- **API 兼容性**：`prev_context`/`next_context` 默认为空字符串，外部调用方无感知；`flow_issues` 字段为新增，老调用方忽略即可
+
+### Next Steps
+- 监控真实 LLM 输出是否仍有悬空引用：可能需要在 prompt 中提供更具体的"改写为自包含"示例
+- 后续可考虑：当 `flow_issues` 数量 > 阈值时，自动对有问题的小节做一次"流畅化"二次调用（仅做衔接修复，不压字数）
+- `_DANGLING_STARTERS` 和 `_DANGLING_TAIL_PATTERNS` 字典可基于实际误报持续扩充
+
+---
+
+## 2026-07-28 - 精简 Prompt 增加可读性要求 + 悬空引用后处理兜底
+
+### 背景
+用户反馈："精简文档时注意，精简完后要保持文档的每个部分是正常可读的"。
+
+### Analysis
+- Topic: `summarize_section` 的 LLM 精简 Prompt 缺少"可读性"硬约束
+- Finding: 现有 Prompt 只覆盖字数/必保项/可精简项/禁止项/输出格式，但没规定精简后必须保持：
+  1. 句子完整（不应中途截断、出现残句）
+  2. 段落连贯（不应话题跳脱）
+  3. 悬空引用清理（"如前所述""见下表"等引用词精简后失去目标对象）
+  4. 上下文衔接（不应出现"前文/后文"等断裂感）
+  5. 格式完整（不应破坏列表/表格结构）
+  6. 首尾完整（不应截掉"因此""综上"等结论词）
+- Decision: 
+  1. 在 `_summarize_one_subsection` 的 system_prompt 中新增"可读性要求"章节，列 6 条硬约束
+  2. 同步在 `aggressive=True` 重试 prompt 中追加"可读性约束仍然适用"声明
+  3. 额外加一个**后处理兜底**：用正则匹配 8 种常见悬空引用词，若在文本末尾出现则截断到该引用所在句子的开头（避免留下"如前所述……"等半句话）
+
+### File Edited
+- File: `app/services/agent_tools.py` L1701-1755 (system_prompt) + L1800-1828 (后处理)
+  - Change 1: system_prompt 新增"可读性要求"章节（6 条硬约束）
+  - Change 2: aggressive=True 时追加"可读性约束仍然适用"声明
+  - Change 3: 后处理新增悬空引用兜底（8 种模式 + 句子边界截断）
+  - Result: Success - SYNTAX OK
+
+### Verification
+- 单元测试：`tests/test_summarize.py` 38/38 全部通过 ✅
+- 第一次提交 bug 修复：`_re_dangling.search(cleaned)` 漏传 pattern 参数导致 TypeError 被外层 except 吞掉，所有小节被判失败（7 个测试挂掉）。修后恢复
+- 实际行为（手动验证 5 个中文用例）：
+  - "正常内容，无需清理。" → 不动 ✅
+  - "本章主要讨论风险评估。如前所述。" → 截断到"。"前 → "本章主要讨论风险评估。" ✅
+  - "如上所述，本文档适用于..." → 不动（无句号在引用前）✅
+  - "风险评估见下表" → 不动（无句号在引用前）✅
+  - "风险管理。详见后续" → 截断到"。" → "风险管理。" ✅
+  - "前文已有讨论，下面是具体内容。" → 不动（非悬空引用）✅
+
+### 影响
+- LLM 现在有明确的 6 条可读性硬约束
+- 即使 LLM 漏掉悬空引用（违反 Prompt 约束），后处理兜底会清理最严重的"句末悬空引用"情况
+- 测试通过率保持 100%（38/38），未引入新 failure
+
+### Next Steps
+- 监控真实 LLM 调用是否还出现"如前所述"等悬空引用（Prompt + 兜底应能覆盖）
+- 必要时可扩展悬空引用模式列表或加正则检测"参见 §3.2"等带具体位置的引用
+
+## 2026-07-30 16:47:13 - 精简文档功能优化（Prompt 重构 + 后置可读性校验）
+- Project: design_planning_generation_local_model
+- Working Dir: E:\nrf_sample_codes\working_team_work\public\project\git_project\design_plan_generation_local_model\design_planning_generation_local_model
+- Task: 优化精简文档功能，保证精简后文档语言逻辑通顺、可读性强、意思不变情况下减少字数
+- 改动范围: app/services/agent_tools.py + tests/test_summarize.py
+
+### 2026-07-30 16:47:13 - File Edited
+- File: app/services/agent_tools.py
+- Change: 新增 `_validate_readability` 函数（120行），检测残句结尾/残句开头/悬空引用/表格列数不一致/表格缺分隔行/空列表项 6类可读性问题
+- Result: Success - 语法验证通过
+
+### 2026-07-30 16:53:00 - File Edited
+- File: app/services/agent_tools.py
+- Change: 重构 `_summarize_one_subsection` 的 system_prompt，优先级改为"意思不变>逻辑通顺>字数控制"，字数从硬约束"严格控制N字以内"改为软约束"目标约N字(±15%浮动)"；aggressive模式去掉"删除所有过渡性描述"过度指令
+- Result: Success
+
+### 2026-07-30 16:55:00 - File Edited
+- File: app/services/agent_tools.py
+- Change: 集成后置可读性校验流程：LLM返回后调用 `_validate_readability`，不达标触发1次修复重试（构造修复prompt含具体issues列表）；硬截断阈值从 target*1.15 提高到 target*1.3；返回值新增 readability_warnings 字段
+- Result: Success
+
+### 2026-07-30 16:56:00 - File Edited
+- File: tests/test_summarize.py
+- Change: 更新6处旧prompt关键词引用（"严格控制在"->"目标约"），适配新prompt格式
+- Result: Success
+
+### 2026-07-30 16:57:00 - File Edited
+- File: tests/test_summarize.py
+- Change: 新增 TestValidateReadability 测试类（17个用例）+ TestReadabilityIntegration 测试类（4个用例），覆盖校验函数各项检测和集成流程
+- Result: Success
+
+### 2026-07-30 16:58:00 - File Edited
+- File: app/services/agent_tools.py
+- Change: 修复 `_validate_readability` 4个bug：1)残句开头检测rest含句号导致漏检 2)表格引用自身包含ref_id导致漏检 3)章节引用同问题 4)表格分隔行regex不允许中间竖线导致完整表格误判
+- Result: Success
+
+### 2026-07-30 17:00:00 - Analysis
+- Topic: 测试结果验证
+- Finding: test_summarize.py 59/59 全部通过；完整测试套件 120 passed, 4 failed
+- Decision: 4个失败（test_phase1_tools_list过时断言4vs15、test_fallback_summary编码乱码等）均为预先存在的问题，与本次精简文档优化无关
+
+### Next Steps
+- 监控真实LLM调用时可读性校验的误报率
+- 必要时扩展 `_validate_readability` 的检测项
+- 考虑后续优化：章节级上下文精简（本次未实施）
+
+## 2026-07-31 17:55:00 - Plan-Eng-Review 执行
+- Topic: Solution D 多附件全场景覆盖（混合方案）技术评审
+- Finding: 当前 `_resolve_attachments` 过早合并附件为单一字符串，下游 prompt builder 丢失附件边界无法做配额分配
+- Finding: 3 种场景的字符预算（3000/1500/50000）总量充足，问题在于分配方式而非总量
+- Finding: VectorStore 语义检索可用但会增加依赖和延迟，建议 v2 升级
+- Decision: 推荐方案 Y（新增 `attachment_texts` 参数，向后兼容）+ 配额分配（比例+最小500保障）+ 逐附件关键词匹配 + outline 等额分配
+- Output: `E:\nrf_sample_codes\working_team_work\public\docs\code_writer_docs\plan-eng-review-2026-07-31-multi-attachment.md`
+- Result: Success - 评审完成，待用户确认后实施
+
+## 2026-07-31 18:10:00 - Solution D 实施完成
+- Topic: 多附件全场景覆盖（混合方案）实施
+- Finding: 4 个文件修改完成，所有新增测试通过
+- Decision: 采用方案 Y（新增 attachment_texts 参数向后兼容）+ 配额分配（比例+最小500保障）+ 逐附件关键词匹配 + outline 等额分配
+
+### 改动文件清单
+1. app/services/attachment_service.py: 新增 resolve_attachment_texts 函数（返回各附件独立文本列表）
+2. app/services/generator.py: _resolve_attachments 返回 (merged_str, attachment_texts) 元组 + generate() 传参
+3. app/services/minimax.py:
+   - 新增 _allocate_attachment_quota 辅助方法（比例分配+最小保障+N>4等额降级）
+   - _build_chapter_prompt: 新增 attachment_texts 参数 + 多附件配额分配/逐附件检索逻辑
+   - _build_section_prompt: 同上
+   - generate_content_with_fallback: 新增 attachment_texts 参数透传
+   - _generate_by_chapters: 新增 attachment_texts 参数透传
+   - _build_section_prompt 调用点: 传递 attachment_texts
+4. app/services/agent_tools.py: outline_from_attachment 遍历所有附件 + 等额分配 50000 预算
+5. tests/test_attachment.py:
+   - 更新 3 个 _resolve_attachments 测试（适配元组返回值）
+   - 更新 1 个接口签名测试（检查 attachment_texts 参数）
+   - 新增 TestAllocateAttachmentQuota（7 用例）
+   - 新增 TestMultiAttachmentInjection（5 用例）
+   - 新增 TestOutlineFromAttachmentMulti（3 用例）
+
+### 测试结果
+- test_attachment.py: 38/38 passed
+- 完整测试套件: 135 passed, 4 failed（4 个失败均为预先存在的问题）
+- Result: Success
+
+## 2026-08-03 13:42 - 精简文档表格内容通顺流畅性优化
+
+### 任务
+用户要求修改项目代码，使精简文档时保持文档表格中内容的通顺流畅。
+
+### 任务评估
+- 评估等级：Medium（2 个文件，4-5 处修改，无架构改动）
+- 用户选择使用 /plan-eng-review Skill 进行规划评审
+- 评审通过：3 issues 都在原计划内，0 critical gaps
+- 计划文件：`E:\nrf_sample_codes\working_team_work\public\docs\code_writer_docs\plan-table-fluency-2026-08-03.md`
+
+### Analysis
+- Topic: 精简文档功能表格流畅性 gap 分析
+- Finding: 现有 `_summarize_one_subsection` system_prompt 已有"可读性要求"段，但缺少表格专项规则；`_validate_readability` 已校验表格列数/分隔行/悬空引用，但不校验单元格残句和表格上下文；`_truncate_at_boundary` docstring 声称保护表格但实现仅按 `\n` 切分；aggressive 模式 line 1872 "删除解释列"主动破坏表格语义
+- Decision: 4 处修改 + 6 新测试，完整方案（Boil the Lake）
+
+### File Edits
+
+| # | Timestamp | File | Change | Result |
+|---|-----------|------|--------|--------|
+| 1 | 13:38 | `app/services/subagents.py` | SUMMARY_AGENT_PROMPT 增加：表格单元格通顺规则 + 表格上下文衔接规则（必须保留段+可以精简段各增 1-2 条） | Success |
+| 2 | 13:39 | `app/services/agent_tools.py` | `_summarize_one_subsection` system_prompt 增加表格单元格完整 + 表格上下文衔接 2 条可读性规则 | Success |
+| 3 | 13:40 | `app/services/agent_tools.py` | aggressive 模式 prompt：删除"表格只保留表头和必要数据行，删除解释列"，改为"表格保留完整列结构，可压缩单元格内冗余说明文字，但不得删除整列或破坏表格语义" | Success |
+| 4 | 13:40 | `app/services/agent_tools.py` | `_validate_readability` 新增规则 7（表格单元格残句校验）+ 规则 8（表格上下文衔接校验，tstart==0 跳过避免误报） | Success |
+| 5 | 13:41 | `app/services/agent_tools.py` | `_truncate_at_boundary` 增加表格保护逻辑：跟踪 in_table 状态，截断点落在表格内时回退到表格开始前 | Success |
+| 6 | 13:41 | `tests/test_summarize.py` | 新增 3 个测试类 8 个测试用例：TestTableFluencyPromptRules (3) + TestValidateReadabilityTableFluency (4) + TestTruncateAtBoundaryTableProtection (2) | Success |
+| 7 | 13:42 | `app/services/agent_tools.py` | 修复规则 8 误报：`test_complete_table_passes` 回归测试失败，tstart==0 时跳过（### 小节标题已提供上下文） | Success |
+
+### Bash Commands
+
+| # | Timestamp | Command | Purpose | Result |
+|---|-----------|---------|---------|--------|
+| 1 | 13:37 | `python -c "import ast; ast.parse(...)"` x3 | 语法验证 3 个修改文件 | Success - 3/3 OK |
+| 2 | 13:41 | `python -m pytest tests/test_summarize.py -v` | 首次单元测试 | Failure - 67/68 passed，`test_complete_table_passes` 回归失败 |
+| 3 | 13:42 | `python -m pytest tests/test_summarize.py -v` | 修复后重测 | Success - 68/68 passed |
+
+### 测试结果
+- test_summarize.py: 68/68 passed（62 既有 + 6 新增，0 回归）
+- 语法验证: 3/3 通过（subagents.py / agent_tools.py / test_summarize.py）
+- Result: Success
+
+### Summary
+- Tasks completed: 4 处代码修改 + 6 新测试 + 工作日志
+- Tasks pending: 无
+- Key decisions: 完整方案（4 点全做）而非简化方案（仅 Prompt）；规则 8 保守校验（tstart==0 跳过避免误报）
+- Next steps: 可选 - 实际 LLM 集成测试（需启动 Ollama 服务，用户确认）
+

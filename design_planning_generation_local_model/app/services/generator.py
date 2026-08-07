@@ -6,7 +6,7 @@ import asyncio
 from app.services.minimax import MiniMaxService
 from app.services.template import TemplateService
 
-from app.services.attachment_service import resolve_attachment_content
+from app.services.attachment_service import resolve_attachment_content, resolve_attachment_texts
 from typing import Optional, List
 
 
@@ -55,7 +55,7 @@ class DocumentGenerator:
         self._validate_input(doc_type, product_name, product_type)
 
         # 2. 解析附件内容
-        combined_attachment = self._resolve_attachments(file_ids, attachment_content)
+        combined_attachment, attachment_texts = self._resolve_attachments(file_ids, attachment_content)
 
         # 3. 在线程池中执行耗时同步操作，避免阻塞事件循环
         content = await asyncio.to_thread(
@@ -64,7 +64,8 @@ class DocumentGenerator:
             product_name=product_name,
             product_type=product_type,
             product_params=product_params,
-            attachment_content=combined_attachment
+            attachment_content=combined_attachment,
+            attachment_texts=attachment_texts
         )
 
         # 保存原始Markdown内容，供后续修订使用
@@ -88,21 +89,31 @@ class DocumentGenerator:
         self,
         file_ids: Optional[List[str]],
         attachment_content: Optional[str]
-    ) -> str:
-        """解析并合并附件内容"""
+    ) -> tuple:
+        """
+        解析附件内容，返回 (merged_str, attachment_texts)。
+
+        - merged_str: 所有附件合并后的单一字符串（向后兼容旧路径）
+        - attachment_texts: 各附件独立文本列表（用于配额分配/逐附件检索）
+        """
+        attachment_texts = []
         parts = []
 
-        # 从向量库解析 file_ids
+        # 从向量库解析 file_ids（保持各附件独立）
         if file_ids:
-            resolved = resolve_attachment_content(file_ids)
-            if resolved:
-                parts.append(resolved)
+            individual_texts = resolve_attachment_texts(file_ids)
+            attachment_texts.extend(individual_texts)
+            merged = "\n\n".join(individual_texts)
+            if merged:
+                parts.append(merged)
 
-        # 直接传入的文本内容
+        # 直接传入的文本内容（作为整体加入）
         if attachment_content:
+            attachment_texts.append(attachment_content)
             parts.append(attachment_content)
 
-        return "\n\n".join(parts) if parts else ""
+        merged_str = "\n\n".join(parts) if parts else ""
+        return merged_str, attachment_texts
 
     @property
     def search_log(self) -> list:

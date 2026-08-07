@@ -169,7 +169,7 @@ DOC_CHAPTERS = {
     ],
     "product_requirements_spec": [
         {"id": "ch1", "name": "产品概述", "query": "贴敷式胰岛素泵 产品概述 预期用途 适用范围"},
-        {"id": "ch2", "name": "功能需求", "query": "功能需求 输注模式 闭环控制 CGM联动 报警功能"},
+        {"id": "ch2", "name": "功能需求", "query": "功能需求 输注模式 开环控制 报警功能"},
         {"id": "ch3", "name": "性能需求", "query": "性能需求 输注精度 流量稳定性 阻塞检测 电池续航"},
         {"id": "ch4", "name": "安全需求", "query": "安全需求 故障检测 冗余设计 安全状态 电气安全"},
         {"id": "ch5", "name": "使用环境需求", "query": "使用环境 家庭护理 温度 湿度 防水 电磁环境"},
@@ -302,7 +302,7 @@ DOC_CHAPTERS = {
     ],
     "software_requirements_spec": [
         {"id": "ch1", "name": "概述", "query": "软件需求规范 目的 系统范围 贴敷式胰岛素泵 SAP1 IEC62304 安全等级C"},
-        {"id": "ch2", "name": "系统功能", "query": "系统功能 设备端app 手机端app 运行环境 用户访问控制 用户界面 输注控制 CGM联动 报警管理 数据记录 设备连接"},
+        {"id": "ch2", "name": "系统功能", "query": "系统功能 设备端app 手机端app 运行环境 用户访问控制 用户界面 输注控制 报警管理 数据记录 设备连接"},
         {"id": "ch3", "name": "数据连接方式", "query": "蓝牙 BLE HTTPS 数据加密 通信协议 服务器"},
         {"id": "ch4", "name": "系统内软件间的数据流通", "query": "数据同步 参数设置 健康数据 服务器 手表端 手机端"},
         {"id": "ch5", "name": "性能效率", "query": "响应时间 启动时间 并发用户 数据精度 平均响应时间"},
@@ -375,14 +375,14 @@ DOC_CHAPTERS = {
     ],
     "software_architecture_doc": [
         {"id": "ch1", "name": "架构概述", "query": "软件架构 IEC62304 安全等级C 系统架构"},
-        {"id": "ch2", "name": "模块划分", "query": "模块 组件 输注控制 CGM通信 报警管理 UI"},
+        {"id": "ch2", "name": "模块划分", "query": "模块 组件 输注控制 报警管理 UI"},
         {"id": "ch3", "name": "接口定义", "query": "API 数据流 控制流 模块间通信"},
         {"id": "ch4", "name": "安全架构", "query": "故障隔离 冗余设计 安全监控 安全状态"},
         {"id": "ch5", "name": "部署架构", "query": "嵌入式固件 移动App 云服务 部署方案"},
     ],
     "software_detailed_design": [
         {"id": "ch1", "name": "设计概述", "query": "详细设计 IEC62304 模块设计 概述"},
-        {"id": "ch2", "name": "核心算法设计", "query": "输注控制算法 CGM联动算法 报警决策 状态机"},
+        {"id": "ch2", "name": "核心算法设计", "query": "输注控制算法 报警决策 状态机"},
         {"id": "ch3", "name": "数据结构定义", "query": "数据结构 数据库 日志存储 配置数据"},
         {"id": "ch4", "name": "接口详细设计", "query": "API规范 通信协议 数据格式 时序"},
         {"id": "ch5", "name": "异常处理设计", "query": "异常处理 故障检测 恢复机制 降级模式"},
@@ -952,13 +952,13 @@ DOC_CHAPTERS = {
         {"id": "ch1", "name": "临床需求和市场分析", "query": "贴敷式胰岛素泵 糖尿病发病率 胰岛素泵市场规模 患者需求分析 竞品分析"},
         {"id": "ch2", "name": "目标用户群体定义", "query": "糖尿病患者 胰岛素泵用户 用户画像 1型糖尿病 2型糖尿病 胰岛素依赖"},
         {"id": "ch3", "name": "产品定义与预期用途", "query": "贴敷式胰岛素泵 产品定义 预期用途 适用范围 适应症 禁忌症"},
-        {"id": "ch4", "name": "产品关键特性定义", "query": "输注精度 无管路设计 BLE通信 闭环控制 贴敷方式 储药器容量"},
+        {"id": "ch4", "name": "产品关键特性定义", "query": "输注精度 无管路设计 BLE通信 开环控制 贴敷方式 储药器容量"},
         {"id": "ch5", "name": "竞争产品对比分析", "query": "Omnipod Medtronic Tandem 竞品分析 差异化优势 市场定位"},
         {"id": "ch6", "name": "法规和市场准入分析", "query": "NMPA三类 FDA 510k MDR 注册路径 医保政策 市场准入策略"},
     ],
     "project_feasibility_study": [
         {"id": "ch1", "name": "项目背景和目的", "query": "贴敷式胰岛素泵 项目背景 研发目的 战略意义"},
-        {"id": "ch2", "name": "技术可行性分析", "query": "胰岛素泵技术 微电机输注 闭环算法 BLE通信 技术成熟度 技术风险"},
+        {"id": "ch2", "name": "技术可行性分析", "query": "胰岛素泵技术 微电机输注 开环控制算法 BLE通信 技术成熟度 技术风险"},
         {"id": "ch3", "name": "商业可行性分析", "query": "市场规模 目标用户 预期售价 成本分析 投资回报 商业模式"},
         {"id": "ch4", "name": "合规可行性分析", "query": "NMPA注册 III类医疗器械 法规要求 标准合规 注册路径"},
         {"id": "ch5", "name": "资源和能力评估", "query": "研发团队 设备资源 生产能力 供应链 知识产权"},
@@ -966,7 +966,7 @@ DOC_CHAPTERS = {
     ],
     "patent_analysis_report": [
         {"id": "ch1", "name": "检索范围和策略", "query": "胰岛素泵 专利检索 数据库 检索策略 IPC分类 关键词"},
-        {"id": "ch2", "name": "核心专利分析", "query": "贴敷式胰岛素泵 输注机构 贴敷方式 闭环控制 核心专利 专利权人"},
+        {"id": "ch2", "name": "核心专利分析", "query": "贴敷式胰岛素泵 输注机构 贴敷方式 开环控制 核心专利 专利权人"},
         {"id": "ch3", "name": "专利布局分析", "query": "胰岛素泵专利 技术领域 地域分布 专利权人 申请趋势"},
         {"id": "ch4", "name": "专利风险分析", "query": "专利侵权风险 FTO分析 重点专利解读 规避设计建议"},
         {"id": "ch5", "name": "专利战略建议", "query": "专利申请策略 技术空白点 可专利性分析 知识产权布局"},
@@ -1552,7 +1552,7 @@ class MiniMaxService:
 - 直接以 "ID : SR N" 开头输出需求项
 
 【语言强制要求】
-- 除标准号（如GB 9706.1-2020、ISO 13485:2016）和必要缩写（CGM、BLE、API、OTA、IPX、DHF、DMR等）外，全部使用中文
+- 除标准号（如GB 9706.1-2020、ISO 13485:2016）和必要缩写（BLE、API、OTA、IPX、DHF、DMR等）外，全部使用中文
 - 不使用"我们"、"本公司"等第一人称
 - 不使用"应该"、"建议"等模糊词，使用"应"或直接陈述句
 - 使用规范的中文医疗器械专业术语
@@ -1799,7 +1799,7 @@ class MiniMaxService:
 - 概述章节包含"目的"和"系统范围"两个子节
 
 【语言强制要求】
-- 除标准号（如GB 42062-2022、ISO 13485）和必要缩写（CGM、BLE、API、OTA、IOB、ISF、TIR、HTTPS、AES、RSA、CRC、MD5、CentOS、MySQL等）外，全部使用中文
+- 除标准号（如GB 42062-2022、ISO 13485）和必要缩写（BLE、API、OTA、IOB、ISF、TIR、HTTPS、AES、RSA、CRC、MD5、CentOS、MySQL等）外，全部使用中文
 - 不使用"我们"、"本公司"等第一人称
 - 不使用"应该"、"建议"等模糊词，使用"应"或直接陈述句
 - 使用规范的中文医疗器械专业术语
@@ -1957,6 +1957,68 @@ class MiniMaxService:
 
         return web_info, downloaded_files, search_method
 
+    def _allocate_attachment_quota(
+        self,
+        attachment_texts: list,
+        total_budget: int,
+        min_per: int = 500
+    ) -> list:
+        """
+        将 total_budget 字符预算分配给多个附件，返回各附件截取后的文本列表。
+
+        策略：比例分配 + 最小保障
+        - N <= 4: 按附件长度比例分配，每个附件至少 min_per 字符
+        - N > 4: 等额分配（避免碎片化，每个附件分到的字符太少无意义）
+        - 单附件: 直接截取 total_budget
+
+        Args:
+            attachment_texts: 各附件独立文本列表
+            total_budget: 总字符预算
+            min_per: 每个附件最小字符保障（仅在 N <= 4 时生效）
+
+        Returns:
+            list[str]: 各附件截取后的文本列表（与输入等长，空文本保留为空字符串）
+        """
+        if not attachment_texts:
+            return []
+
+        texts = [t if t else "" for t in attachment_texts]
+        # 过滤空文本用于计算，但保留索引映射
+        non_empty = [(i, t) for i, t in enumerate(texts) if t.strip()]
+        if not non_empty:
+            return [""] * len(texts)
+
+        if len(non_empty) == 1:
+            idx, t = non_empty[0]
+            result = [""] * len(texts)
+            result[idx] = t[:total_budget]
+            return result
+
+        n = len(non_empty)
+        # N > 4: 等额分配
+        if n > 4:
+            per = total_budget // n
+            result = [""] * len(texts)
+            for idx, t in non_empty:
+                result[idx] = t[:per]
+            return result
+
+        # N <= 4: 比例分配 + 最小保障
+        lengths = [len(t) for _, t in non_empty]
+        total_len = sum(lengths)
+
+        result = [""] * len(texts)
+        for idx, t in non_empty:
+            l = len(t)
+            # 按比例分配
+            share = int(total_budget * l / total_len) if total_len > 0 else total_budget // n
+            # 最小保障（不超过文本本身长度）
+            share = max(min_per, share)
+            share = min(share, l)
+            result[idx] = t[:share]
+
+        return result
+
     def _build_chapter_prompt(
         self,
         index: int,
@@ -1969,7 +2031,8 @@ class MiniMaxService:
         product_name: str,
         product_type: str,
         product_params: str,
-        attachment_content: str
+        attachment_content: str,
+        attachment_texts: list = None
     ) -> str:
         """为单个章节构建增强后的 prompt（纯函数，线程安全）"""
         # 构建基础 prompt
@@ -2004,8 +2067,35 @@ class MiniMaxService:
         else:
             enhanced_prompt = base_prompt
 
-        # 注入附件内容 — 第一章全文注入，后续章节关键词匹配
-        if attachment_content:
+        # # 注入附件内容 - 多附件配额分配/逐附件检索，单附件保持原逻辑
+        multi_attachments = attachment_texts and len(attachment_texts) > 1
+        if multi_attachments:
+            if index == 1:
+                allocated = self._allocate_attachment_quota(attachment_texts, total_budget=3000, min_per=500)
+                parts = []
+                for i, text in enumerate(allocated):
+                    if text and text.strip():
+                        parts.append(f"--- 附件 {i + 1} ---\n{text}")
+                if parts:
+                    enhanced_prompt = enhanced_prompt.rstrip() + "\n\n" + \
+                        "【附件文档 - 产品背景信息（来自多个文档）】\n" + \
+                        "以下内容来自用户上传的多个产品相关文档，请充分利用这些信息生成内容：\n" + \
+                        "\n\n".join(parts) + "\n"
+            else:
+                per_budget = max(300, 1500 // len(attachment_texts))
+                all_relevant = []
+                for i, att_text in enumerate(attachment_texts):
+                    if not att_text or not att_text.strip():
+                        continue
+                    relevant = self._match_relevant_paragraphs(att_text, chapter_query, max_chars=per_budget)
+                    if relevant:
+                        all_relevant.append(f"--- 附件 {i + 1} 相关段落 ---\n{relevant}")
+                if all_relevant:
+                    enhanced_prompt = enhanced_prompt.rstrip() + "\n\n" + \
+                        "【附件文档 - 相关段落（来自多个文档）】\n" + \
+                        "\n\n".join(all_relevant) + "\n"
+        elif attachment_content:
+
             if index == 1:
                 enhanced_prompt = enhanced_prompt.rstrip() + "\n\n" + \
                     "【附件文档 - 产品背景信息】\n" + \
@@ -2016,7 +2106,6 @@ class MiniMaxService:
                 if relevant:
                     enhanced_prompt = enhanced_prompt.rstrip() + "\n\n" + \
                         "【附件文档 - 相关段落】\n" + relevant + "\n"
-
         # 注入 Web 搜索上下文
         if web_info:
             enhanced_prompt = enhanced_prompt.rstrip() + "\n\n" + "【相关法规标准 - 来自网络搜索】\n" + web_info + "\n"
@@ -2037,6 +2126,7 @@ class MiniMaxService:
         product_type: str,
         product_params: str,
         attachment_content: str,
+        attachment_texts: list = None,
         total_sections: int = 1,
         all_chapter_names: list = None
     ) -> str:
@@ -2167,8 +2257,35 @@ ID :  SR 2
         else:
             enhanced_prompt = section_prompt
 
-        # 注入附件内容 — 第一个小节全文注入，后续小节关键词匹配
-        if attachment_content:
+        # # 注入附件内容 - 多附件配额分配/逐附件检索，单附件保持原逻辑
+        multi_attachments = attachment_texts and len(attachment_texts) > 1
+        if multi_attachments:
+            if index == 1:
+                allocated = self._allocate_attachment_quota(attachment_texts, total_budget=3000, min_per=500)
+                parts = []
+                for i, text in enumerate(allocated):
+                    if text and text.strip():
+                        parts.append(f"--- 附件 {i + 1} ---\n{text}")
+                if parts:
+                    enhanced_prompt = enhanced_prompt.rstrip() + "\n\n" + \
+                        "【附件文档 - 产品背景信息（来自多个文档）】\n" + \
+                        "以下内容来自用户上传的多个产品相关文档，请充分利用这些信息生成内容：\n" + \
+                        "\n\n".join(parts) + "\n"
+            else:
+                per_budget = max(300, 1500 // len(attachment_texts))
+                all_relevant = []
+                for i, att_text in enumerate(attachment_texts):
+                    if not att_text or not att_text.strip():
+                        continue
+                    relevant = self._match_relevant_paragraphs(att_text, section_query, max_chars=per_budget)
+                    if relevant:
+                        all_relevant.append(f"--- 附件 {i + 1} 相关段落 ---\n{relevant}")
+                if all_relevant:
+                    enhanced_prompt = enhanced_prompt.rstrip() + "\n\n" + \
+                        "【附件文档 - 相关段落（来自多个文档）】\n" + \
+                        "\n\n".join(all_relevant) + "\n"
+        elif attachment_content:
+
             if index == 1:
                 enhanced_prompt = enhanced_prompt.rstrip() + "\n\n" + \
                     "【附件文档 - 产品背景信息】\n" + \
@@ -2179,7 +2296,6 @@ ID :  SR 2
                 if relevant:
                     enhanced_prompt = enhanced_prompt.rstrip() + "\n\n" + \
                         "【附件文档 - 相关段落】\n" + relevant + "\n"
-
         # 注入 Web 搜索上下文
         if web_info:
             enhanced_prompt = enhanced_prompt.rstrip() + "\n\n" + "【相关法规标准 - 来自网络搜索】\n" + web_info + "\n"
@@ -2363,7 +2479,8 @@ ID :  SR 2
         product_name: str,
         product_type: str,
         product_params: str = "",
-        attachment_content: str = ""
+        attachment_content: str = "",
+        attachment_texts: list = None
     ) -> str:
         """
         分小节生成文档内容并汇总（两阶段生成）
@@ -2514,6 +2631,7 @@ ID :  SR 2
                 product_type=product_type,
                 product_params=product_params,
                 attachment_content=attachment_content,
+                attachment_texts=attachment_texts,
                 total_sections=total,
                 all_chapter_names=all_chapter_names
             )
@@ -3136,7 +3254,8 @@ ID :  SR 2
         product_name: str,
         product_type: str,
         product_params: str = "",
-        attachment_content: str = ""
+        attachment_content: str = "",
+        attachment_texts: list = None
     ) -> str:
         """
         生成文档内容（分章节生成模式，统一入口）
@@ -3146,7 +3265,8 @@ ID :  SR 2
         try:
             # 统一使用分章节生成模式
             return self._generate_by_chapters(
-                doc_type, product_name, product_type, product_params, attachment_content
+                doc_type, product_name, product_type, product_params,
+                attachment_content, attachment_texts
             )
         except Exception as e:
             return self._generate_placeholder(doc_type, product_name, product_type, product_params, str(e))

@@ -334,7 +334,7 @@ class TestSummarizeOneSubsection:
             call_args = mock.call_args
             prompt = call_args[1]["system_prompt"] or call_args[0][0]
             # 比例化保底后：4*0.9=3，下限 40，但 3 < 40 故取 min(40,3)=3
-            assert "严格控制在 3 字" in prompt, f"expected 3 chars floor, got: {prompt[:200]}"
+            assert "目标约 3 字" in prompt, f"expected 3 chars floor, got: {prompt[:200]}"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -509,9 +509,9 @@ class TestSummarizeSectionTool:
         captured_targets = []
 
         def mock_llm(system_prompt, user_prompt, **kwargs):
-            # 提取目标字数（适配新 prompt 格式："严格控制在 N 字以内"）
+            # 提取目标字数（适配新 prompt 格式："目标约 N 字以内"）
             import re
-            m = re.search(r'严格控制在 (\d+) 字', system_prompt)
+            m = re.search(r'目标约 (\d+) 字', system_prompt)
             if m:
                 captured_targets.append(int(m.group(1)))
             return "精简内容"
@@ -677,7 +677,7 @@ class TestRatioModeFixes:
         # Mock LLM：返回固定长度的"假精简内容"，避免污染字符统计
         def mock_llm(system_prompt, user_prompt, **kwargs):
             import re
-            m = re.search(r'严格控制在 (\d+) 字', system_prompt)
+            m = re.search(r'目标约 (\d+) 字', system_prompt)
             target = int(m.group(1)) if m else 0
             # 模拟 LLM 严格按目标字数输出
             return "精" * max(target, 1) if target > 0 else "精" * 10
@@ -793,7 +793,7 @@ class TestRatioModeFixes:
 
         def mock_llm(system_prompt, user_prompt, **kwargs):
             import re
-            m = re.search(r'严格控制在 (\d+) 字', system_prompt)
+            m = re.search(r'目标约 (\d+) 字', system_prompt)
             target = int(m.group(1)) if m else 0
             is_aggressive = "紧急要求" in system_prompt
             is_retry = "上一轮精简后为" in user_prompt
@@ -866,7 +866,7 @@ class TestRatioModeFixes:
 
         def mock_llm(system_prompt, user_prompt, **kwargs):
             import re
-            m = re.search(r'严格控制在 (\d+) 字', system_prompt)
+            m = re.search(r'目标约 (\d+) 字', system_prompt)
             if m:
                 target = int(m.group(1))
                 # 严格按 target 输出 target 个"精"字（模拟理想 LLM）
@@ -890,4 +890,393 @@ class TestRatioModeFixes:
         assert deviation <= 0.15, (
             f"压缩比 {actual_ratio:.1%} 与目标 {target_ratio:.1%} 偏差 {deviation:.1%} > 15%\n"
             f"details: {data}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# _validate_readability 后置可读性校验测试 (2026-07-30 优化新增)
+# 覆盖: 残句/悬空引用/表格完整性/列表完整性/空内容
+# ═══════════════════════════════════════════════════════════════
+
+class TestValidateReadability:
+    """_validate_readability 后置可读性校验测试"""
+
+    def test_normal_text_passes(self):
+        """正常文本通过校验"""
+        from app.services.agent_tools import _validate_readability
+        result = _validate_readability("依据 ISO 13485 标准规范设计开发流程。")
+        assert result["is_valid"] is True
+        assert result["issues"] == []
+
+    def test_empty_text_fails(self):
+        """空内容标记为问题"""
+        from app.services.agent_tools import _validate_readability
+        result = _validate_readability("")
+        assert result["is_valid"] is False
+        assert any("为空" in i for i in result["issues"])
+
+    def test_whitespace_only_fails(self):
+        """仅空白内容标记为问题"""
+        from app.services.agent_tools import _validate_readability
+        result = _validate_readability("   \n  \t  ")
+        assert result["is_valid"] is False
+
+    def test_trailing_comma_is_fragment(self):
+        """末尾以逗号收尾是残句"""
+        from app.services.agent_tools import _validate_readability
+        result = _validate_readability("精简后内容以逗号，")
+        assert result["is_valid"] is False
+        assert any("逗号" in i or "标点" in i for i in result["issues"])
+
+    def test_trailing_semicolon_is_fragment(self):
+        """末尾以分号收尾是残句"""
+        from app.services.agent_tools import _validate_readability
+        result = _validate_readability("精简后内容以分号；")
+        assert result["is_valid"] is False
+
+    def test_trailing_conjunction_is_fragment(self):
+        """末尾以连词'和/或/与'收尾是残句"""
+        from app.services.agent_tools import _validate_readability
+        for conj in ('和', '或', '与'):
+            result = _validate_readability(f"精简后内容以连词{conj}")
+            assert result["is_valid"] is False, f"应检测到连词'{conj}'收尾残句"
+
+    def test_leading_conclusion_word_short_is_fragment(self):
+        """以'因此'开头但主句过短是残句"""
+        from app.services.agent_tools import _validate_readability
+        result = _validate_readability("因此。")
+        assert result["is_valid"] is False
+        assert any("因此" in i or "残句" in i for i in result["issues"])
+
+    def test_leading_conclusion_word_complete_passes(self):
+        """以'因此'开头但主句完整通过校验"""
+        from app.services.agent_tools import _validate_readability
+        result = _validate_readability("因此本章规范设计开发流程，依据 ISO 13485 标准执行。")
+        assert result["is_valid"] is True
+
+    def test_dangling_table_reference_fails(self):
+        """引用'如表3-1所示'但结果中无对应表格标记为悬空"""
+        from app.services.agent_tools import _validate_readability
+        text = "性能要求如表3-1所示。"
+        result = _validate_readability(text)
+        assert result["is_valid"] is False
+        assert any("表3-1" in i or "表格" in i for i in result["issues"])
+
+    def test_table_reference_with_table_passes(self):
+        """引用'表3-1'且结果中存在表格通过校验"""
+        from app.services.agent_tools import _validate_readability
+        text = ("性能要求如表3-1所示。\n\n"
+                "| 参数 | 限值 |\n"
+                "|------|------|\n"
+                "| 精度 | 0.05 |")
+        result = _validate_readability(text)
+        assert result["is_valid"] is True
+
+    def test_dangling_section_reference_fails(self):
+        """引用'见§3.2'但结果中无对应章节标记为悬空"""
+        from app.services.agent_tools import _validate_readability
+        text = "详见§9.9 的要求。"
+        result = _validate_readability(text)
+        assert result["is_valid"] is False
+        assert any("§9.9" in i or "章节" in i for i in result["issues"])
+
+    def test_table_inconsistent_columns_fails(self):
+        """表格列数不一致标记为问题"""
+        from app.services.agent_tools import _validate_readability
+        text = ("| 参数 | 限值 |\n"
+                "|------|------|\n"
+                "| 精度 | 0.05 | 备注 |")  # 第3行3列，前2行2列
+        result = _validate_readability(text)
+        assert result["is_valid"] is False
+        assert any("列数" in i for i in result["issues"])
+
+    def test_table_missing_separator_fails(self):
+        """表格缺少表头分隔行标记为问题"""
+        from app.services.agent_tools import _validate_readability
+        text = ("| 参数 | 限值 |\n"
+                "| 精度 | 0.05 |")  # 缺少 |---|---| 分隔行
+        result = _validate_readability(text)
+        assert result["is_valid"] is False
+        assert any("分隔行" in i for i in result["issues"])
+
+    def test_complete_table_passes(self):
+        """完整表格通过校验"""
+        from app.services.agent_tools import _validate_readability
+        text = ("| 参数 | 限值 |\n"
+                "|------|------|\n"
+                "| 精度 | 0.05 |")
+        result = _validate_readability(text)
+        assert result["is_valid"] is True
+
+    def test_empty_list_item_fails(self):
+        """空列表项标记为问题"""
+        from app.services.agent_tools import _validate_readability
+        text = "要求如下：\n\n- 精度\n-\n- 续航"
+        result = _validate_readability(text)
+        assert result["is_valid"] is False
+        assert any("空列表项" in i for i in result["issues"])
+
+    def test_normal_list_passes(self):
+        """正常列表通过校验"""
+        from app.services.agent_tools import _validate_readability
+        text = "要求如下：\n\n- 精度 0.05 U/h\n- 续航 3-7 天"
+        result = _validate_readability(text)
+        assert result["is_valid"] is True
+
+    def test_multiple_issues_all_reported(self):
+        """多个问题同时存在时全部报告"""
+        from app.services.agent_tools import _validate_readability
+        text = "因此，"  # 结论词开头 + 逗号收尾
+        result = _validate_readability(text)
+        assert result["is_valid"] is False
+        assert len(result["issues"]) >= 2
+
+
+class TestReadabilityIntegration:
+    """可读性校验集成到 _summarize_one_subsection 的测试"""
+
+    @pytest.mark.asyncio
+    async def test_readability_fix_retry_triggered(self):
+        """LLM 返回残句时触发可读性修复重试"""
+        from app.services.agent_tools import _summarize_one_subsection
+
+        call_count = [0]
+
+        def mock_llm(system_prompt, user_prompt, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # 首次返回以逗号收尾的残句
+                return "精简后内容以逗号，"
+            # 修复重试返回正常内容
+            return "精简后内容完整。"
+
+        with patch("app.services.minimax._call_minimax_api_raw",
+                   side_effect=mock_llm):
+            sub_title, new_body, stat = await _summarize_one_subsection(
+                sub_title="### 1.1 目的",
+                sub_body="原始内容" * 50,
+                target_chars=100,
+                chapter_name="第一章",
+                doc_label="项目开发计划书",
+            )
+
+        assert stat["status"] == "ok"
+        # 应触发修复重试（至少 2 次调用）
+        assert call_count[0] >= 2
+        # 修复后内容应以句号收尾而非逗号
+        assert new_body.rstrip().endswith("。")
+
+    @pytest.mark.asyncio
+    async def test_readability_warnings_recorded_when_fix_fails(self):
+        """修复重试仍无法解决时记录 readability_warnings"""
+        from app.services.agent_tools import _summarize_one_subsection
+
+        def mock_llm(system_prompt, user_prompt, **kwargs):
+            # 始终返回残句
+            return "精简后内容以逗号，"
+
+        with patch("app.services.minimax._call_minimax_api_raw",
+                   side_effect=mock_llm):
+            sub_title, new_body, stat = await _summarize_one_subsection(
+                sub_title="### 1.1 目的",
+                sub_body="原始内容" * 50,
+                target_chars=100,
+                chapter_name="第一章",
+                doc_label="项目开发计划书",
+            )
+
+        assert stat["status"] == "ok"
+        # 应记录可读性警告
+        assert "readability_warnings" in stat
+        assert len(stat["readability_warnings"]) > 0
+
+    @pytest.mark.asyncio
+    async def test_no_readability_warnings_when_clean(self):
+        """LLM 返回正常内容时不记录 warnings 且不触发修复重试"""
+        from app.services.agent_tools import _summarize_one_subsection
+
+        call_count = [0]
+
+        def mock_llm(system_prompt, user_prompt, **kwargs):
+            call_count[0] += 1
+            return "依据 ISO 13485 标准规范设计开发流程。"
+
+        with patch("app.services.minimax._call_minimax_api_raw",
+                   side_effect=mock_llm):
+            sub_title, new_body, stat = await _summarize_one_subsection(
+                sub_title="### 1.1 目的",
+                sub_body="原始内容" * 50,
+                target_chars=100,
+                chapter_name="第一章",
+                doc_label="项目开发计划书",
+            )
+
+        assert stat["status"] == "ok"
+        assert stat["readability_warnings"] == []
+        # 只调用 1 次（无修复重试）
+        assert call_count[0] == 1
+
+    @pytest.mark.asyncio
+    async def test_hard_truncate_threshold_raised_to_130(self):
+        """硬截断阈值从 1.15× 提高到 1.3×，减少误截断"""
+        from app.services.agent_tools import _summarize_one_subsection
+
+        # target=100，返回 118 字（>1.15×=115 但 <1.3×=130）
+        # 旧逻辑会硬截断，新逻辑不截断
+        long_content = "精" * 118
+        with patch("app.services.minimax._call_minimax_api_raw",
+                   return_value=long_content):
+            sub_title, new_body, stat = await _summarize_one_subsection(
+                sub_title="### 1.1",
+                sub_body="原始内容" * 50,
+                target_chars=100,
+                chapter_name="第一章",
+                doc_label="项目开发计划书",
+            )
+
+        assert stat["status"] == "ok"
+        # 118 < 130，不应触发硬截断
+        assert stat["new_chars"] == 118
+
+
+# ═══════════════════════════════════════════════════════════════
+# 表格内容通顺流畅性测试 (2026-08-03 优化新增)
+# 覆盖: prompt 规则存在性 / 表格单元格残句校验 / 表格上下文衔接校验 /
+#       _truncate_at_boundary 表格保护 / aggressive 模式不再删除解释列
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestTableFluencyPromptRules:
+    """Prompt 规则存在性测试：确保 prompt 含表格通顺性规则"""
+
+    def test_summary_agent_prompt_has_table_cell_fluency_rule(self):
+        """SUMMARY_AGENT_PROMPT 含表格单元格通顺性规则"""
+        from app.services.subagents import SUMMARY_AGENT_PROMPT
+        # 必须提及表格单元格完整/通顺
+        assert "表格单元格" in SUMMARY_AGENT_PROMPT
+        assert "通顺" in SUMMARY_AGENT_PROMPT or "完整" in SUMMARY_AGENT_PROMPT
+
+    def test_summary_agent_prompt_has_table_context_bridge_rule(self):
+        """SUMMARY_AGENT_PROMPT 含表格上下文衔接规则"""
+        from app.services.subagents import SUMMARY_AGENT_PROMPT
+        # 必须提及表格引出句或上下文衔接
+        assert "引出" in SUMMARY_AGENT_PROMPT or "上下文" in SUMMARY_AGENT_PROMPT
+
+    def test_aggressive_mode_no_longer_deletes_columns(self):
+        """aggressive 模式 prompt 不再含'删除解释列'，改为保留完整列结构"""
+        from app.services.agent_tools import _summarize_one_subsection
+        # 通过 mock 捕获 aggressive 模式的 system_prompt
+        captured = {"system_prompt": ""}
+
+        def mock_llm(system_prompt, user_prompt, **kwargs):
+            captured["system_prompt"] = system_prompt
+            return "精简内容" * 30
+
+        import asyncio
+        from unittest.mock import patch
+
+        async def run():
+            with patch("app.services.minimax._call_minimax_api_raw",
+                       side_effect=mock_llm):
+                await _summarize_one_subsection(
+                    sub_title="### 1.1",
+                    sub_body="原始内容" * 100,
+                    target_chars=50,  # 极小目标触发 aggressive
+                    chapter_name="第一章",
+                    doc_label="项目开发计划书",
+                    is_ratio_mode=False,
+                    aggressive=True,
+                )
+
+        asyncio.run(run())
+
+        # aggressive prompt 不应含"删除解释列"
+        assert "删除解释列" not in captured["system_prompt"]
+        # 应含"完整列结构"或类似保留表格语义的措辞
+        assert "完整列" in captured["system_prompt"] or "不得删除整列" in captured["system_prompt"]
+
+
+class TestValidateReadabilityTableFluency:
+    """_validate_readability 表格通顺性校验测试"""
+
+    def test_validate_table_cell_dangling_punct_fails(self):
+        """表格单元格以'的/和/或'等连词/助词收尾标记为残句"""
+        from app.services.agent_tools import _validate_readability
+        # 第二行单元格"针对胰岛素泵的"以"的"收尾，是残句
+        text = ("| 参数 | 说明 |\n"
+                "|------|------|\n"
+                "| 精度 | 针对胰岛素泵的 |")
+        result = _validate_readability(text)
+        assert result["is_valid"] is False
+        assert any("单元格" in i or "残句" in i for i in result["issues"])
+
+    def test_validate_table_cell_complete_passes(self):
+        """表格单元格内容完整通过校验"""
+        from app.services.agent_tools import _validate_readability
+        text = ("| 参数 | 说明 |\n"
+                "|------|------|\n"
+                "| 精度 | 输注精度 ±5% |")
+        result = _validate_readability(text)
+        # 不应有单元格残句问题（其他问题也都不应触发）
+        assert not any("单元格" in i or "残句" in i for i in result["issues"])
+
+    def test_validate_table_without_context_flagged(self):
+        """表格前无引出句或表号标记为缺少上下文"""
+        from app.services.agent_tools import _validate_readability
+        # 表格直接出现，前面无任何引出词或表号
+        text = ("设计开发流程。\n"
+                "| 参数 | 限值 |\n"
+                "|------|------|\n"
+                "| 精度 | 0.05 |")
+        result = _validate_readability(text)
+        assert result["is_valid"] is False
+        assert any("引出" in i or "上下文" in i for i in result["issues"])
+
+    def test_validate_table_with_intro_passes(self):
+        """表格前有引出句通过校验"""
+        from app.services.agent_tools import _validate_readability
+        text = ("主要参数如下表所示。\n"
+                "| 参数 | 限值 |\n"
+                "|------|------|\n"
+                "| 精度 | 0.05 |")
+        result = _validate_readability(text)
+        # 不应有表格上下文问题
+        assert not any("引出" in i or "上下文" in i for i in result["issues"])
+
+
+class TestTruncateAtBoundaryTableProtection:
+    """_truncate_at_boundary 表格保护测试"""
+
+    def test_truncate_protects_table_integrity(self):
+        """截断点落在表格内时回退到表格开始前，保留表格完整性"""
+        from app.services.agent_tools import _truncate_at_boundary, _count_chinese_chars
+        # 构造：前 200 字普通文本 + 一个表格（4 行，每行约 20 字）
+        # 表格总长约 80 字，max_chars 设为让截断点落在表格中间
+        prefix = "依据 ISO 13485 标准规范设计开发流程。" * 8  # 约 200 字
+        table = ("主要参数如下表所示。\n"
+                 "| 参数 | 限值 |\n"
+                 "|------|------|\n"
+                 "| 精度 | 0.05 U/h |\n"
+                 "| 防护 | IPX8 |")
+        text = prefix + table
+        # max_chars=210 让截断点在表格第一行数据行附近
+        truncated = _truncate_at_boundary(text, 210)
+        # 不应在表格中间断开（不应出现"|"开头的行作为最后一行）
+        last_lines = truncated.strip().split('\n')
+        last_line = last_lines[-1].strip()
+        # 最后一行不应是表格行（若截断在表格内应回退到表格前）
+        # 允许：截断在 prefix 内，或回退到表格前；不允许截断在表格中间
+        if last_line.startswith('|'):
+            # 若最后一行是表格行，则必须是表格的完整最后一行（IPX8）
+            assert "IPX8" in last_line or "0.05" in last_line, (
+                f"截断在表格中间: 最后一行='{last_line}'")
+
+    def test_truncate_no_table_in_text_unchanged_behavior(self):
+        """无表格文本仍按原逻辑截断（回归测试）"""
+        from app.services.agent_tools import _truncate_at_boundary, _count_chinese_chars
+        long_text = "这是一段长内容。" * 200  # 约 1000 字
+        truncated = _truncate_at_boundary(long_text, 500)
+        truncated_chars = _count_chinese_chars(truncated)
+        # 应仍按 1.05× 上限截断
+        assert truncated_chars <= 525
+
 

@@ -83,6 +83,10 @@ def get_pending_chapter_content(chapter_name: str) -> dict:
 async def search_kb(query: str, top_k: int = 5, use_rerank: bool = True) -> str:
     """检索贴敷式胰岛素泵知识库 (标准、法规、技术文档、测试报告等)。
 
+    同时检索两个 collection 并合并结果:
+      1. 主知识库 (insulin_pump_kb) — 标准、法规、技术参考文档
+      2. 用户上传附件库 (uploads) — 当前项目用户上传的参考文件
+
     当需要查找具体标准条款、技术参数限值、法规要求、同类产品数据时，必须先调用此工具。
     不要在未检索的情况下编造标准条款号和具体限值。
 
@@ -91,14 +95,17 @@ async def search_kb(query: str, top_k: int = 5, use_rerank: bool = True) -> str:
         top_k: 返回结果数量，默认5条。
         use_rerank: 是否启用Cross-Encoder精排（默认开启，提升精确率）。
                     两阶段检索：粗召回30条→BGE-Reranker精排→Top-K。
+                    注：精排仅作用于主知识库；uploads 集合较小，直接向量检索即可。
 
     Returns:
-        JSON格式的检索结果列表，每项包含 content, source, score。
+        JSON格式的检索结果列表，每项包含 content, source, source_collection, score。
+        source_collection 标识结果来源: "insulin_pump_kb" 或 "uploads"。
     """
     try:
         from app.services.rag.vector_store import VectorStore
 
-        def _do_retrieve():
+        def _do_retrieve_main():
+            """检索主知识库 (insulin_pump_kb)，可走 Reranker 精排"""
             store = VectorStore()
             if use_rerank:
                 return store.retrieve_and_rerank(
@@ -114,27 +121,121 @@ async def search_kb(query: str, top_k: int = 5, use_rerank: bool = True) -> str:
                     vector_weight=0.85,
                 )
 
-        # 精排增加30秒容错（粗召回90s + 精排30s）
-        timeout_sec = 120.0 if use_rerank else 90.0
-        results = await asyncio.wait_for(
-            asyncio.to_thread(_do_retrieve),
-            timeout=timeout_sec,
-        )
+        def _do_retrieve_uploads():
+            """直接检索 uploads collection (用户上传附件库)。
 
-        if not results:
+            uploads 集合规模较小 (通常 < 1000 chunks) 且不参与 QUERY_COLLECTIONS，
+            直接走 self.collection.query 即可，无需 Reranker 或 BM25 二次召回。
+            """
+            try:
+                store = VectorStore(collection_name="uploads")
+                try:
+                    count = store.collection.count()
+                except Exception:
+                    return []
+                if count == 0:
+                    return []
+                query_embedding = store.embedder.encode_single(query)
+                raw = store.collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=top_k,
+                    include=["documents", "metadatas", "distances"],
+                )
+                if not raw or not raw.get("ids") or not raw["ids"][0]:
+                    return []
+                results = []
+                for i in range(len(raw["ids"][0])):
+                    distance = raw["distances"][0][i]
+                    similarity = max(0.0, 1.0 - distance / 2.0)
+                    meta = raw["metadatas"][0][i] or {}
+                    results.append({
+                        "text": raw["documents"][0][i],
+                        "source_file": meta.get("source_file", "用户上传附件"),
+                        "section_title": meta.get("section_title", ""),
+                        "doc_type": meta.get("doc_type", ""),
+                        "chunk_index": meta.get("chunk_index", 0),
+                        "similarity": similarity,
+                        "distance": distance,
+                        "chunk_id": raw["ids"][0][i],
+                    })
+                return results
+            except Exception as e:
+                print(f"[search_kb] uploads 检索异常: {e}")
+                return []
+
+        # 并行执行两个检索 (主库可能耗时较长，uploads 几秒内完成)
+        timeout_sec = 120.0 if use_rerank else 90.0
+        try:
+            main_results, upload_results = await asyncio.wait_for(
+                asyncio.gather(
+                    asyncio.to_thread(_do_retrieve_main),
+                    asyncio.to_thread(_do_retrieve_uploads),
+                    return_exceptions=True,
+                ),
+                timeout=timeout_sec,
+            )
+        except asyncio.TimeoutError:
+            return json.dumps({
+                "status": "timeout",
+                "message": f"知识库检索超时（{int(timeout_sec)}秒）。请尝试缩小查询范围或稍后重试。",
+                "results": [],
+            }, ensure_ascii=False)
+
+        # 归一化主库结果
+        if isinstance(main_results, Exception):
+            print(f"[search_kb] 主库检索异常: {main_results}")
+            main_results = []
+        main_results = main_results or []
+        for r in main_results:
+            r.setdefault("source_collection", "insulin_pump_kb")
+
+        # 归一化 uploads 结果
+        if isinstance(upload_results, Exception):
+            print(f"[search_kb] uploads 检索异常: {upload_results}")
+            upload_results = []
+        upload_results = upload_results or []
+        for r in upload_results:
+            r["source_collection"] = "uploads"
+
+        all_results = list(main_results) + list(upload_results)
+        if not all_results:
             return json.dumps({
                 "status": "no_results",
                 "message": f'未找到与"{query}"直接相关的知识库内容。请用已有知识回答，并告知用户此为基于经验的建议，建议用户自行查证最新标准。',
                 "results": [],
             }, ensure_ascii=False)
 
+        # 按分数排序 (精排分数优先，回退到相似度)
+        def _get_score(r):
+            rs = r.get("rerank_score")
+            if rs is not None:
+                return rs
+            return r.get("similarity", 0.0)
+        all_results.sort(key=_get_score, reverse=True)
+
+        # 去重 (按 chunk_id，否则按 text 前 100 字)
+        seen = set()
+        unique = []
+        for r in all_results:
+            key = r.get("chunk_id") or r.get("text", "")[:100]
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(r)
+            if len(unique) >= top_k:
+                break
+
+        # 格式化输出
         formatted = []
-        for r in results:
-            # 优先使用精排分数，回退到相似度分数
-            score = r.get("rerank_score", r.get("similarity", 0))
+        for r in unique:
+            score = _get_score(r)
+            source = r.get("source_file", "未知来源")
+            if r.get("source_collection") == "uploads":
+                source = f"[附件] {source}"
             formatted.append({
                 "content": r.get("text", ""),
-                "source": r.get("source_file", "未知来源"),
+                "source": source,
+                "source_collection": r.get("source_collection", "unknown"),
                 "score": round(score, 3),
             })
 
@@ -143,6 +244,7 @@ async def search_kb(query: str, top_k: int = 5, use_rerank: bool = True) -> str:
             "query": query,
             "count": len(formatted),
             "reranked": use_rerank,
+            "uploads_included": len(upload_results) > 0,
             "results": formatted,
         }, ensure_ascii=False)
 
@@ -233,7 +335,7 @@ async def _generate_search_queries(
 ## 任务
 生成 {num_queries} 条检索查询词，每条查询词应：
 1. 包含具体的标准号、参数名、技术术语或法规条款号（不要泛泛而谈）
-2. 与产品上下文紧密结合（如软件C级、贴敷式胰岛素泵、闭环控制等）
+2. 与产品上下文紧密结合（如软件C级、贴敷式胰岛素泵、开环控制等）
 3. 覆盖不同检索维度（如：标准要求类、测试方法类、限值参数类）
 
 ## 输出格式（严格JSON）
@@ -1531,6 +1633,8 @@ def _truncate_at_boundary(text: str, max_chars: int) -> str:
     优先在句子边界（。！？；\\n）截断，保留表格和代码块完整性。
     用于 LLM 精简后仍超目标时的硬截断兜底。
     修复：原 1.15× 上限偏高，比例模式下应更紧凑。
+    修复：增加表格完整性保护 - 若截断点落在表格内，回退到表格开始前的位置，
+          避免丢失表格数据行破坏表格结构。
     """
     if not text or max_chars <= 0:
         return text
@@ -1546,12 +1650,50 @@ def _truncate_at_boundary(text: str, max_chars: int) -> str:
     result_parts = []
     accumulated = 0
     limit = int(max_chars * 1.05)
+    # 表格保护：跟踪当前是否在表格内，记录表格开始时的累积量
+    in_table = False
+    table_start_accumulated = 0  # 表格开始前已累积的字数
+
+    def _is_table_row(s: str) -> bool:
+        s = s.strip()
+        return s.startswith('|') and s.endswith('|')
+
+    def _is_table_separator(s: str) -> bool:
+        s = s.strip()
+        return bool(re.match(r'^[\s\-:|]+$', s)) and '-' in s and '|' in s
 
     for sent in sentences:
         if not sent:
             continue
+        sent_stripped = sent.strip()
+        # 检测表格边界
+        if _is_table_row(sent_stripped) and not _is_table_separator(sent_stripped):
+            if not in_table:
+                # 表格开始：记录当前累积量作为回退点
+                in_table = True
+                table_start_accumulated = accumulated
+        elif _is_table_row(sent_stripped) and _is_table_separator(sent_stripped):
+            # 分隔行，保持 in_table 状态
+            pass
+        elif not _is_table_row(sent_stripped):
+            # 非表格行：结束表格状态
+            in_table = False
+
         sent_chars = _count_chinese_chars(sent)
         if accumulated + sent_chars > limit and result_parts:
+            # 截断点：若当前在表格内，回退到表格开始前
+            if in_table and table_start_accumulated > 0:
+                # 回退到表格开始前
+                while (result_parts
+                       and _is_table_row(result_parts[-1].strip())):
+                    result_parts.pop()
+                # 同时清除可能残留的空行
+                while result_parts and not result_parts[-1].strip():
+                    result_parts.pop()
+                if result_parts:
+                    return "".join(result_parts).rstrip()
+                # 全部回退完了，用硬截断
+                return text[:max_chars * 2]
             break
         result_parts.append(sent)
         accumulated += sent_chars
@@ -1561,6 +1703,188 @@ def _truncate_at_boundary(text: str, max_chars: int) -> str:
         return text[:max_chars * 2]
 
     return "".join(result_parts).rstrip()
+
+
+def _validate_readability(text: str, orig_text: str = "") -> dict:
+    """校验精简后文本的可读性与语义完整性。
+
+    保守检测精简过程中常见的可读性问题，返回问题列表供 LLM 修复参考。
+    只标记明确的违规模式，避免误报。
+
+    Args:
+        text: 精简后的文本
+        orig_text: 原始文本（用于引用有效性校验，可选）
+
+    Returns:
+        {"is_valid": bool, "issues": [str]} - is_valid 为 True 表示通过校验
+    """
+    import re
+
+    if not text or not text.strip():
+        return {"is_valid": False, "issues": ["精简后内容为空"]}
+
+    issues = []
+    cleaned = text.strip()
+
+    # 1. 残句结尾：以逗号/顿号/分号等收尾，说明被截断
+    bad_end_punct = ('，', '、', '；', ',', ';', '：', ':')
+    # 去除末尾的空白和 markdown 标记后再判断
+    stripped_end = cleaned.rstrip()
+    while stripped_end and stripped_end[-1] in (' ', '\n', '\t'):
+        stripped_end = stripped_end.rstrip()
+    if stripped_end and stripped_end[-1] in bad_end_punct:
+        issues.append(f"末尾以标点'{stripped_end[-1]}'收尾，疑似残句被截断")
+
+    # 2. 残句结尾：以连词/介词收尾（"和/或/与/而/则"等），后无内容
+    if stripped_end:
+        last_char = stripped_end[-1]
+        if last_char in ('和', '或', '与', '而', '则', '把', '被', '将', '由'):
+            issues.append(f"末尾以连词/介词'{last_char}'收尾，疑似残句")
+
+    # 3. 残句开头：以结论词开头但主句过短
+    first_line = cleaned.split('\n', 1)[0].lstrip('#-*>` \t')
+    bad_start_words = ('因此', '综上', '所以', '从而', '可见', '由此')
+    for bw in bad_start_words:
+        if first_line.startswith(bw):
+            # 若结论词后没有完整主句（去除标点后少于 4 字），标记为残句
+            rest = first_line[len(bw):]
+            rest_content = re.sub(r'[。！？，、；：,.!?;:\s]', '', rest)
+            if len(rest_content) < 4:
+                issues.append(f"开头以'{bw}'起始但主句不完整，疑似残句")
+            break
+
+    # 4. 悬空引用：引用对象（表/图/章节）在精简结果中找不到
+    # 移除引用本身后再检查 ref_id 是否仍存在，避免引用自身导致误判
+    ref_checks = [
+        (r'如\s*表\s*([\d\-\.]+)\s*所示', '表', 'table'),
+        (r'见\s*表\s*([\d\-\.]+)', '表', 'table'),
+        (r'见\s*图\s*([\d\-\.]+)', '图', 'figure'),
+        (r'参见\s*§\s*([\d\.]+)', '章节', 'section'),
+        (r'见\s*§\s*([\d\.]+)', '章节', 'section'),
+    ]
+    has_any_table = '|' in cleaned  # 是否存在任何 markdown 表格
+    for pat, label, kind in ref_checks:
+        for m in re.finditer(pat, cleaned):
+            ref_id = m.group(1)
+            full_match = m.group(0).strip()
+            # 移除所有匹配的引用后，检查 ref_id 是否仍存在
+            text_without_refs = re.sub(pat, '', cleaned)
+            if kind == 'table':
+                # 表格引用：文本中需要存在 markdown 表格（|）或独立的"表 {id}"标题
+                has_ref = has_any_table or (f'表 {ref_id}' in text_without_refs)
+                if not has_ref:
+                    issues.append(f"引用'{full_match}'在精简结果中找不到对应表格")
+            elif kind == 'figure':
+                has_ref = (f'图 {ref_id}' in text_without_refs or f'图{ref_id}' in text_without_refs)
+                if not has_ref:
+                    issues.append(f"引用'{full_match}'在精简结果中找不到对应图")
+            elif kind == 'section':
+                has_ref = (f'§{ref_id}' in text_without_refs or f'§ {ref_id}' in text_without_refs
+                           or ref_id in text_without_refs)
+                if not has_ref:
+                    issues.append(f"引用'{full_match}'在精简结果中找不到对应章节")
+
+    # 5. 表格完整性：表格列数不一致（跳过分隔行 |---|---|）
+    # 分隔行只包含 -、:、|、空白，且至少含一个 - 和一个 |
+    def _is_separator_row(s: str) -> bool:
+        return bool(re.match(r'^[\s\-:|]+$', s)) and '-' in s and '|' in s
+
+    table_lines = [l for l in cleaned.split('\n')
+                   if l.strip().startswith('|') and l.strip().endswith('|')]
+    if len(table_lines) >= 2:
+        col_counts = set()
+        for line in table_lines:
+            s = line.strip()
+            if _is_separator_row(s):
+                continue  # 分隔行
+            cols = s.count('|') - 1
+            if cols > 0:
+                col_counts.add(cols)
+        if len(col_counts) > 1:
+            issues.append(f"表格列数不一致：{sorted(col_counts)}")
+
+        # 表格缺少表头分隔行：第一行数据行后未紧跟 |---| 分隔行
+        first_data_idx = None
+        for i, line in enumerate(table_lines):
+            if not _is_separator_row(line.strip()):
+                first_data_idx = i
+                break
+        if first_data_idx is not None and first_data_idx + 1 < len(table_lines):
+            next_line = table_lines[first_data_idx + 1].strip()
+            if not _is_separator_row(next_line):
+                issues.append("表格缺少表头分隔行（|---|）")
+
+    # 6. 空列表项：列表符号后无内容
+    for line in cleaned.split('\n'):
+        s = line.strip()
+        if s in ('-', '*') or re.match(r'^[-*]\s*$', s):
+            issues.append("存在空列表项（'-' 后无内容）")
+            break
+
+    # 7. 表格单元格残句：单元格内文本以连词/助词/逗号等收尾
+    # 仅校验表格数据行（跳过分隔行），提取单元格内容并检查末尾字符
+    if len(table_lines) >= 2:
+        cell_dangling_chars = ('，', '、', '；', ',', ';', '：', ':',
+                               '和', '或', '与', '而', '则', '把', '被', '将', '由', '的')
+        cell_issues_found = []
+        for line in table_lines:
+            s = line.strip()
+            if _is_separator_row(s):
+                continue  # 跳过分隔行
+            # 提取单元格内容：去掉首尾 | 后按 | 切分
+            inner = s[1:-1] if s.startswith('|') and s.endswith('|') else s
+            cells = inner.split('|')
+            for cell_idx, cell in enumerate(cells):
+                cell_text = cell.strip()
+                if not cell_text:
+                    continue
+                # 去除单元格末尾的 markdown 标记后再判断
+                stripped_cell = cell_text.rstrip('*_`~ ')
+                if stripped_cell and stripped_cell[-1] in cell_dangling_chars:
+                    cell_issues_found.append(
+                        f"表格单元格'{stripped_cell[:12]}...'以'{stripped_cell[-1]}'收尾，疑似残句")
+                    break  # 每行只报一次，避免噪音
+            if cell_issues_found:
+                break  # 整体只报一次，避免噪音
+        if cell_issues_found:
+            issues.append(cell_issues_found[0])
+
+    # 8. 表格上下文衔接：表格前应有引出句或表号标注（保守校验）
+    # 仅当表格前 2 行内无任何引出词/表号时才标记，避免误报
+    # 例外：表格在小节正文起始位置（tstart==0）时，### 小节标题已提供上下文，不标记
+    if len(table_lines) >= 2:
+        # 找到表格块在原文中的起始位置
+        lines_all = cleaned.split('\n')
+        table_start_indices = []
+        for i, line in enumerate(lines_all):
+            s = line.strip()
+            if s.startswith('|') and s.endswith('|') and not _is_separator_row(s):
+                # 检查是否是表格块的第一行（前一行不是表格行）
+                if i == 0 or not (lines_all[i-1].strip().startswith('|')
+                                  and lines_all[i-1].strip().endswith('|')):
+                    table_start_indices.append(i)
+
+        intro_patterns = [
+            r'如下表', r'如下所示', r'见下表', r'如表所示', r'详见下表',
+            r'如下表所示', r'如表\s*[\d\-\.]+', r'表\s*\d', r'下表\s*列',
+            r'下表\s*给', r'下表\s*展', r'下表\s*汇总',
+        ]
+        for tstart in table_start_indices:
+            # 表格在小节正文起始位置，### 小节标题已提供上下文，跳过
+            if tstart == 0:
+                continue
+            # 检查表格前 2 行（含表格首行）是否有引出词或表号
+            has_intro = False
+            check_start = max(0, tstart - 2)
+            for j in range(check_start, tstart + 1):
+                if re.search('|'.join(intro_patterns), lines_all[j]):
+                    has_intro = True
+                    break
+            if not has_intro:
+                issues.append("表格缺少引出上下文（表格前应有引出句或表号标注）")
+                break  # 整体只报一次
+
+    return {"is_valid": len(issues) == 0, "issues": issues}
 
 
 async def _summarize_one_subsection(
@@ -1598,8 +1922,11 @@ async def _summarize_one_subsection(
 
     system_prompt = f"""你是医疗器械注册文档的小节内容精简专家。
 
-## 任务
-精简以下小节内容，**严格控制在 {target_chars} 字以内，最多不超过 {hard_limit} 字**。
+## 核心原则（按优先级，优先级高的优先保证）
+1. **意思不变**：保留原文所有核心观点、结论、法规条款号、技术参数，不编造、不篡改
+2. **逻辑通顺**：精简后必须自然流畅可读，语句完整、段落连贯，无残句、断链、悬空引用
+3. **字数控制**：目标约 {target_chars} 字（允许 ±15% 浮动，最多 {hard_limit} 字），字数服从前两项
+
 本小节属于《{doc_label}》文档「{chapter_name}」章节。
 
 ## 精简规则
@@ -1624,23 +1951,38 @@ async def _summarize_one_subsection(
 - 改变技术参数的数值或单位
 - 增加原文没有的新观点或新结论
 
+### 可读性要求（精简后必须保持）
+- **语句完整**：每个句子必须语法完整，禁止中途截断、保留主谓宾结构；不要出现"主语后突然断句""以逗号收尾"等残句
+- **段落连贯**：精简后必须保持段落内部逻辑连贯，避免话题跳脱；先说原因后说结论、先说前提后说要求等叙述顺序要保留
+- **避免悬空引用**：
+  - 禁止使用「如前所述」「如上所述」「见下表」「如下表所示」「上述内容」「详见后续」「前面提到」等悬空引用词
+  - 若原文有指向具体内容（如"如表4-1所示""见§3.2"），精简后该引用必须仍然有效（指向的内容必须在精简结果中可找到）
+  - 若引用的具体内容在精简中被删除，必须改写为完整描述或删除该引用
+- **表格单元格完整**：表格单元格内文本必须语法完整、语义通顺；禁止单元格以"的/和/或/与/而/则/把/被/将/由"等连词/助词收尾的残句；单元格内应是一个完整的词组、短语或句子
+- **表格上下文衔接**：保留引出表格的句子（如"主要参数如下表所示"）和解释表格的关键结论句；若表格独立成段且有明确表号（如"表 4-1"），可无引出句但需有表号标注；禁止表格前后均无任何引出或解释文字的悬空表格
+- **上下文衔接**：精简后的小节首尾应能自然衔接上下文，不要出现"前文/后文"等断裂感
+- **格式完整**：保留必要的 Markdown 结构（列表项、表格行列、加粗、引用块），不要因为精简而破坏列表/表格的完整结构
+- **首尾完整**：精简后的小节应是一个完整的语义单元，开头和结尾都要自然；不要因为字数限制而把"因此""综上"等结论词截掉
+
 ## 输出格式
 - 直接输出精简后的 Markdown 正文
 - 不要输出小节标题（### XXX），只输出正文
 - 不要输出任何解释、前言、总结
 - 保留原有的 Markdown 格式（表格、列表、加粗等）""" + (
-    """
+    f"""
 
 ## ⚠️ 紧急要求：必须严格控制字数
-你之前的精简尝试未达标，现在必须**更激进地**精简。
-- 大胆合并同义句、删除所有过渡性描述、削减举例说明
-- 表格只保留表头和必要数据行，删除解释列
+你之前的精简尝试未达标，现在需要更紧凑地精简。
+- 在不损伤语义前提下合并同义句、压缩冗长背景、删除过渡性描述
+- 表格保留完整列结构，可压缩单元格内冗余说明文字，但不得删除整列或破坏表格语义
+- 表格单元格内文本必须保持语法完整、语义通顺，禁止单元格残句
 - 法规条款号可保留但删除其后的展开说明
-- 再次严格控制在 {target_chars} 字以内（最多 {hard_limit} 字）"""
+- 目标约 {target_chars} 字（最多 {hard_limit} 字）
+- **可读性约束仍然适用**：即使精简也必须保持语句完整、段落连贯，禁止悬空引用；如要删除被引用的内容，必须同时改写或删除引用本身"""
     if aggressive else ""
 )
 
-    user_prompt = f"""请精简以下小节内容（必须控制在 {target_chars} 字以内，最多 {hard_limit} 字）：
+    user_prompt = f"""请精简以下小节内容（目标约 {target_chars} 字，最多 {hard_limit} 字，优先保证意思不变和逻辑通顺）：
 
 {sub_body}"""
 
@@ -1683,9 +2025,92 @@ async def _summarize_one_subsection(
             lines = cleaned.split("\n", 1)
             cleaned = lines[1].strip() if len(lines) > 1 else cleaned
 
+        # 清理悬空引用兜底：若 LLM 输出结尾包含明显悬空引用（无明确目标对象），
+        # 截断到该引用所在句子的开头，避免留下"如前所述……"等半句话
+        import re as _re_dangling
+        dangling_patterns = [
+            r"如前所述[，。；,.;\s]*$",
+            r"如上所述[，。；,.;\s]*$",
+            r"见下表[，。；,.;\s]*$",
+            r"如下表所示[，。；,.;\s]*$",
+            r"上述内容[，。；,.;\s]*$",
+            r"详见后续[，。；,.;\s]*$",
+            r"前面提到[，。；,.;\s]*$",
+            r"参见附录[，。；,.;\s]*$",
+        ]
+        if cleaned:
+            for pat in dangling_patterns:
+                m = _re_dangling.search(pat, cleaned)
+                if m:
+                    # 截断到该悬空引用所在句子的开头
+                    cut_pos = m.start()
+                    # 找到 cut_pos 之前的最近一个句号/换行
+                    last_boundary = max(
+                        cleaned.rfind("。", 0, cut_pos),
+                        cleaned.rfind("\n", 0, cut_pos),
+                    )
+                    if last_boundary > 0:
+                        cleaned = cleaned[:last_boundary + 1].rstrip()
+                        print(f"[summarize_section] 清理悬空引用 (匹配 '{pat}'): "
+                              f"保留前 {len(cleaned)} 字符")
+                    break
+
         new_chars = _count_chinese_chars(cleaned)
 
-        # 迭代精简：若结果超目标 15%，最多重试 2 轮（共 3 轮），每轮更激进
+        # ── 后置可读性校验：检测残句、悬空引用、表格列表完整性问题 ──
+        # 不达标触发 1 次修复重试，将 issues 反馈给 LLM 主动修复（比 regex 硬删更安全）
+        readability_warnings = []
+        validation = _validate_readability(cleaned, sub_body)
+        if not validation["is_valid"]:
+            print(f"[summarize_section] 可读性校验发现 {len(validation['issues'])} 个问题: "
+                  f"{validation['issues']}，触发修复重试")
+            fix_user_prompt = f"""你刚才精简的内容存在以下可读性问题：
+{chr(10).join(f'- {issue}' for issue in validation['issues'])}
+
+请修复上述所有问题，重新输出精简后的内容。要求：
+1. 修复上述所有可读性问题（补全残句、改写或删除悬空引用、修复表格列表结构）
+2. 保持语义不变，保留所有法规条款号和技术参数
+3. 目标约 {target_chars} 字（最多 {hard_limit} 字）
+4. 直接输出修复后的 Markdown 正文，不要输出标题和解释
+
+待修复内容：
+{cleaned}"""
+            try:
+                async with _llm_semaphore:
+                    fix_response = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _call_minimax_api_raw,
+                            system_prompt=system_prompt,
+                            user_prompt=fix_user_prompt,
+                            temperature=0.2,
+                            max_tokens=max_tok,
+                        ),
+                        timeout=180.0,
+                    )
+                if fix_response:
+                    fix_cleaned = fix_response.strip()
+                    if fix_cleaned.startswith("### "):
+                        lines_fc = fix_cleaned.split("\n", 1)
+                        fix_cleaned = lines_fc[1].strip() if len(lines_fc) > 1 else fix_cleaned
+                    # 重新校验修复结果
+                    revalidation = _validate_readability(fix_cleaned, sub_body)
+                    if revalidation["is_valid"]:
+                        print(f"[summarize_section] 可读性修复成功: 修复 {len(validation['issues'])} 个问题")
+                        cleaned = fix_cleaned
+                    elif _count_chinese_chars(fix_cleaned) <= new_chars:
+                        # 修复后仍有问题但未变长，接受修复结果并记录剩余警告
+                        print(f"[summarize_section] 可读性修复部分成功: 剩余 {len(revalidation['issues'])} 个问题")
+                        cleaned = fix_cleaned
+                        readability_warnings = revalidation["issues"]
+                    else:
+                        # 修复后变长且仍有问题，保留原 cleaned，记录原警告
+                        readability_warnings = validation["issues"]
+                new_chars = _count_chinese_chars(cleaned)
+            except Exception as e:
+                print(f"[summarize_section] 可读性修复重试失败: {e}")
+                readability_warnings = validation["issues"]
+
+        # 迭代精简：若结果超目标 15%，最多重试 2 轮（共 3 轮），每轮更紧凑
         # 修复：原 1.2× 阈值过宽，比例模式下允许 20% 偏差导致总比例偏离目标
         max_rounds = 3
         for round_idx in range(1, max_rounds):
@@ -1694,8 +2119,8 @@ async def _summarize_one_subsection(
             print(f"[summarize_section] 第{round_idx}轮精简不足: "
                   f"{new_chars}字 > 目标{target_chars}字×1.15={int(target_chars*1.15)}字，重试")
             retry_user_prompt = f"""上一轮精简后为 {new_chars} 字，仍超出目标 {target_chars} 字。
-请**更激进地**精简以下内容，必须控制在 {target_chars} 字以内（最多 {hard_limit} 字）。
-大胆删除重复表述、冗长背景、过渡句，只保留核心结论、法规条款号和技术参数：
+请在保持语义完整和可读性的前提下，进一步精简以下内容，目标约 {target_chars} 字（最多 {hard_limit} 字）：
+合并重复表述、压缩冗长背景、删除非必要过渡句，保留核心结论、法规条款号和技术参数：
 
 {cleaned}"""
             try:
@@ -1724,9 +2149,9 @@ async def _summarize_one_subsection(
                 print(f"[summarize_section] 第{round_idx}轮重试失败: {e}")
                 break
 
-        # 硬截断兜底：3 轮后仍超目标 15%，按句子边界截断
-        # 修复：原阈值 1.3× 偏高，会让最终结果超出目标
-        if new_chars > target_chars * 1.15:
+        # 硬截断兜底：3 轮迭代 + 1 次可读性修复后仍超目标 30%，按句子边界截断
+        # 提高阈值（原 1.15×）减少误截断，让 LLM 重试优先于硬截断，保护可读性
+        if new_chars > target_chars * 1.3:
             truncated = _truncate_at_boundary(cleaned, target_chars)
             if truncated and _count_chinese_chars(truncated) < new_chars:
                 print(f"[summarize_section] 硬截断兜底: {new_chars} -> "
@@ -1739,6 +2164,7 @@ async def _summarize_one_subsection(
             "orig_chars": orig_chars,
             "new_chars": new_chars,
             "target_chars": target_chars,
+            "readability_warnings": readability_warnings,
         })
 
     except asyncio.TimeoutError:
@@ -2408,33 +2834,54 @@ async def outline_from_attachment(
             "message": "当前没有上传附件。请先上传参考文档，或改用 design_outline 自主设计框架。",
         }, ensure_ascii=False)
 
-    att = None
+    # 确定要使用的附件列表
     if file_id:
-        att = next((a for a in attachments if a.get("file_id") == file_id), None)
-    if not att:
-        # 取第一个有 full_text 的附件
-        att = next((a for a in attachments if a.get("full_text")), None)
-    if not att:
+        # 指定 file_id: 只用该附件（向后兼容）
+        target_att = next((a for a in attachments if a.get("file_id") == file_id), None)
+        if not target_att:
+            return json.dumps({
+                "status": "error",
+                "message": f"未找到 file_id={file_id} 的附件。请改用 design_outline。",
+            }, ensure_ascii=False)
+        target_attachments = [target_att]
+    else:
+        # 未指定 file_id: 使用所有有 full_text 的附件
+        target_attachments = [a for a in attachments if a.get("full_text")]
+
+    if not target_attachments:
         return json.dumps({
             "status": "error",
             "message": "未找到可用的附件（所有附件均无文本内容）。请改用 design_outline。",
         }, ensure_ascii=False)
 
-    filename = att.get("filename", "unknown")
-    full_text = att.get("full_text", "")
-    if not full_text:
+    # Step 2: 截取附件全文送给 LLM
+    # 多附件时等额分配 50000 字符预算，确保每个附件都有代表
+    TOTAL_BUDGET = 50000
+    n = len(target_attachments)
+    per_budget = TOTAL_BUDGET // n if n > 0 else TOTAL_BUDGET
+
+    text_parts = []
+    filenames = []
+    for att in target_attachments:
+        fn = att.get("filename", "unknown")
+        ft = att.get("full_text", "")
+        if not ft or not ft.strip():
+            continue
+        sample = ft[:per_budget]
+        if len(ft) > per_budget:
+            print(f"[agent_tools] outline_from_attachment: full_text truncated "
+                  f"({len(ft)} -> {per_budget} chars) for '{fn}'")
+        text_parts.append(f"=== 附件: {fn} ===\n{sample}")
+        filenames.append(fn)
+
+    if not text_parts:
         return json.dumps({
             "status": "error",
-            "message": f"附件「{filename}」无文本内容（可能是空文件或提取失败）。请改用 design_outline。",
+            "message": "所有附件均无文本内容。请改用 design_outline。",
         }, ensure_ascii=False)
 
-    # Step 2: 截取附件全文送给 LLM
-    # 使用更大窗口（50000 字符，约覆盖 3-5 万字文档），
-    # 避免短窗口（如 analyze_document_structure 的 12000）导致长文档章节识别不完整
-    text_sample = full_text[:50000]
-    if len(full_text) > 50000:
-        print(f"[agent_tools] outline_from_attachment: full_text truncated "
-              f"({len(full_text)} -> 50000 chars) for '{filename}'")
+    text_sample = "\n\n".join(text_parts)
+    filename_display = ", ".join(filenames)
 
     # Step 3: 一步 LLM 调用 — 直接从附件全文识别章节结构并补全 subsections + content_points
     # 不再依赖 analyze_document_structure 的两步流程，避免中间格式转换损失和短窗口截断
@@ -2483,7 +2930,7 @@ async def outline_from_attachment(
     user_prompt = f"""请分析以下附件全文，识别完整的章节结构并补全 subsections 和 content_points。
 
 ## 附件文件名
-{filename}
+{filename_display}
 
 ## 附件全文
 {text_sample}"""

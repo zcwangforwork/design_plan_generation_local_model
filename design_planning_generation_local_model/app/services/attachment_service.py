@@ -242,3 +242,43 @@ def resolve_attachment_content(file_ids: Optional[List[str]] = None) -> str:
         return "\n\n".join(all_texts) if all_texts else ""
     except Exception:
         return ""
+
+
+def resolve_attachment_texts(file_ids: Optional[List[str]] = None) -> List[str]:
+    """
+    将 file_ids 解析为各附件的独立文本列表（保持附件边界，不合并）。
+
+    与 resolve_attachment_content 的区别：
+    - resolve_attachment_content 返回所有附件合并后的单一字符串
+    - resolve_attachment_texts 返回各附件独立的文本，用于配额分配/逐附件检索
+
+    Args:
+        file_ids: 已入库的文件 ID 列表
+
+    Returns:
+        各附件文本组成的列表（按 file_ids 顺序），空文本附件被跳过
+    """
+    if not file_ids:
+        return []
+
+    try:
+        from app.services.rag.vector_store import VectorStore
+        vs = VectorStore(collection_name="uploads")
+
+        texts = []
+        for file_id in file_ids:
+            try:
+                results = vs.collection.get(
+                    where={"file_id": file_id},
+                    include=["documents"]
+                )
+                if results and results.get("documents"):
+                    text = "\n\n".join(results["documents"])
+                    if text.strip():
+                        texts.append(text)
+            except Exception:
+                continue
+
+        return texts
+    except Exception:
+        return []
