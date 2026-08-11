@@ -327,6 +327,23 @@ TOOL_RULES = """# 工具使用规则
    与 search_kb 的区别: search_kb 搜索系统内置知识库，search_attachment 搜索用户上传的文件。
    规则: 用户提到上传了文件或附件中有相关内容时，优先调用此工具。
 
+2c. **modify_attachment** — 根据用户指令修改指定上传附件的内容，生成修改版文档
+   参数: instruction (修改指令), file_id (可选，指定要修改的附件ID。为空时自动选择第一个已上传附件)
+   何时用: 用户要求"修改/改写/更新/把XX改为YY"某个已上传的参考文档时。
+   规则:
+   - 修改的是附件副本，不改变原附件，也不影响已生成的目标文档章节
+   - 长文档自动按章节分段改写，只修改指令影响的章节，其余章节原样保留
+   - 修改完成后前端会自动弹出修改版文档的下载按钮
+   - 若用户未指定附件且存在多个附件，工具会返回附件列表要求指定 file_id
+
+2b. **web_search** — 搜索互联网获取医疗器械法规标准、技术文献等最新信息
+   何时用: 用户询问最新的法规动态、标准更新、新闻资讯、实时信息，或本地知识库检索不到所需信息时。
+   与 search_kb 的区别: search_kb 搜索本地预置知识库，web_search 搜索互联网最新内容。
+   规则: 只要用户问题涉及最新/实时信息，或本地知识库检索结果不足，就必须先调用 web_search，
+         不得直接凭已有知识编造。网络结果是辅助参考，具体条款号仍需以官方发布为准。
+   注意: search_kb 本地检索为空时会自动附加网络搜索结果（返回结果带 web_fallback 标记、
+         source 为 "[网络]..."），此时该结果可直接使用，无需再单独调用 web_search。
+
 3. **analyze_document_structure** — 分析上传文档的章节结构和内容概要
    何时用: 用户问"这个文档有哪些章节"、"第三章讲了什么"、"梳理文档结构"等问题时。
    参数: file_id (可选，指定要分析的附件ID。为空则分析所有附件)
@@ -428,6 +445,24 @@ TOOL_RULES = """# 工具使用规则
 2. 基于返回的结构JSON回答用户问题（如"第三章主要内容是..."）
 3. 如用户问具体条款细节，再调用 search_attachment 检索全文
 
+## SQL 领域数据库查询
+内置贴敷式胰岛素泵领域数据库（6 张表：products / standards / materials / components / parameters / risk_items）。
+用于回答结构化数据问题，与 search_kb（非结构化文本检索）互补：
+- 何时用: 用户询问可枚举/筛选的结构化数据，如"哪些标准适用于贴敷式胰岛素泵"、
+  "哪种材料符合生物相容性要求"、"输注精度限值是多少"、"主要风险项有哪些"。
+- 何时不用: 标准条款原文、具体测试方法等文本内容仍用 search_kb 检索。
+
+查询顺序（务必按此执行）:
+1. **sql_db_list_tables** — 查看有哪些表
+2. **sql_db_schema** — 查看目标表的列名与示例数据（避免查不存在的列）
+3. **sql_db_query** — 编写 SELECT 查询执行
+
+规则:
+- 本数据库只读：禁止任何 INSERT/UPDATE/DELETE/DROP/PRAGMA 写操作（工具会拒绝）
+- 查询务必用 LIMIT 控制行数（工具最多返回 50 行）
+- 若报"表/列不存在"，先用 sql_db_schema 确认真实表名和列名再重写查询
+- 查询结果用于回答问题，必要时可结合 search_kb 补充标准条款原文
+
 工具调用过程对用户可见——用户会看到"正在检索知识库..."的提示。
 """
 
@@ -506,6 +541,20 @@ def build_system_prompt(state: AgentState) -> str:
             parts.append(f"- 预期用途: {state.get('product_intended_use')}")
         product_info = "\n## 当前产品画像（已确认）\n" + "\n".join(parts) + "\n"
 
+    # 精炼生成模式（用户开启后，仅影响文档内容生成，不影响聊天回复）
+    concise_block = ""
+    if state.get("concise_mode"):
+        concise_block = """
+# 精炼生成模式（已开启）
+
+用户已开启"精炼生成"。该模式仅作用于**文档内容生成**，不改变聊天回复风格：
+- 适用输出: write_chapter / generate_section / modify_attachment / update_outline 生成的文档内容
+- 生成章节、修改文档时，内容精炼、突出重点，直接给出关键条款、参数和依据
+- 删除冗余铺垫、重复表述和空泛套话；能用分点/表格表达的不用长段落
+- 在保证信息完整、覆盖用户要求的必填内容项的前提下尽量压缩篇幅（目标约为常规篇幅的 60-70%）
+- 不得因追求简洁而遗漏用户要求的必填内容或关键条款
+"""
+
     # 组装完整Prompt
     return (
         ROLE_DEFINITION + "\n"
@@ -513,6 +562,7 @@ def build_system_prompt(state: AgentState) -> str:
         + SOP_KNOWLEDGE + "\n"
         + TOOL_RULES + "\n"
         + REPLY_STYLE + "\n"
+        + concise_block
         + product_info
         + state_section
     )

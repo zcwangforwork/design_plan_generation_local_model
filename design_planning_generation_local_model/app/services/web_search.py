@@ -25,14 +25,13 @@ sys.path.insert(0, str(project_root))
 
 
 def _check_ddg_library():
-    """检查 ddgs 库是否可用"""
+    """检查 ddgs 库是否可导入（不做实时网络探测，避免瞬时网络/限流失败永久禁用该后端）"""
     global _ddg_library_available
     if _ddg_library_available is None:
         try:
-            from ddgs import DDGS
-            DDGS().text("test", max_results=1)
+            import ddgs  # 仅检查包可导入
             _ddg_library_available = True
-        except Exception:
+        except ImportError:
             _ddg_library_available = False
     return _ddg_library_available
 
@@ -286,19 +285,49 @@ class EnhancedWebSearchService:
             print(f"    [WEB SEARCH] 搜索失败: {e}")
             return "", []
 
+    async def search_general(
+        self,
+        query: str,
+        max_results: int = 3,
+        enable_deep_scrape: bool = True,
+    ) -> Tuple[str, List[str]]:
+        """通用搜索：直接用原始关键词搜索互联网，不做医疗法规查询改写。
+
+        用于 agent 回答天气、新闻等实时性问题时检索即时信息。
+        走 ddgs 优先 + 重试 + Playwright 备用的通用后端，返回格式化文本。
+        """
+        try:
+            results, files = await self._search_with_best_backend(
+                query, max_results, enable_deep_scrape,
+                enable_file_download=False, doc_type="general"
+            )
+            if not results:
+                return "", []
+            return self._format_results(results[: max_results * 2]), files
+        except Exception as e:
+            print(f"    [WEB SEARCH] 通用搜索失败: {e}")
+            return "", []
+
     async def _search_with_best_backend(
         self, query: str, max_results: int,
         enable_deep_scrape: bool, enable_file_download: bool, doc_type: str
     ) -> Tuple[List[Dict], List[str]]:
         """选择最佳可用后端执行搜索"""
-        # 首选: duckduckgo_search 库（无浏览器，不会被检测）
+        # 首选: duckduckgo_search 库（无浏览器，不会被检测）。
+        # 瞬时网络波动/限流可能导致偶发失败或空结果，重试一次再降级到 Playwright，
+        # 避免单一瞬时失败直接丢掉最可靠的 ddgs 后端。
         if self.ddg_available:
-            try:
-                results = await self._search_ddg_library(query, max_results)
-                if results:
-                    return results, []
-            except Exception as e:
-                print(f"    [WEB SEARCH] DDG库搜索失败: {e}")
+            for attempt in range(2):
+                try:
+                    results = await self._search_ddg_library(query, max_results)
+                    if results:
+                        return results, []
+                    if attempt == 0:
+                        print("    [WEB SEARCH] DDG库返回空结果，重试一次")
+                except Exception as e:
+                    print(f"    [WEB SEARCH] DDG库搜索失败(第{attempt + 1}次): {e}")
+                if attempt == 0:
+                    await asyncio.sleep(1.5)
 
         # 备用: Playwright 浏览器爬虫
         if self.playwright_available:
@@ -748,4 +777,23 @@ class SyncWebSearchService:
                 return future.result(timeout=60)
         except Exception as e:
             print(f"    [WEB SEARCH] 同步调用失败: {e}")
+            return "", []
+
+    def search_general(
+        self,
+        query: str,
+        max_results: int = 3,
+        enable_deep_scrape: bool = True,
+    ) -> Tuple[str, List[str]]:
+        """通用搜索（同步包装，内部使用独立线程避免事件循环冲突）"""
+        import concurrent.futures
+        try:
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(
+                    asyncio.run,
+                    self.async_service.search_general(query, max_results, enable_deep_scrape)
+                )
+                return future.result(timeout=60)
+        except Exception as e:
+            print(f"    [WEB SEARCH] 同步通用搜索失败: {e}")
             return "", []

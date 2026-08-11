@@ -40,6 +40,14 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
+    # 关闭 OpenViking 服务
+    try:
+        from app.services.openviking_client import close_openviking
+        await close_openviking()
+        print("[main] OpenViking service closed")
+    except Exception:
+        pass
+
 
 app = FastAPI(
     title="QMS Document Generator",

@@ -16,6 +16,21 @@ from app.services.doc_types import DOC_TYPE_LABELS
 from app.services.prompt_engineer import DOC_TYPE_SPECIFIC_PROMPTS
 
 
+# 项目计划书类文档类型：不需要在文档中写明具体法规条款（其余文档须带明确条款号）
+_PLAN_DOC_TYPES = {"design_development_plan"}
+
+
+def _regulation_clause_rule(doc_type: str) -> str:
+    """法规条款引用规则：项目计划书类文档不写明具体法规/标准条款号，
+    其余文档（风险管理、设计输入、产品需求等）须引用明确条款号。"""
+    if doc_type in _PLAN_DOC_TYPES:
+        return (
+            "- 本策划书为项目计划类文档，**不需要写明具体法规/标准条款号**，"
+            "聚焦阶段划分、任务分配、资源配置、里程碑与评审点等计划内容\n"
+        )
+    return "- 所有标准条款引用必须有明确的条款号\n"
+
+
 # ── 模块级API调用函数 (供Agent Tools等模块使用) ──
 
 def _call_minimax_api_raw(
@@ -60,6 +75,10 @@ def _call_minimax_api_raw(
     payload = {
         "model": model,
         "messages": messages,
+        # qwen3.5:122b 默认开启 thinking 模式，思考会耗尽 token 预算导致
+        # content 为空（尤其小 max_tokens 调用，如 RAG 查询词生成）。
+        # 显式关闭思考，确保 content 直接输出正文/JSON。
+        "think": False,
         "options": {
             "temperature": temperature,
             "num_predict": max_tokens,
@@ -1863,30 +1882,22 @@ class MiniMaxService:
         """
         为单个章节执行 RAG 检索（线程安全）
 
+        uploads 已纳入 QUERY_COLLECTIONS，主库检索会一并命中 uploads
+        （且 uploads chunk 豁免 doc_type 过滤），故不再单独检索 uploads。
+
         Returns:
-            (chunks, uploads_chunks) — chunks 已合并 uploads_chunks
+            (chunks, uploads_chunks) — chunks 已合并 uploads_chunks（此处恒为空）
         """
-        # 1. 检查 uploads collection
+        # 1. 检查 uploads collection 是否有数据（用于调整主库配额）
         uploads_chunks = []
         uploads_has_data = False
         try:
             from app.services.rag.vector_store import VectorStore
-            uploads_vs = VectorStore(collection_name="uploads")
-            if uploads_vs.count() > 0:
-                uploads_has_data = True
-                uploads_chunks = uploads_vs.retrieve_hybrid(
-                    doc_type=doc_type,
-                    query=chapter_query,
-                    top_k=5,
-                    similarity_threshold=0.3,
-                    vector_weight=0.7
-                )
-                if uploads_chunks:
-                    print(f"    附件检索: 从uploads collection检索到 {len(uploads_chunks)} 条相关段落")
+            uploads_has_data = VectorStore(collection_name="uploads").collection.count() > 0
         except Exception:
             pass
 
-        # 2. 主知识库检索
+        # 2. 主知识库检索（含 uploads）
         main_k = 13 if not uploads_has_data else 8
         chunks = []
         if self.use_rag:
@@ -2191,7 +2202,7 @@ ID :  SR 2
 2. **短句直陈**：每句不超过60字
 3. **禁止冗余内容**：不要写"该功能需通过XX测试验证"、"旨在降低XX风险"、"确保XX"等解释性语句
 4. **参数量化**：技术参数必须有明确数值范围（如"≥24h"、"±5%"、"10℃~40℃"）
-5. **标准引用**：标准号后用书名号包裹全称，如"GB 9706.1-2020《医用电气设备 第1部分：基本安全和基本性能的通用要求》"
+5. **标准引用**：{'不引用具体法规/标准条款号，聚焦计划内容本身' if doc_type in _PLAN_DOC_TYPES else '标准号后用书名号包裹全称，如"GB 9706.1-2020《医用电气设备 第1部分：基本安全和基本性能的通用要求》"'}
 6. **SR编号连续**：从SR 1开始连续编号，不跳号
 
 **风格示例（严格参照）**：
@@ -2219,7 +2230,7 @@ ID :  SR 2
 
 【内容质量要求】
 1. 技术参数要具体、可测量、有明确数值范围
-2. 标准号和条款引用要准确
+2. {'不引用具体法规/标准条款号' if doc_type in _PLAN_DOC_TYPES else '标准号和条款引用要准确'}
 3. 使用专业、规范的医疗器械行业术语
 4. 每条SR需求必须有实质性内容，不能只写框架
 5. **每个小节生成1-3条SR需求项即可**，不要贪多
@@ -2845,6 +2856,9 @@ ID :  SR 2
                     "content": prompt
                 }
             ],
+            # 禁用 thinking（qwen3.5:122b 默认开启，思考会耗尽 token 预算
+            # 导致 content 为空），确保正文直接输出。
+            "think": False,
             "options": {
                 "temperature": 0.7,
                 "num_predict": max_tokens,
@@ -3069,8 +3083,7 @@ ID :  SR 2
 
 【修改质量要求】
 - 内容必须极其细致和具体，每个段落都要有实质性内容
-- 所有标准条款引用必须有明确的条款号
-- 技术参数要具体、可测量、有明确的数值范围
+{_regulation_clause_rule(doc_type)}- 技术参数要具体、可测量、有明确的数值范围
 - 表格要填写完整，不能留"(描述)"或"待填写"等占位符
 - 修改后内容的详细程度要与首次生成的其他章节保持一致，像实际可用于注册申报的正式文档一样
 - 如果用户指令要求添加新内容，应展开详细描述（每个要点至少200字），而非只加一句话
@@ -3235,8 +3248,7 @@ ID :  SR 2
 
 【要求】
 - 内容必须极其细致和具体，每个段落都要有实质性内容
-- 所有标准条款引用必须有明确的条款号
-- 技术参数要具体、可测量、有明确的数值范围
+{_regulation_clause_rule(doc_type)}- 技术参数要具体、可测量、有明确的数值范围
 - 表格要填写完整，不能留"(描述)"或"待填写"等占位符
 - 修改后内容的详细程度要与首次生成的其他章节保持一致
 - 如果用户指令要求添加新内容，应展开详细描述（每个要点至少200字）

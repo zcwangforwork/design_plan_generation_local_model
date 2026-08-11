@@ -49,6 +49,16 @@ _current_confirmed_standards: contextvars.ContextVar[list] = contextvars.Context
 # contextvar 丢失导致回退到 JSON 摘要被写入文档。
 _pending_chapter_contents: dict = {}  # {chapter_name: full_content}
 
+# modify_attachment 完整内容旁路: 工具返回简短JSON摘要，完整修改后文档通过此字典
+# 传递给 _after_tools_node（复用 write_chapter 的旁路模式，避免大段内容进入 LLM 对话历史）。
+# 使用模块级 dict 而非 contextvar，避免 LangGraph 异步节点切换时 contextvar 丢失。
+_pending_modified_documents: dict = {}  # {file_id: {"markdown": str, "filename": str}}
+
+
+def get_pending_modified_document(file_id: str) -> dict | None:
+    """读取并删除 modify_attachment 写入的指定附件修改结果"""
+    return _pending_modified_documents.pop(file_id, None)
+
 
 def set_current_doc_context(
     doc_type: str,
@@ -77,10 +87,117 @@ def get_pending_chapter_content(chapter_name: str) -> dict:
     return {"chapter_name": chapter_name, "full_content": _pending_chapter_contents.pop(chapter_name, "")}
 
 
+# 项目计划书类文档类型：不需要在文档中写明具体法规条款（其余文档须带明确条款号）
+_PLAN_DOC_TYPES = {"design_development_plan"}
+
+
+def _regulation_clause_rule(doc_type: str) -> str:
+    """法规条款引用规则：项目计划书类文档不写明具体法规/标准条款号，
+    其余文档（风险管理、设计输入、产品需求等）须引用明确条款号。"""
+    if doc_type in _PLAN_DOC_TYPES:
+        return (
+            "- 本策划书为项目计划类文档，**不需要写明具体法规/标准条款号**，"
+            "聚焦阶段划分、任务分配、资源配置、里程碑与评审点等计划内容\n"
+        )
+    return "- 所有标准条款引用必须有明确的条款号\n"
+
+
+def _output_structure_requirement(doc_type: str, is_revision: bool = False) -> str:
+    """输出结构要求：项目计划书类文档不引用法规条款/合规要点，其余文档保持法规导向结构。"""
+    if doc_type in _PLAN_DOC_TYPES:
+        return (
+            "## 输出结构要求\n"
+            "请按以下结构组织内容:\n"
+            "1. 首先用1-2段概述本节要点（聚焦计划目的、范围与产品适用性）\n"
+            "2. 然后逐个详细阐述每个关键计划要素（阶段划分/任务分配/资源/时间安排/职责等），每个要素至少200字\n"
+            "3. 如涉及阶段、资源、时间安排对比，以表格形式呈现（至少3列）\n"
+            "4. 最后用1段总结本节的计划要点和与贴敷式胰岛素泵的关联性"
+        )
+    verb = "修改后的" if is_revision else ""
+    return (
+        f"## 输出结构要求\n"
+        f"请按以下结构组织{verb}内容:\n"
+        f"1. 首先用1-2段概述本节要点（含法规依据和产品适用性）\n"
+        f"2. 然后逐个详细阐述每个关键要求（每个要求至少200字，包含法规条款原文引用、产品参数映射、实施建议）\n"
+        f"3. 如涉及数据/参数对比，以表格形式呈现（至少3列）\n"
+        f"4. 最后用1段总结本节的合规要点和与贴敷式胰岛素泵的关联性"
+    )
+
+
+def _same_chapter(a: str, b: str) -> bool:
+    """宽松的章节名相等判断（容忍"2 目的和范围"vs"目的和范围"这类差异）"""
+    a = (a or "").replace(" ", "")
+    b = (b or "").replace(" ", "")
+    if not a or not b:
+        return False
+    return a == b or a in b or b in a
+
+
+def _build_covered_digest(exclude_chapter: str) -> str:
+    """从已生成文档（_current_generated_markdown，`# 章节\n\n内容` 拼接格式）
+    提取除 exclude_chapter 之外各章节的"已覆盖内容"摘要，返回 Markdown 文本。
+
+    摘要包含：已写章节标题 + 各小节标题 + 每小节首条要点（截断80字）。
+    注入 write_chapter / generate_section 提示词，让模型避免跨章节重复相同内容。
+    文档为空或无可排除章节时返回空串。
+    """
+    md = _current_generated_markdown.get()
+    if not md or not md.strip():
+        return ""
+
+    # (chapter_title, [(section_heading, first_point)]) 列表
+    digest: list = []
+    cur_chapter = None
+    cur_section = None
+    cur_first = None
+    section_points: list = []
+
+    def _flush_section():
+        nonlocal cur_section, cur_first
+        if cur_section is not None:
+            section_points.append((cur_section, (cur_first or "")[:80]))
+            cur_section = None
+            cur_first = None
+
+    for line in md.split("\n"):
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("# "):
+            _flush_section()
+            if cur_chapter is not None and not _same_chapter(cur_chapter, exclude_chapter):
+                digest.append((cur_chapter, section_points))
+            cur_chapter = s[2:].strip()
+            section_points = []
+        elif s.startswith("##### ") or s.startswith("#### ") \
+                or s.startswith("### ") or s.startswith("## "):
+            _flush_section()
+            cur_section = s.lstrip("#").strip()
+        else:
+            if cur_section is not None and cur_first is None:
+                cur_first = s
+    _flush_section()
+    if cur_chapter is not None and not _same_chapter(cur_chapter, exclude_chapter):
+        digest.append((cur_chapter, section_points))
+
+    if not digest:
+        return ""
+
+    parts = ["已覆盖内容（请勿重复以下章节内容，如需引用用\"详见第X章\"简述）:"]
+    for ch, points in digest:
+        parts.append(f"- {ch}")
+        for sec, first in points:
+            if first:
+                parts.append(f"  - {sec}：{first}")
+            else:
+                parts.append(f"  - {sec}")
+    return "\n".join(parts)
+
+
 # ── Tool 1: search_kb ──
 
 @tool
-async def search_kb(query: str, top_k: int = 5, use_rerank: bool = True) -> str:
+async def search_kb(query: str, top_k: int = 10, use_rerank: bool = True) -> str:
     """检索贴敷式胰岛素泵知识库 (标准、法规、技术文档、测试报告等)。
 
     同时检索两个 collection 并合并结果:
@@ -92,9 +209,9 @@ async def search_kb(query: str, top_k: int = 5, use_rerank: bool = True) -> str:
 
     Args:
         query: 搜索查询关键词。应为具体的标准号、参数名或技术问题。
-        top_k: 返回结果数量，默认5条。
+        top_k: 返回结果数量，默认10条。
         use_rerank: 是否启用Cross-Encoder精排（默认开启，提升精确率）。
-                    两阶段检索：粗召回30条→BGE-Reranker精排→Top-K。
+                    两阶段检索：粗召回40条→BGE-Reranker精排→Top-K。
                     注：精排仅作用于主知识库；uploads 集合较小，直接向量检索即可。
 
     Returns:
@@ -111,7 +228,7 @@ async def search_kb(query: str, top_k: int = 5, use_rerank: bool = True) -> str:
                 return store.retrieve_and_rerank(
                     query=query,
                     top_k=top_k,
-                    candidate_pool_size=30,
+                    candidate_pool_size=40,
                     vector_weight=0.85,
                 )
             else:
@@ -124,7 +241,9 @@ async def search_kb(query: str, top_k: int = 5, use_rerank: bool = True) -> str:
         def _do_retrieve_uploads():
             """直接检索 uploads collection (用户上传附件库)。
 
-            uploads 集合规模较小 (通常 < 1000 chunks) 且不参与 QUERY_COLLECTIONS，
+            uploads 已纳入 QUERY_COLLECTIONS，主库检索会一并命中 uploads。
+            本方法仍独立检索一次，用于控制 uploads 配额 (uploads_n) 并打上
+            [附件] 来源标注；主库结果中的 uploads chunk 会在后续被剔除，避免重复。
             直接走 self.collection.query 即可，无需 Reranker 或 BM25 二次召回。
             """
             try:
@@ -136,9 +255,11 @@ async def search_kb(query: str, top_k: int = 5, use_rerank: bool = True) -> str:
                 if count == 0:
                     return []
                 query_embedding = store.embedder.encode_single(query)
+                # uploads 集合较小，给主库让出 top_k 半数配额，避免 uploads 占满结果
+                uploads_n = max(top_k // 2, 3)
                 raw = store.collection.query(
                     query_embeddings=[query_embedding],
-                    n_results=top_k,
+                    n_results=uploads_n,
                     include=["documents", "metadatas", "distances"],
                 )
                 if not raw or not raw.get("ids") or not raw["ids"][0]:
@@ -186,6 +307,12 @@ async def search_kb(query: str, top_k: int = 5, use_rerank: bool = True) -> str:
             print(f"[search_kb] 主库检索异常: {main_results}")
             main_results = []
         main_results = main_results or []
+        # uploads 已通过 _do_retrieve_uploads 单独检索（含配额与[附件]标注），
+        # 剔除主库结果中的 uploads 来源 chunk，避免同一内容重复进入 Agent 上下文
+        main_results = [
+            r for r in main_results
+            if r.get("source_collection") != "qms_doc_uploads"
+        ]
         for r in main_results:
             r.setdefault("source_collection", "insulin_pump_kb")
 
@@ -199,10 +326,33 @@ async def search_kb(query: str, top_k: int = 5, use_rerank: bool = True) -> str:
 
         all_results = list(main_results) + list(upload_results)
         if not all_results:
+            # ── 本地检索为空 → 自动升级网络搜索（系统级兜底，不依赖 LLM 二次判断）──
+            web_results = []
+            try:
+                web_json = await web_search.ainvoke({
+                    "query": query,
+                    "doc_type": _current_doc_type.get(),
+                })
+                parsed = json.loads(web_json)
+                if parsed.get("status") == "ok" and parsed.get("content"):
+                    web_results = [{
+                        "content": parsed["content"],
+                        "source": f"[网络] {parsed.get('search_method', 'web')}",
+                        "source_collection": "web",
+                        "score": 0.0,
+                    }]
+                    print(f"[search_kb] 本地无结果，已自动升级 web_search "
+                          f"({len(parsed['content'])} chars)")
+            except Exception as e:
+                print(f"[search_kb] web 自动升级失败: {e}")
             return json.dumps({
-                "status": "no_results",
-                "message": f'未找到与"{query}"直接相关的知识库内容。请用已有知识回答，并告知用户此为基于经验的建议，建议用户自行查证最新标准。',
-                "results": [],
+                "status": "ok" if web_results else "no_results",
+                "query": query,
+                "count": len(web_results),
+                "reranked": use_rerank,
+                "uploads_included": len(upload_results) > 0,
+                "web_fallback": True,
+                "results": web_results,
             }, ensure_ascii=False)
 
         # 按分数排序 (精排分数优先，回退到相似度)
@@ -213,11 +363,14 @@ async def search_kb(query: str, top_k: int = 5, use_rerank: bool = True) -> str:
             return r.get("similarity", 0.0)
         all_results.sort(key=_get_score, reverse=True)
 
-        # 去重 (按 chunk_id，否则按 text 前 100 字)
+        # 去重 (按 text 前 100 字)。
+        # 统一按文本去重: 主库结果无 chunk_id，uploads 结果有 chunk_id，
+        # 若按 chunk_id 去重会漏掉两路检索返回的同一段内容 (含 BM25-only 命中)，
+        # 统一用文本前缀可确保跨路径重复被剔除。
         seen = set()
         unique = []
         for r in all_results:
-            key = r.get("chunk_id") or r.get("text", "")[:100]
+            key = (r.get("text") or "")[:100]
             if key in seen:
                 continue
             seen.add(key)
@@ -494,26 +647,38 @@ async def search_attachment(query: str, top_k: int = 5) -> str:
                 })
 
     if not all_matches:
-        # 尝试向量检索（如果附件已入库到uploads集合）
+        # 尝试向量检索（附件已入库到 uploads 集合时）。
+        # retrieve_hybrid 现在会检索整个语料（含主知识库），附件检索需直查
+        # uploads 集合，仅返回用户上传文件的内容。
         try:
             from app.services.rag.vector_store import VectorStore
             store = VectorStore(collection_name="uploads")
-            results = store.retrieve_hybrid(query=query, top_k=top_k, vector_weight=0.85)
-            if results:
+            if store.collection.count() > 0:
+                query_embedding = store.embedder.encode_single(query)
+                raw = store.collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=top_k,
+                    include=["documents", "metadatas", "distances"],
+                )
                 formatted = []
-                for r in results:
-                    formatted.append({
-                        "content": r.get("text", ""),
-                        "source": r.get("source_file", "用户上传附件"),
-                        "score": round(r.get("similarity", 0), 3),
-                    })
-                return json.dumps({
-                    "status": "ok",
-                    "query": query,
-                    "count": len(formatted),
-                    "source": "vector_search",
-                    "results": formatted,
-                }, ensure_ascii=False)
+                if raw and raw.get("ids") and raw["ids"][0]:
+                    for i in range(len(raw["ids"][0])):
+                        distance = raw["distances"][0][i]
+                        similarity = max(0.0, 1.0 - distance / 2.0)
+                        meta = raw["metadatas"][0][i] or {}
+                        formatted.append({
+                            "content": raw["documents"][0][i],
+                            "source": meta.get("source_file", "用户上传附件"),
+                            "score": round(similarity, 3),
+                        })
+                if formatted:
+                    return json.dumps({
+                        "status": "ok",
+                        "query": query,
+                        "count": len(formatted),
+                        "source": "vector_search",
+                        "results": formatted,
+                    }, ensure_ascii=False)
         except Exception:
             pass
 
@@ -542,6 +707,252 @@ async def search_attachment(query: str, top_k: int = 5) -> str:
         "source": "attachment_text",
         "results": unique_matches,
     }, ensure_ascii=False)
+
+
+# ── Tool: modify_attachment ──
+# 根据用户指令修改上传附件的内容。短文档单遍改写，长文档按章节分段改写
+# （先识别受影响章节，再逐段改写，避免无关章节被 LLM 顺手改动）。
+
+# 单遍改写阈值（字符数）：超过则走章节分段改写
+_MODIFY_SINGLE_PASS_LIMIT = 6000
+# 修改要点标记：标记行之前为文档正文，之后为修改要点
+_MODIFY_SUMMARY_MARKER = "@@CHANGES@@"
+
+
+async def _llm_rewrite(system_prompt: str, user_prompt: str, timeout: float = 180.0) -> str:
+    """调用本地 LLM 改写，返回文本（失败返回空串）"""
+    from app.services.minimax import _call_minimax_api_raw
+
+    def _do():
+        return _call_minimax_api_raw(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.3,
+            max_tokens=16384,
+        )
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_do), timeout=timeout)
+    except Exception:
+        return ""
+
+
+def _one_line(text: str, limit: int = 80) -> str:
+    """取文本第一个非空行的前 limit 个字符（用于章节列表预览）"""
+    for line in (text or "").split("\n"):
+        if line.strip():
+            line = line.strip()
+            return line[:limit] + ("..." if len(line) > limit else "")
+    return "(空)"
+
+
+def _split_sections_by_heading(markdown: str) -> list[str]:
+    """按 Markdown 标题 (# ~ ######) 将文档拆分为若干章节，保留原文。
+
+    每个章节从标题行开始，到下一个标题行之前结束（含标题行与其正文）。
+    文档开头无标题的内容作为第一个章节（前言段）。
+    """
+    import re as _re
+    lines = markdown.split('\n')
+    heading_re = _re.compile(r'^(#{1,6})\s+')
+    sections = []
+    current = []
+    for line in lines:
+        if heading_re.match(line) and current:
+            sections.append('\n'.join(current))
+            current = []
+        current.append(line)
+    if current:
+        sections.append('\n'.join(current))
+    if not sections:
+        sections = [markdown]
+    return sections
+
+
+def _split_summary(response: str) -> tuple[str, str]:
+    """将模型输出拆分为 (正文, 修改要点)。标记行之前为正文，之后为要点。"""
+    marker = _MODIFY_SUMMARY_MARKER
+    if marker in response:
+        doc, _, summary = response.partition(marker)
+        return doc.strip(), summary.strip()
+    return response.strip(), ""
+
+
+def _parse_affected_indices(resp: str) -> list[int]:
+    """从"受影响章节识别"的模型输出中解析章节编号列表"""
+    import re as _re
+    if not resp:
+        return []
+    idx = resp.find("{")
+    end = resp.rfind("}")
+    if idx != -1 and end > idx:
+        try:
+            data = json.loads(resp[idx:end + 1])
+            affected = data.get("affected", [])
+            return [int(i) for i in affected if str(i).lstrip('-').isdigit()]
+        except Exception:
+            pass
+    # 回退：提取所有数字（保守，宁可多改不可漏改）
+    return [int(m) for m in _re.findall(r'\d+', resp)]
+
+
+async def _rewrite_single_pass(full_text: str, instruction: str) -> tuple[str, str]:
+    """单遍改写整个文档。返回 (修改后文档, 修改要点)"""
+    system_prompt = (
+        "你是一位专业的文档改写专家。用户要求修改一份文档，请输出修改后的完整文档。\n"
+        "要求:\n"
+        "- 严格按用户指令修改；指令未涉及的部分保持原样，不得擅自增删\n"
+        "- 保持原有的Markdown格式和标题层级\n"
+        "- 技术参数要具体、可测量\n"
+        "- 用中文表述（标准号和必要缩写除外）\n"
+        f"- 在文档正文结束后空一行，输出标记行 `{_MODIFY_SUMMARY_MARKER}`，"
+        "标记行之后逐条列出本次修改要点（每条一行，以-开头）\n"
+    )
+    user_prompt = f"修改指令: {instruction}\n\n原文:\n{full_text}"
+    response = await _llm_rewrite(system_prompt, user_prompt)
+    if not response:
+        return "", ""
+    return _split_summary(response)
+
+
+async def _rewrite_section_wise(full_text: str, instruction: str) -> tuple[str, str]:
+    """长文档分段改写：先识别受影响的章节，再逐段改写，其余章节原样保留。
+
+    返回 (修改后文档, 修改要点)。
+    """
+    sections = _split_sections_by_heading(full_text)
+
+    # 步骤1: 识别受影响的章节（防止无关章节被 LLM 顺手改动）
+    outline = "\n".join(f"[{i}] {_one_line(s)}" for i, s in enumerate(sections))
+    detect_prompt = (
+        "以下是一份文档的章节列表。用户给出一个修改指令。\n"
+        "请判断哪些章节需要修改。只把**内容会被指令影响**的章节编号列入 affected。\n"
+        "严格输出JSON，格式: {\"affected\": [章节编号]}，不要输出任何其他内容。\n\n"
+        f"章节列表:\n{outline}\n\n修改指令: {instruction}"
+    )
+    detect_resp = await _llm_rewrite(
+        "你只输出JSON，不输出任何其他内容。", detect_prompt, timeout=120.0
+    )
+    affected = _parse_affected_indices(detect_resp)
+    if not affected:
+        # 无法识别 → 保守处理：全部章节视为受影响（改写指令含"无关则原样输出"保护）
+        affected = list(range(len(sections)))
+
+    # 步骤2: 逐个改写受影响章节
+    notes = []
+    for idx in affected:
+        if not (0 <= idx < len(sections)):
+            continue
+        sec = sections[idx]
+        sys_p = (
+            "你是一位专业的文档改写专家。下面是文档中的一个章节，请根据用户指令修改它。\n"
+            "要求:\n"
+            "- 严格按指令修改本节；指令与本节点内容无关时，原样输出本节内容，不要改动\n"
+            "- 保持Markdown格式和标题层级\n"
+            "- 只输出修改后的**这一节**的完整内容，不要输出章节列表或解释\n"
+            f"- 在本节内容结束后空一行，输出标记行 `{_MODIFY_SUMMARY_MARKER}`，"
+            "标记行之后用一行概括本节的修改要点；若本节未修改则标记行后写“无”\n"
+        )
+        user_p = f"修改指令: {instruction}\n\n本节原文:\n{sec}"
+        resp = await _llm_rewrite(sys_p, user_p)
+        if not resp:
+            continue  # 失败保留原文
+        new_sec, note = _split_summary(resp)
+        if new_sec.strip():
+            sections[idx] = new_sec.strip()
+        if note.strip() and note.strip() != "无":
+            notes.append(note.strip())
+
+    modified_md = "\n\n".join(s.strip() for s in sections if s.strip())
+    summary = "\n".join(notes)
+    return modified_md, summary
+
+
+@tool
+async def modify_attachment(instruction: str, file_id: str = "") -> str:
+    """根据用户指令修改指定上传附件的内容，生成修改版文档并提供下载。
+
+    调用时机: 用户要求"修改/改写/更新"某个已上传的参考文档内容时。
+    修改的是附件副本，不改变原附件，也不影响已生成的目标文档。
+
+    Args:
+        instruction: 用户的具体修改指令，如"把技术参数表中电池寿命改为3年，并更新相关描述"。
+        file_id: 要修改的附件ID（来自附件列表）。为空时自动选择第一个已上传附件。
+
+    Returns:
+        JSON格式的结果，包含 file_id、filename、summary（修改要点）等信息。
+    """
+    try:
+        attachments = _current_attachments.get()
+        if not attachments:
+            return json.dumps({
+                "status": "error",
+                "message": "当前项目没有上传附件，无法修改。请先上传需要修改的文档。",
+            }, ensure_ascii=False)
+
+        # 定位附件
+        target = None
+        if file_id:
+            target = next((a for a in attachments if a.get("file_id") == file_id), None)
+            if target is None:
+                return json.dumps({
+                    "status": "error",
+                    "message": f"未找到附件 {file_id}。可用附件: {[a.get('filename') for a in attachments]}",
+                }, ensure_ascii=False)
+        else:
+            completed = [a for a in attachments if a.get("status") == "completed" and a.get("full_text")]
+            if not completed:
+                return json.dumps({
+                    "status": "error",
+                    "message": "没有可修改的附件（附件可能仍在处理中）。请稍后重试或重新上传。",
+                }, ensure_ascii=False)
+            if len(completed) > 1:
+                return json.dumps({
+                    "status": "error",
+                    "message": f"有多个附件，请指定要修改的附件 file_id。可用附件: {[a.get('filename') for a in completed]}",
+                }, ensure_ascii=False)
+            target = completed[0]
+
+        full_text = target.get("full_text", "") or ""
+        if not full_text.strip():
+            return json.dumps({
+                "status": "error",
+                "message": f"附件「{target.get('filename', '?')}」内容为空，无法修改。",
+            }, ensure_ascii=False)
+
+        filename = target.get("filename", "document.md")
+        if len(full_text) <= _MODIFY_SINGLE_PASS_LIMIT:
+            modified_md, summary = await _rewrite_single_pass(full_text, instruction)
+        else:
+            modified_md, summary = await _rewrite_section_wise(full_text, instruction)
+
+        if not (modified_md or "").strip():
+            return json.dumps({
+                "status": "error",
+                "message": "文档修改失败（模型未返回有效内容）。请稍后重试。",
+            }, ensure_ascii=False)
+
+        # 存入旁路，供 _after_tools_node 写入 state（完整内容不进 LLM 对话历史）
+        file_id_actual = target.get("file_id", "")
+        _pending_modified_documents[file_id_actual] = {
+            "markdown": modified_md,
+            "filename": filename,
+        }
+
+        return json.dumps({
+            "status": "ok",
+            "file_id": file_id_actual,
+            "filename": filename,
+            "modified_chars": len(modified_md),
+            "summary": summary,
+            "message": f"附件「{filename}」修改完成，已生成修改版文档供下载。",
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"修改附件时发生异常: {str(e)}。请稍后重试。",
+        }, ensure_ascii=False)
 
 
 # ── Tool 2: generate_section ──
@@ -581,26 +992,36 @@ async def generate_section(section_name: str, doc_type: str = "design_developmen
 
         # 构建 system prompt: 专家角色 + 文档类型特定要求
         expert_section = f"\n\n# 本文档类型特定要求\n{expert_prompt}" if expert_prompt else ""
+
+        # 已覆盖内容摘要（排除本节省），避免与已生成章节内容重复
+        covered_digest = _build_covered_digest(section_name)
+        covered_block = (
+            f"\n## 去重要求（避免跨章节内容重复）\n"
+            f"- 已覆盖内容（请勿重复，引用用\"详见第X章\"）:\n{covered_digest}\n"
+            if covered_digest
+            else "\n## 去重要求（避免跨章节内容重复）\n"
+                 "- 产品通用参数（尺寸、储药量、输注精度、BLE、IPX8、灭菌方式、Class C等）"
+                 "只在最相关章节写全，其他章节引用时用\"见第X章\"简述\n"
+                 "- 标准总则类描述（\"本部分适用于…\"\"本标准规定…\"）全文档只出现一次\n"
+                 "- 同一法规条款仅在与本节直接相关处展开，不在多节重复相同说明\n"
+        )
+
         system_prompt = f"""你是一位贴敷式胰岛素泵RA文档专家。请基于当前已确认的策划内容信息，
 生成《{doc_label}》文档中「{section_name}」章节的初稿。{expert_section}
 
 要求:
 - 内容必须极其细致和具体，每个段落都要有实质性内容，不能只写框架标题
 - 内容专业、完整，符合NMPA注册申报要求
-- 所有标准条款引用必须有明确的条款号
-- 使用Markdown格式，标题层级清晰 (##, ###)
+{_regulation_clause_rule(doc_type)}- 使用Markdown格式，标题层级清晰 (##, ###)
 - 技术参数要具体、可测量、有明确的数值范围
 - 表格要填写完整，不能留"(描述)"或"待填写"等占位符
 - 针对贴敷式胰岛素泵产品特性编写
 - 生成内容的详细程度要像实际可用于注册申报的正式文档一样
 - 用中文表述 (标准号和必要缩写除外)
+- 禁止以"本章依据XX标准编制"等冗余前缀行开头
 
-## 输出结构要求
-请按以下结构组织内容:
-1. 首先用1-2段概述本节要点（含法规依据和产品适用性）
-2. 然后逐个详细阐述每个关键要求（每个要求至少200字，包含法规条款原文引用、产品参数映射、实施建议）
-3. 如涉及数据/参数对比，以表格形式呈现（至少3列）
-4. 最后用1段总结本节的合规要点和与贴敷式胰岛素泵的关联性"""
+{covered_block}
+{_output_structure_requirement(doc_type)}"""
 
         # RAG 检索: 用 LLM 基于产品上下文+章节信息生成针对性查询词
         rag_context = ""
@@ -621,7 +1042,7 @@ async def generate_section(section_name: str, doc_type: str = "design_developmen
             merged_results = []
             seen_keys = set()
             for q in queries:
-                rag_result = await search_kb.ainvoke({"query": q, "top_k": 5})
+                rag_result = await search_kb.ainvoke({"query": q, "top_k": 10})
                 rag_data = json.loads(rag_result)
                 if rag_data.get("status") == "ok" and rag_data.get("results"):
                     for item in rag_data["results"]:
@@ -820,7 +1241,7 @@ async def revise_section(section_name: str, instruction: str, doc_type: str = "d
         rag_context = ""
         try:
             rag_query = f"{doc_label} {section_name} {instruction}"
-            rag_result = await search_kb.ainvoke({"query": rag_query, "top_k": 5})
+            rag_result = await search_kb.ainvoke({"query": rag_query, "top_k": 10})
             rag_data = json.loads(rag_result)
             if rag_data.get("status") == "ok" and rag_data.get("results"):
                 lines = ["\n\n# 知识库参考资料（必须优先依据以下内容进行修改）:"]
@@ -838,8 +1259,7 @@ async def revise_section(section_name: str, instruction: str, doc_type: str = "d
 要求:
 - 内容必须极其细致和具体，每个段落都要有实质性内容，不能只写框架标题
 - 内容专业、完整，符合NMPA注册申报要求
-- 所有标准条款引用必须有明确的条款号
-- 使用Markdown格式，标题层级清晰 (##, ###)
+{_regulation_clause_rule(doc_type)}- 使用Markdown格式，标题层级清晰 (##, ###)
 - 技术参数要具体、可测量、有明确的数值范围
 - 表格要填写完整，不能留"(描述)"或"待填写"等占位符
 - 针对贴敷式胰岛素泵产品特性编写
@@ -853,12 +1273,7 @@ async def revise_section(section_name: str, instruction: str, doc_type: str = "d
 - 如果修改影响了其他章节的参数/引用，在回复末尾用"⚠️ 关联影响:"标注
 - 用中文回复
 
-## 输出结构要求
-请按以下结构组织修改后的内容:
-1. 首先用1-2段概述本节要点（含法规依据和产品适用性）
-2. 然后逐个详细阐述每个关键要求（每个要求至少200字，包含法规条款原文引用、产品参数映射、实施建议）
-3. 如涉及数据/参数对比，以表格形式呈现（至少3列）
-4. 最后用1段总结本节的合规要点和与贴敷式胰岛素泵的关联性"""
+{_output_structure_requirement(doc_type, is_revision=True)}"""
 
         user_prompt = f"""请修改《{doc_label}》的「{section_name}」章节，修改指令: {instruction}
 
@@ -980,7 +1395,7 @@ async def design_outline(
         merged_results = []
         seen_keys = set()
         for q in queries:
-            rag_result = await search_kb.ainvoke({"query": q, "top_k": 5})
+            rag_result = await search_kb.ainvoke({"query": q, "top_k": 10})
             rag_data = json.loads(rag_result)
             if rag_data.get("status") == "ok" and rag_data.get("results"):
                 for item in rag_data["results"]:
@@ -1157,6 +1572,10 @@ async def write_chapter(
         pass
     expert_section = f"\n\n{expert_prompt}" if expert_prompt else ""
 
+    # 已覆盖内容摘要（排除本章），注入每个小节提示词避免跨章节内容重复
+    covered_digest = _build_covered_digest(chapter_name)
+    covered_block = f"- 已覆盖内容（请勿重复，引用用\"详见第X章\"）:\n{covered_digest}" if covered_digest else ""
+
     # 轻量去重: 对同一小节的检索结果做 Jaccard 相似度去重
     def _dedup_results(results: list, threshold: float = 0.6) -> list:
         if len(results) <= 1:
@@ -1212,7 +1631,7 @@ async def write_chapter(
             try:
                 async with _rag_sem:
                     for q in queries:
-                        r = await search_kb.ainvoke({"query": q, "top_k": 5})
+                        r = await search_kb.ainvoke({"query": q, "top_k": 10})
                         data = json.loads(r)
                         if data.get("status") == "ok" and data.get("results"):
                             for item in data["results"]:
@@ -1276,7 +1695,7 @@ async def write_chapter(
                 f"- 大量使用 `- 项目符号` 列表项表达并列规则/参数\n"
                 f"- 每个要点风格如 \"支持X功能\"/\"参数：Y\"/\"协议：Z\"\n"
                 f"- 涉及多个数值参数时用小表格呈现（2-10 行 × 2-6 列），不要写大表格\n"
-                f"- 所有标准条款引用必须有明确的条款号\n"
+                f"{_regulation_clause_rule(doc_type)}"
                 f"- 技术参数要具体、可测量、有明确的数值范围\n"
                 f"- 表格要填写完整，不能留\"(描述)\"或\"待填写\"等占位符\n"
                 f"- 针对贴敷式胰岛素泵产品特性编写\n"
@@ -1288,6 +1707,14 @@ async def write_chapter(
                 f"- **禁止写总结段、归纳段、结尾段**\n"
                 f"- **禁止写\"本小节将介绍...\"/\"综上所述...\"等过渡句**\n"
                 f"- **禁止把同一要点展开成完整段落**\n"
+                f"- **禁止以\"本章依据XX标准编制\"/\"本节依据...\"等冗余前缀行开头**\n"
+                f"\n"
+                f"## 去重要求（避免跨章节内容重复）\n"
+                f"- 产品通用参数（尺寸、储药量、输注精度、BLE、IPX8、灭菌方式、Class C等）"
+                f"只在最相关章节写全，其他章节引用时用\"见第X章\"简述，不重复罗列\n"
+                f"- 标准总则类描述（\"本部分适用于…\"\"本标准规定…\"）全文档只出现一次\n"
+                f"- 同一法规条款仅在与本节直接相关处展开，不在多节重复相同说明\n"
+                f"{covered_block}\n"
                 f"\n"
                 f"## 输出结构示例（参考《产品技术要求》风格）\n"
                 f"直接写要点/列表/小表格，第一行就是实质内容（不是标题）。\n"
@@ -1372,7 +1799,7 @@ async def write_chapter(
             merged_results = []
             seen_keys = set()
             for q in queries:
-                rag_result = await search_kb.ainvoke({"query": q, "top_k": 5})
+                rag_result = await search_kb.ainvoke({"query": q, "top_k": 10})
                 rag_data = json.loads(rag_result)
                 if rag_data.get("status") == "ok" and rag_data.get("results"):
                     for item in rag_data["results"]:
@@ -1403,7 +1830,7 @@ async def write_chapter(
             f"- 每个要点风格如 \"支持X功能\"/\"参数：Y\"/\"协议：Z\"\n"
             f"- 涉及多个数值参数时用小表格呈现（2-10 行 × 2-6 列）\n"
             f"- 使用 4 级层级 Markdown: ## (章) -> ### (节) -> #### (小节) -> ##### (子小节)\n"
-            f"- 所有标准条款引用必须有明确的条款号\n"
+            f"{_regulation_clause_rule(doc_type)}"
             f"- 技术参数要具体、可测量、有明确的数值范围\n"
             f"- 表格要填写完整，不能留\"(描述)\"或\"待填写\"等占位符\n"
             f"- 针对贴敷式胰岛素泵产品特性编写\n"
@@ -2552,19 +2979,72 @@ async def summarize_document(
 
 # ── Tool 7: web_search ──
 
+# 医疗器械/文档生成类关键词：命中则走医疗专用搜索（Agent SDK 深度研究），
+# 未命中则视为通用实时问题（天气、新闻等），直接对原始关键词做真实网络搜索。
+# 列表保持高精度（宁可少放，避免把实时问题误判为医疗问题）。
+_MEDICAL_DOC_KEYWORDS = (
+    "医疗器械", "医疗", "器械", "药监", "NMPA", "FDA", "CE", "ISO", "GB/T", "GB ",
+    "YY/T", "YY ", "法规", "标准", "注册", "审评", "风险", "FMEA", "验证", "确认",
+    "设计输入", "设计输出", "设计开发", "开发策划", "研发", "生产质量", "质量体系",
+    "胰岛素", "血糖", "泵", "贴敷", "临床", "患者", "无源", "有源", "体外诊断",
+    "说明书", "标签", "SOP", "作业指导书", "工艺", "检验", "检测", "灭菌",
+    "第X章", "章节", "概述", "目的和范围", "产品描述", "职责", "里程碑",
+    "符合性", "资源规划", "风险分析", "风险评估", "风险控制", "受益",
+)
+
+# 实时话题关键词：命中则 LLM 未调用工具时，代码层强制触发 web_search
+_REALTIME_TOPIC_KEYWORDS = (
+    "天气", "气温", "温度", "降雨", "降水", "台风", "地震", "新闻", "最新",
+    "实时", "今日", "今天", "明天", "汇率", "股市", "股票", "金价", "疫情",
+    "政策", "油价", "空气质量", "限行", "放假", "节日",
+)
+
+# 实时信息缺失的拒绝性回答特征词
+_REALTIME_REFUSAL_PATTERNS = (
+    "无法获取", "不能获取", "无法提供", "没有实时", "无法访问", "不能访问",
+    "没有权限获取", "获取不了", "查询不了", "无法查询",
+)
+
+
+def _is_general_query(query: str) -> bool:
+    """判断是否为通用（非医疗器械/非文档生成）查询。
+
+    命中任一医疗/文档关键词 → 医疗路径；否则 → 通用实时路径。
+    空查询视为通用（交给真实搜索），保持简单。
+    """
+    if not query:
+        return True
+    return not any(kw in query for kw in _MEDICAL_DOC_KEYWORDS)
+
+
+def _looks_like_realtime_refusal(response_text: str) -> bool:
+    """检测 LLM 最终回答是否为"无法获取实时信息"式的拒绝。"""
+    if not response_text:
+        return False
+    return any(p in response_text for p in _REALTIME_REFUSAL_PATTERNS)
+
+
+def _user_asks_realtime(user_text: str) -> bool:
+    """检测用户问题是否涉及实时/最新信息话题。"""
+    if not user_text:
+        return False
+    return any(kw in user_text for kw in _REALTIME_TOPIC_KEYWORDS)
+
+
 @tool
 async def web_search(query: str, doc_type: str = "design_development_plan") -> str:
-    """搜索互联网获取医疗器械法规标准、技术文献等最新信息。
+    """搜索互联网获取最新信息。
 
     与 search_kb 的区别: search_kb 搜索本地预置知识库，web_search 搜索互联网最新内容。
-    当本地知识库找不到需要的信息，或需要查询最新法规动态时使用此工具。
+    当本地知识库找不到需要的信息，或需要查询最新法规动态、实时信息（天气、新闻等）时使用此工具。
 
     Args:
-        query: 搜索查询关键词。应为具体的标准号、法规名或技术问题。
+        query: 搜索查询关键词。医疗/文档类问题应为标准号、法规名或技术问题；
+               通用实时问题（如天气、新闻）可直接使用自然语言描述。
         doc_type: 文档类型标识，用于优化搜索策略。
 
     Returns:
-        JSON格式的搜索结果，包含网页摘要和相关法规信息。
+        JSON格式的搜索结果，包含网页摘要和相关法规/实时信息。
     """
     import concurrent.futures
 
@@ -2574,32 +3054,36 @@ async def web_search(query: str, doc_type: str = "design_development_plan") -> s
     # 从上下文获取当前产品名称，避免硬编码
     product_name = _current_product_name.get() or "贴敷式胰岛素泵"
 
-    # 优先使用 Claude Agent SDK 搜索（更智能，质量更高）
-    try:
-        from app.services.agent_search import SyncAgentSearchService
-        agent_search = SyncAgentSearchService()
-        if agent_search.available:
-            web_info, _ = agent_search.search_regulations(
-                chapter_name=query,
-                product_type=product_name,
-                max_results=3,
-                enable_deep_scrape=True,
-                enable_file_download=False,
-                doc_type=doc_type,
-            )
-            if web_info:
-                search_method = "agent_sdk"
-                print(f"[agent_tools] web_search: {len(web_info)} chars via Agent SDK")
-    except Exception as e:
-        print(f"[agent_tools] Agent SDK search failed: {e}")
-
-    # Agent SDK 不可用或失败时回退到 Playwright
-    if not web_info:
+    if _is_general_query(query):
+        # ── 通用实时查询（天气、新闻等）→ 直接对原始关键词做真实网络搜索 ──
+        # 不经过 Agent SDK 的医疗专用研究提示（它会过滤掉非医疗主题），
+        # 也不做章节→医疗查询改写，避免把"今天天气"变成"医疗器械 法规 天气"。
         try:
             from app.services.web_search import SyncWebSearchService
-            playwright_search = SyncWebSearchService()
-            if playwright_search.playwright_available:
-                web_info, _ = playwright_search.search_regulations(
+            general_search = SyncWebSearchService()
+            if general_search.playwright_available:
+                web_info, _ = general_search.search_general(
+                    query=query, max_results=3, enable_deep_scrape=True,
+                )
+                if web_info:
+                    search_method = "ddgs"
+                    print(f"[agent_tools] web_search(general): {len(web_info)} chars via raw web search")
+        except Exception as e:
+            print(f"[agent_tools] general search failed: {e}")
+
+        if not web_info:
+            return json.dumps({
+                "status": "no_results",
+                "message": f'未找到与"{query}"相关的网络信息。请尝试使用不同关键词。',
+                "results": [],
+            }, ensure_ascii=False)
+    else:
+        # ── 医疗器械/文档类查询 → Agent SDK 深度研究，失败降级 ddgs/Playwright ──
+        try:
+            from app.services.agent_search import SyncAgentSearchService
+            agent_search = SyncAgentSearchService()
+            if agent_search.available:
+                web_info, _ = agent_search.search_regulations(
                     chapter_name=query,
                     product_type=product_name,
                     max_results=3,
@@ -2608,10 +3092,25 @@ async def web_search(query: str, doc_type: str = "design_development_plan") -> s
                     doc_type=doc_type,
                 )
                 if web_info:
-                    search_method = "playwright"
-                    print(f"[agent_tools] web_search: {len(web_info)} chars via Playwright")
+                    search_method = "agent_sdk"
+                    print(f"[agent_tools] web_search: {len(web_info)} chars via Agent SDK")
         except Exception as e:
-            print(f"[agent_tools] Playwright search failed: {e}")
+            print(f"[agent_tools] Agent SDK search failed: {e}")
+
+        # Agent SDK 不可用或失败时回退到通用搜索
+        if not web_info:
+            try:
+                from app.services.web_search import SyncWebSearchService
+                playwright_search = SyncWebSearchService()
+                if playwright_search.playwright_available:
+                    web_info, _ = playwright_search.search_general(
+                        query=query, max_results=3, enable_deep_scrape=True,
+                    )
+                    if web_info:
+                        search_method = "ddgs"
+                        print(f"[agent_tools] web_search: {len(web_info)} chars via raw web search (fallback)")
+            except Exception as e:
+                print(f"[agent_tools] Playwright search failed: {e}")
 
     if not web_info:
         return json.dumps({
@@ -3093,11 +3592,80 @@ async def ingest_attachment_to_kb(file_id: str = "") -> str:
     }, ensure_ascii=False)
 
 
+# ── SQL 数据库查询工具（内置贴敷式胰岛素泵领域库） ──
+
+@tool
+async def sql_db_list_tables() -> str:
+    """列出内置领域数据库（贴敷式胰岛素泵）中的所有表名。
+
+    何时用: 需要从数据库查询结构化数据（产品/标准/材料/组件/参数/风险）时，
+           应最先调用此工具了解数据库有哪些表，再按需查表结构。
+
+    Returns:
+        JSON: {"status": "ok", "tables": ["products", ...]}
+    """
+    try:
+        from app.services.sql_db import list_tables
+        tables = list_tables()
+        return json.dumps({"status": "ok", "tables": tables}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+
+@tool
+async def sql_db_schema(table_names: str) -> str:
+    """查看指定表的建表结构与前3行示例数据。
+
+    何时用: 调用 sql_db_list_tables 拿到表名后，在编写 SQL 查询之前，
+           先用本工具确认目标表的列名、类型和示例内容，避免查询不存在的列。
+
+    Args:
+        table_names: 逗号分隔的表名列表，如 "products, standards"。
+           最多展示 6 张表。
+
+    Returns:
+        str: 每张表的 CREATE TABLE 语句 + 前3行示例数据，或错误信息。
+    """
+    try:
+        from app.services.sql_db import get_schema
+        return get_schema(table_names)
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+
+@tool
+async def sql_db_query(query: str) -> str:
+    """执行只读 SQL 查询并返回结果（内置贴敷式胰岛素泵领域数据库）。
+
+    何时用: 用户询问结构化数据（如"哪些标准适用于贴敷式胰岛素泵"、
+           "哪种材料符合生物相容性要求"、"输注精度限值是多少"）时，
+           先 sql_db_list_tables → 再 sql_db_schema → 最后用本工具执行查询。
+
+    Args:
+        query: 只读 SQL 查询语句，必须以 SELECT/WITH/EXPLAIN 开头。
+
+    Rules:
+        - 只读数据库：INSERT/UPDATE/DELETE/DROP/PRAGMA 等写操作一律被拒绝
+        - 结果最多返回 50 行，请用 LIMIT 控制行数
+        - 若返回"表不存在"错误，先用 sql_db_schema 查看正确的表名/列名
+        - 若返回列名错误，先用 sql_db_schema 查询该表的真实字段
+
+    Returns:
+        str: 表头 + 数据行，或明确的错误信息。
+    """
+    try:
+        from app.services.sql_db import run_query
+        return run_query(query)
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+
+
 # ── 工具列表导出 ──
 
 PHASE1_TOOLS = [
     search_kb,
     search_attachment,
+    modify_attachment,
     web_search,
     analyze_document_structure,
     ingest_attachment_to_kb,
@@ -3111,4 +3679,8 @@ PHASE1_TOOLS = [
     update_outline,
     summarize_section,
     summarize_document,
+    # SQL 领域数据库查询（2026-08-11 集成）
+    sql_db_list_tables,
+    sql_db_schema,
+    sql_db_query,
 ]

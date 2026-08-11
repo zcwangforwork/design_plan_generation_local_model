@@ -251,8 +251,11 @@ def extract_text_from_pdf(pdf_path: str, enable_ocr: bool = True) -> List[Tuple[
             if paragraphs:
                 return paragraphs
 
-    except ImportError:
-        pass
+    except Exception as e:
+        # pdfplumber 对加密/损坏/部分 PDF 会抛 PdfminerException 等非 ImportError
+        # 异常，原代码只捕获 ImportError 导致异常穿透，使整个上传提取任务失败。
+        # 此处捕获所有异常，回退到 PyPDF2 / fitz / OCR。
+        print(f"  [PDF] pdfplumber 解析失败，回退其它解析器: {e}")
 
     # 回退到 PyPDF2
     try:
@@ -269,7 +272,26 @@ def extract_text_from_pdf(pdf_path: str, enable_ocr: bool = True) -> List[Tuple[
                         if line:
                             paragraphs.append((current_section, line))
     except Exception as e:
-        print(f"  [PDF] 读取失败: {e}")
+        print(f"  [PDF] PyPDF2 读取失败: {e}")
+
+    # fitz (PyMuPDF) 兜底：对部分 pdfplumber/PyPDF2 解析失败但含文本层的 PDF 有效
+    if not paragraphs:
+        try:
+            import fitz
+            doc = fitz.open(pdf_path)
+            try:
+                for page_num, page in enumerate(doc):
+                    text = page.get_text()
+                    if text:
+                        current_section = f"第{page_num + 1}页"
+                        for line in text.split("\n"):
+                            line = line.strip()
+                            if line:
+                                paragraphs.append((current_section, line))
+            finally:
+                doc.close()
+        except Exception as e:
+            print(f"  [PDF] fitz 读取失败: {e}")
 
     # OCR 回退：如果直接提取无文本，尝试 OCR
     if not paragraphs and enable_ocr:

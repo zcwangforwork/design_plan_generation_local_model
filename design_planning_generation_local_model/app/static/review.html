@@ -220,6 +220,65 @@
         }
         .doc-container hr { border: none; border-top: 1px solid #e0e0e0; margin: 20px 0; }
 
+        /* ── 段落级编辑 ── */
+        .btn-save-doc {
+            background: #1976d2;
+            color: #fff;
+            border: none;
+            padding: 6px 16px;
+            border-radius: 6px;
+            font-size: 13px;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .btn-save-doc:hover { background: #1565c0; }
+        .btn-save-doc:disabled { background: #bdbdbd; cursor: not-allowed; }
+        .md-block { position: relative; }
+        .md-block .block-edit-btn {
+            position: absolute;
+            top: 2px;
+            right: -10px;
+            display: none;
+            background: #1976d2;
+            color: #fff;
+            border: none;
+            padding: 2px 8px;
+            font-size: 11px;
+            border-radius: 4px;
+            cursor: pointer;
+            opacity: 0.85;
+            z-index: 5;
+        }
+        .md-block:hover .block-edit-btn { display: inline-block; }
+        .md-block.editing .block-edit-btn { display: none; }
+        .md-block.editing { background: #f9fbff; border-radius: 4px; padding: 2px 6px; }
+        .block-editor {
+            width: 100%;
+            min-height: 60px;
+            font-family: "Consolas", "Courier New", monospace;
+            font-size: 13px;
+            line-height: 1.6;
+            padding: 8px;
+            border: 1px solid #1976d2;
+            border-radius: 6px;
+            resize: vertical;
+            margin: 4px 0;
+            color: #333;
+            box-sizing: border-box;
+        }
+        .block-editor:focus { outline: none; box-shadow: 0 0 0 2px rgba(25,118,210,0.2); }
+        .block-editor-actions { display: flex; gap: 8px; margin: 4px 0 8px; }
+        .block-editor-actions .btn-save {
+            background: #1976d2; color: #fff; border: none;
+            padding: 4px 16px; border-radius: 4px; font-size: 13px; cursor: pointer;
+        }
+        .block-editor-actions .btn-save:hover { background: #1565c0; }
+        .block-editor-actions .btn-cancel {
+            background: #f5f5f5; color: #555; border: 1px solid #e0e0e0;
+            padding: 4px 16px; border-radius: 4px; font-size: 13px; cursor: pointer;
+        }
+        .block-editor-actions .btn-cancel:hover { background: #e0e0e0; }
+
         /* Empty / loading / error states */
         .state-box {
             max-width: 500px;
@@ -261,6 +320,7 @@
                 padding: 20px 0;
                 max-width: 100%;
             }
+            .md-block .block-edit-btn, .md-block.editing .block-editor, .md-block.editing .block-editor-actions { display: none !important; }
         }
 
         @media (max-width: 768px) {
@@ -293,6 +353,8 @@
             <h2 id="topbarTitle">文档审阅</h2>
             <span class="badge" id="statusBadge" style="display:none"></span>
             <span class="spacer"></span>
+            <span id="dirtyIndicator" style="display:none;font-size:12px;color:#e65100">✎ 有未保存的修改</span>
+            <button id="btnSaveDoc" class="btn-save-doc" onclick="saveDocument()" disabled>保存修改</button>
             <span id="topbarMeta" style="font-size:12px;color:#999"></span>
         </div>
         <div class="content-area" id="contentArea">
@@ -309,6 +371,8 @@
         const pathParts = window.location.pathname.split('/');
         const PROJECT_ID = pathParts[pathParts.length - 1];
         let documentData = null;
+        let blocks = [];   // blocks[sidx] = 该章节的 markdown 块列表
+        let dirty = false; // 是否存在未保存的修改
 
         // ── Init ──
         (async function init() {
@@ -384,18 +448,19 @@
             if (stds.length > 0) parts.push(`${stds.length} 个标准已确认`);
             topbarMeta.textContent = parts.join(' · ');
 
-            // Render document content
+            // Render document content (按 markdown 块拆分，支持段落级编辑)
             const area = document.getElementById('contentArea');
             if (sections.length === 0) {
                 showEmpty('暂无已生成章节', '请先通过Agent对话生成文档章节，然后在此审阅。');
                 return;
             }
 
+            blocks = sections.map(s => splitBlocks(s.content || ''));
+
             let html = '<div class="doc-container">';
             for (let i = 0; i < sections.length; i++) {
-                const s = sections[i];
                 html += `<div id="section-${i}">`;
-                html += marked.parse(s.content || '*（空章节）*');
+                html += renderSectionHTML(i);
                 html += '</div>';
             }
             html += '</div>';
@@ -408,6 +473,131 @@
 
             // Enable download button
             document.getElementById('btnDownload').disabled = false;
+            setDirty(false);
+        }
+
+        // ── Markdown 块拆分 / 合并 ──
+        function splitBlocks(md) {
+            if (!md) return [];
+            const lines = md.split('\n');
+            const out = [];
+            let cur = [];
+            let inFence = false;
+            for (const line of lines) {
+                if (/^\s*(```|~~~)/.test(line)) { inFence = !inFence; cur.push(line); continue; }
+                if (inFence) { cur.push(line); continue; }
+                if (line.trim() === '') {
+                    if (cur.length) { out.push(cur.join('\n')); cur = []; }
+                    continue;
+                }
+                // 标题 / 分隔线独立成块，便于单独编辑
+                if (/^\s*#{1,6}\s/.test(line) || /^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line.trim())) {
+                    if (cur.length) { out.push(cur.join('\n')); cur = []; }
+                    out.push(line.trim());
+                    continue;
+                }
+                cur.push(line);
+            }
+            if (cur.length) out.push(cur.join('\n'));
+            return out;
+        }
+
+        function joinBlocks(list) {
+            return (list || []).join('\n\n');
+        }
+
+        function renderSectionHTML(sidx) {
+            const list = blocks[sidx] || [];
+            if (list.length === 0) return '<p>*（空章节）*</p>';
+            return list.map((src, bidx) =>
+                `<div class="md-block" data-section="${sidx}" data-block="${bidx}">`
+                + `<button class="block-edit-btn" title="编辑此段落" onclick="event.stopPropagation();startEditBlock(${sidx},${bidx})">✎ 编辑</button>`
+                + `<div class="block-content">${marked.parse(src)}</div>`
+                + `</div>`
+            ).join('');
+        }
+
+        function renderSection(sidx) {
+            const el = document.getElementById('section-' + sidx);
+            if (el) el.innerHTML = renderSectionHTML(sidx);
+        }
+
+        // ── 段落编辑 ──
+        function startEditBlock(sidx, bidx) {
+            const el = document.querySelector(`.md-block[data-section="${sidx}"][data-block="${bidx}"]`);
+            if (!el || !blocks[sidx]) return;
+            el.classList.add('editing');
+            el.querySelector('.block-content').innerHTML =
+                `<textarea class="block-editor" rows="4">${esc(blocks[sidx][bidx])}</textarea>`
+                + `<div class="block-editor-actions">`
+                + `<button class="btn-save" onclick="event.stopPropagation();saveEditBlock(${sidx},${bidx})">保存</button>`
+                + `<button class="btn-cancel" onclick="event.stopPropagation();cancelEditBlock(${sidx},${bidx})">取消</button>`
+                + `</div>`;
+            const ta = el.querySelector('.block-editor');
+            ta.focus();
+            ta.setSelectionRange(ta.value.length, ta.value.length);
+        }
+
+        function saveEditBlock(sidx, bidx) {
+            if (!blocks[sidx]) return;
+            const el = document.querySelector(`.md-block[data-section="${sidx}"][data-block="${bidx}"]`);
+            if (!el) return;
+            const ta = el.querySelector('.block-editor');
+            if (!ta) return;
+            const newSrc = ta.value.trim();
+            if (newSrc) {
+                blocks[sidx][bidx] = newSrc;
+            } else {
+                // 内容清空 = 删除该段落
+                blocks[sidx].splice(bidx, 1);
+            }
+            setDirty(true);
+            renderSection(sidx);
+        }
+
+        function cancelEditBlock(sidx, bidx) {
+            renderSection(sidx);
+        }
+
+        // ── 保存修改到后端 ──
+        function setDirty(v) {
+            dirty = v;
+            document.getElementById('btnSaveDoc').disabled = !v;
+            document.getElementById('dirtyIndicator').style.display = v ? 'inline-block' : 'none';
+        }
+
+        async function saveDocument() {
+            if (!dirty) return;
+            const btn = document.getElementById('btnSaveDoc');
+            btn.disabled = true;
+            btn.textContent = '保存中...';
+            try {
+                const sections = documentData.sections.map((s, i) => ({
+                    title: s.title,
+                    content: joinBlocks(blocks[i] || [])
+                }));
+                const resp = await fetch(`/api/agent/projects/${PROJECT_ID}/document`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sections })
+                });
+                const result = await resp.json().catch(() => ({}));
+                if (!resp.ok) {
+                    alert('保存失败: ' + (result.detail || resp.statusText));
+                    return;
+                }
+                // 同步本地 documentData，保证后续操作基于最新内容
+                sections.forEach((s, i) => {
+                    if (documentData.sections[i]) documentData.sections[i].content = s.content;
+                });
+                setDirty(false);
+                alert(`已保存，共更新 ${result.sections_updated || sections.length} 个章节。`);
+            } catch (err) {
+                alert('保存失败: ' + err.message);
+            } finally {
+                btn.textContent = '保存修改';
+                btn.disabled = !dirty;
+            }
         }
 
         function scrollToSection(index) {

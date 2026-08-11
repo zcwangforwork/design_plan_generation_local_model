@@ -33,6 +33,17 @@ class GenerateRequest(BaseModel):
     attachment_content: Optional[str] = Field(None, description="临时附件的提取文本内容")
 
 
+class SectionContent(BaseModel):
+    """审阅页文档章节内容（title 为章节名，content 为 Markdown 文本）"""
+    title: str = Field(..., description="章节标题")
+    content: str = Field("", description="章节 Markdown 内容")
+
+
+class DocumentUpdateRequest(BaseModel):
+    """审阅页保存文档修改请求（整体替换 generated_sections）"""
+    sections: List[SectionContent] = Field(..., description="修改后的章节列表（保留原顺序）")
+
+
 # 内存中的任务存储
 tasks = {}  # task_id -> {status, progress, message, file_bytes, filename, created_at}
 
@@ -491,6 +502,43 @@ async def agent_send_message(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.post("/agent/projects/{project_id}/mode")
+async def agent_set_generation_mode(
+    project_id: str,
+    concise: bool = Form(...),
+):
+    """设置文档生成模式（精炼生成开关）
+
+    仅影响文档内容生成（write_chapter/generate_section/modify_attachment/update_outline），
+    不改变聊天回复风格。模式按项目持久化到 Agent 状态，下一轮生成自动生效。
+
+    Args:
+        project_id: 项目ID
+        concise: True=开启精炼生成, False=关闭
+    """
+    from app.services.agent_engine import get_agent
+    from app.services.agent_state import create_initial_state
+
+    agent = get_agent()
+    config = {"configurable": {"thread_id": project_id}}
+
+    try:
+        existing = await agent.aget_state(config)
+        has_checkpoint = existing is not None and bool(existing.values)
+        if has_checkpoint:
+            await agent.aupdate_state(config, {"concise_mode": concise}, as_node="after_tools")
+        else:
+            # 新线程无 checkpoint：用初始状态合并模式后整体 seed，避免 aupdate_state 报错
+            init = dict(create_initial_state())
+            init["concise_mode"] = concise
+            await agent.aupdate_state(config, init, as_node="after_tools")
+        return {"success": True, "concise_mode": concise}
+    except Exception as e:
+        import traceback as _tb
+        print(f"[agent_set_generation_mode] 设置失败:\n{_tb.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"设置生成模式失败: {str(e)}")
 
 
 @router.post("/agent/projects/{project_id}/resume")
@@ -972,6 +1020,49 @@ async def agent_get_document(project_id: str):
     }
 
 
+@router.post("/agent/projects/{project_id}/document")
+async def agent_update_document(project_id: str, request: DocumentUpdateRequest):
+    """审阅页面保存修改后的文档内容
+
+    接收前端编辑后的完整章节列表，整体替换 generated_sections 并持久化到 Agent 状态。
+    章节顺序按请求列表顺序（前端保留原顺序），修订/新增/删除章节均生效；
+    后续 Agent 生成、build_docx、下载都会基于保存后的最新内容。
+    """
+    from app.services.agent_engine import get_agent
+
+    agent = get_agent()
+    config = {"configurable": {"thread_id": project_id}}
+
+    try:
+        state = await agent.aget_state(config)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"无法读取Agent状态: {str(e)}")
+
+    if not state or not state.values:
+        raise HTTPException(status_code=404, detail="项目不存在或尚未开始")
+
+    new_sections = {}
+    for s in request.sections:
+        title = (s.title or "").strip()
+        if not title:
+            continue
+        new_sections[title] = s.content
+
+    if not new_sections:
+        raise HTTPException(status_code=400, detail="未提供有效的章节内容")
+
+    try:
+        await agent.aupdate_state(config, {"generated_sections": new_sections})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"保存修改失败: {str(e)}")
+
+    return {
+        "success": True,
+        "project_id": project_id,
+        "sections_updated": len(new_sections),
+    }
+
+
 @router.get("/agent/projects/{project_id}/download")
 async def agent_download_document(project_id: str):
     """直接从Agent状态组装文档并下载.docx（无需Agent参与）
@@ -1047,6 +1138,103 @@ async def agent_download_docx(download_id: str):
 
     return StreamingResponse(
         io.BytesIO(docx_data["bytes"]),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
+        }
+    )
+
+
+@router.get("/agent/projects/{project_id}/modified-documents")
+async def agent_list_modified_documents(project_id: str):
+    """列出项目内所有附件修改结果（modify_attachment 工具的产物）
+
+    从Agent状态读取 attachment_modifications，返回摘要列表
+    （不含完整 Markdown，避免响应过大）。
+    """
+    from app.services.agent_engine import get_agent
+
+    agent = get_agent()
+    config = {"configurable": {"thread_id": project_id}}
+
+    try:
+        state = await agent.aget_state(config)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"无法读取Agent状态: {str(e)}")
+
+    if not state or not state.values:
+        raise HTTPException(status_code=404, detail="项目不存在或尚未开始")
+
+    modifications = state.values.get("attachment_modifications", []) or []
+    return {
+        "success": True,
+        "project_id": project_id,
+        "modifications": [
+            {
+                "file_id": m.get("file_id"),
+                "filename": m.get("filename", ""),
+                "summary": m.get("summary", ""),
+                "modified_chars": m.get("modified_chars", 0),
+                "timestamp": m.get("timestamp", ""),
+            }
+            for m in modifications
+        ],
+    }
+
+
+@router.get("/agent/projects/{project_id}/modified-documents/{file_id}/download")
+async def agent_download_modified_document(project_id: str, file_id: str):
+    """下载修改后的附件文档 (.docx)
+
+    从Agent状态读取 attachment_modifications 中 file_id 对应的修改后 Markdown，
+    通过 TemplateService 构建 .docx 并返回。
+    """
+    from app.services.agent_engine import get_agent
+    from app.services.template import TemplateService
+
+    agent = get_agent()
+    config = {"configurable": {"thread_id": project_id}}
+
+    try:
+        state = await agent.aget_state(config)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"无法读取Agent状态: {str(e)}")
+
+    if not state or not state.values:
+        raise HTTPException(status_code=404, detail="项目不存在或尚未开始")
+
+    values = state.values
+    modifications = values.get("attachment_modifications", []) or []
+    target = next((m for m in modifications if m.get("file_id") == file_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="未找到该附件的修改结果，请先在对话中让Agent修改附件")
+
+    modified_markdown = target.get("modified_markdown", "")
+    if not modified_markdown.strip():
+        raise HTTPException(status_code=400, detail="修改后文档内容为空")
+
+    # 读取实际的 doc_type（无则默认设计开发计划书）
+    doc_type = values.get("doc_type", "design_development_plan")
+    product_name = values.get("product_name", "") or "贴敷式胰岛素泵"
+
+    # 构建.docx（复用审阅下载链路）
+    template_service = TemplateService()
+    doc = template_service.load_template(doc_type)
+    doc = template_service.fill_template(
+        doc=doc,
+        content=modified_markdown,
+        product_name=product_name,
+        doc_type=doc_type,
+    )
+    file_bytes = template_service.document_to_bytes(doc)
+
+    orig_name = target.get("filename", "document.md")
+    stem = os.path.splitext(orig_name)[0]
+    filename = f"{stem}_修改版.docx"
+    encoded_filename = quote(filename)
+
+    return StreamingResponse(
+        io.BytesIO(file_bytes),
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={
             "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"

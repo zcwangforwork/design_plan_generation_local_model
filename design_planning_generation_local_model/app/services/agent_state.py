@@ -57,6 +57,9 @@ class AgentState(TypedDict, total=False):
     # ── 自动模式 ──
     auto_mode: Optional[bool]  # True时跳过所有HITL确认
 
+    # ── 生成模式 ──
+    concise_mode: Optional[bool]  # True时Agent以简洁精炼语言生成文档内容（仅文档内容，不影响聊天回复）
+
     # ── 多代理协作 ──
     outline: Optional[str]          # JSON字符串, 完整的文档框架
     outline_status: Optional[str]   # "not_started" | "draft" | "confirmed" | "revised"
@@ -66,6 +69,12 @@ class AgentState(TypedDict, total=False):
     # ── 附件管理 ──
     # 结构: [{"file_id": str, "filename": str, "char_count": int, "preview": str, "full_text": str, "status": str}, ...]
     attachments: list[dict]
+
+    # ── 附件修改结果 ──
+    # 结构: [{"file_id": str, "filename": str, "modified_markdown": str, "summary": str,
+    #         "modified_chars": int, "timestamp": str, "download_id": str}, ...]
+    # 独立于 generated_sections：修改的是上传附件的副本，不污染目标文档章节
+    attachment_modifications: list[dict]
 
 
 # ── 默认初始状态 ──
@@ -88,11 +97,13 @@ def create_initial_state() -> AgentState:
         review_status="not_started",
         unresolved_items=[],
         auto_mode=False,
+        concise_mode=False,
         outline=None,
         outline_status="not_started",
         current_chapter=None,
         chapter_write_queue=[],
         attachments=[],
+        attachment_modifications=[],
     )
 
 
@@ -156,6 +167,7 @@ def build_state_snapshot(state: AgentState) -> dict:
     对应PRD Section 4.3的JSON结构
     """
     return {
+        "concise_mode": bool(state.get("concise_mode", False)),
         "product": {
             "name": state.get("product_name"),
             "classification": state.get("product_classification"),

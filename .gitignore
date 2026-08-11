@@ -5,6 +5,12 @@
 *.sqlite-journal
 *.db-journal
 
+# SQL agent 领域库（app/services/sql_db.py 的 data/domain.db）
+**/data/domain.db
+**/data/domain.db-journal
+**/data/domain.db-wal
+**/data/domain.db-shm
+
 # ChromaDB / vector store
 **/chroma*/
 **/chroma.sqlite3

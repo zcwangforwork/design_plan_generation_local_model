@@ -10,6 +10,7 @@ Agent Engine — 设计策划文档Agent核心引擎
 import os
 import re
 import json
+import time
 from typing import Optional, Literal
 from pathlib import Path
 
@@ -21,7 +22,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.types import interrupt, Command
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
 
 from app.services.agent_state import (
     AgentState,
@@ -30,7 +31,12 @@ from app.services.agent_state import (
     build_state_snapshot,
 )
 from app.services.agent_prompt import build_system_prompt
-from app.services.agent_tools import PHASE1_TOOLS, generate_section
+from app.services.agent_tools import (
+    PHASE1_TOOLS,
+    generate_section,
+    _user_asks_realtime,
+    _looks_like_realtime_refusal,
+)
 from app.services.context_manager import maybe_compress_messages
 
 
@@ -97,6 +103,31 @@ async def _agent_node(state: AgentState) -> dict:
     model = _get_model_with_tools()
     response = await model.ainvoke(full_messages)
 
+    # OpenViking capture（静默降级，评审决策 #3 Phase 1 capture-only）
+    # 每轮 agent 对话后捕获消息到 OpenViking，为 Phase 3 recall 积累数据
+    await _capture_to_openviking(messages + [response])
+
+    # ── 代码级兜底：LLM 未调用工具但给出"无法获取实时信息"式拒绝，且用户问题涉及实时话题 ──
+    # 此时强制插入 web_search 工具调用，让图路由到 ToolNode 执行真实网络搜索，
+    # 搜索完成后自动回到本节点，LLM 依据真实结果重新回答。
+    # 场景：本地 LLM 偶尔不遵循提示词强规则（如问天气时直接拒绝），此兜底保证触发真实搜索。
+    if not getattr(response, "tool_calls", None):
+        user_text = str(messages[-1].content) if messages else ""
+        resp_text = str(getattr(response, "content", "")) or ""
+        if _user_asks_realtime(user_text) and _looks_like_realtime_refusal(resp_text):
+            query = user_text.strip()[:200] or resp_text[:80]
+            forced = AIMessage(
+                content="",  # 仅携带工具调用，触发真实网络搜索
+                tool_calls=[{
+                    "name": "web_search",
+                    "args": {"query": query},
+                    "id": f"call_backstop_{int(time.time() * 1000)}",
+                    "type": "tool_call",
+                }],
+            )
+            print(f"[agent_engine] 代码兜底: 强制触发 web_search (query={query[:40]})")
+            return {"messages": [forced]}
+
     # 如果发生了压缩，也更新状态中的messages
     if was_compressed:
         return {
@@ -104,6 +135,40 @@ async def _agent_node(state: AgentState) -> dict:
         }
 
     return {"messages": [response]}
+
+
+async def _capture_to_openviking(messages: list) -> None:
+    """将对话消息捕获到 OpenViking（静默降级）。
+
+    Phase 1 capture-only：每轮 agent 对话后记录消息到 OpenViking，
+    为 Phase 3 recall 积累数据。失败时不影响 Agent 运行。
+
+    使用 LangGraph thread_id 作为 OpenViking session_id（Phase 0 验证：
+    _resolve_session_id 直接读 thread_id，无需前缀映射）。
+    """
+    try:
+        from app.services.openviking_client import get_openviking_service
+        ov_service = get_openviking_service()
+        if not ov_service or not ov_service.is_available():
+            return
+
+        # 获取 thread_id 作为 OpenViking session_id
+        # Python 3.10 下 LangGraph get_config() 的 contextvar 可能跨 async
+        # 任务传播失败（与 _pre_tool_node 同一问题），失败时跳过 capture。
+        thread_id = None
+        try:
+            from langgraph.config import get_config
+            config = get_config()
+            thread_id = config.get("configurable", {}).get("thread_id", "")
+        except (RuntimeError, Exception):
+            pass
+
+        if not thread_id:
+            return
+
+        await ov_service.capture_messages(messages, thread_id)
+    except Exception:
+        pass  # 静默降级：capture 失败不影响 Agent 运行
 
 
 async def _pre_tool_node(state: AgentState) -> dict:
@@ -193,6 +258,7 @@ async def _after_tools_node(state: AgentState) -> dict:
     doc_status = None
     outline_data = None
     outline_status = None
+    modifications = []  # attachment_modifications 新增项
 
     for tool_msg in reversed(new_tool_messages):
         tool_call_id = getattr(tool_msg, "tool_call_id", None)
@@ -277,6 +343,34 @@ async def _after_tools_node(state: AgentState) -> dict:
             except json.JSONDecodeError:
                 pass
 
+        # ── 新增: modify_attachment 结果处理 ──
+        # 完整修改后文档从旁路 dict 读取（避免大段内容进入 LLM 对话历史），
+        # 工具返回的 JSON 提供 file_id / filename / summary / download_id。
+        if tool_name == "modify_attachment":
+            try:
+                parsed = json.loads(str(tool_msg.content))
+            except Exception:
+                parsed = {}
+            if parsed.get("status") == "ok":
+                from app.services.agent_tools import get_pending_modified_document
+                file_id = tool_args.get("file_id", "") or parsed.get("file_id", "")
+                pending = get_pending_modified_document(file_id) if file_id else None
+                markdown = (pending or {}).get("markdown", "")
+                if not markdown:
+                    markdown = parsed.get("modified_markdown", "")
+                if markdown:
+                    from datetime import datetime as _dt
+                    modifications.append({
+                        "file_id": file_id,
+                        "filename": parsed.get("filename", "") or (pending or {}).get("filename", ""),
+                        "modified_markdown": markdown,
+                        "summary": parsed.get("summary", ""),
+                        "modified_chars": parsed.get("modified_chars", len(markdown)),
+                        "timestamp": _dt.now().isoformat(timespec="seconds"),
+                    })
+                    print(f"[agent_engine] Saved modified attachment "
+                          f"'{parsed.get('filename', '?')}' ({len(markdown)} chars)")
+
     result = {}
     if sections_updated:
         result["generated_sections"] = generated_sections
@@ -286,6 +380,9 @@ async def _after_tools_node(state: AgentState) -> dict:
     if outline_data:
         result["outline"] = outline_data
         result["outline_status"] = outline_status
+    if modifications:
+        existing_mods = list(state.get("attachment_modifications", []) or [])
+        result["attachment_modifications"] = existing_mods + modifications
 
     return result
 
@@ -379,6 +476,29 @@ async def init_agent(db_path: Optional[str] = None):
         db_path: SQLite检查点数据库路径
     """
     global _agent_graph
+
+    # 初始化领域 SQLite 数据库（建表 + 一次性种子，幂等；agent 的 SQL 工具查询源）
+    try:
+        from app.services.sql_db import init_db
+        print(f"[agent_engine] SQL domain db: {init_db()}")
+    except Exception as e:
+        print(f"[agent_engine] SQL domain db init failed (non-fatal): {e}")
+
+    # 初始化 OpenViking（静默降级，评审决策 #3 Phase 1 capture-only）
+    from app.services.openviking_client import init_openviking, get_openviking_service
+    await init_openviking()
+
+    # 追加 OpenViking capture 工具到 PHASE1_TOOLS（去重）
+    # capture-only: viking_store / viking_add_resource（合规收窄，无 recall）
+    ov_service = get_openviking_service()
+    if ov_service and ov_service.is_available():
+        capture_tools = ov_service.get_capture_tools()
+        for t in capture_tools:
+            if t not in PHASE1_TOOLS:
+                PHASE1_TOOLS.append(t)
+        print(f"[agent_engine] OpenViking capture tools added: {len(capture_tools)}")
+    else:
+        print("[agent_engine] OpenViking not available (non-fatal)")
 
     checkpointer = await get_checkpointer(db_path)
     workflow = _build_graph()
@@ -549,6 +669,21 @@ async def stream_agent_events(
                         }
                 except Exception:
                     pass
+            # modify_attachment 完成时发射 modified_doc_ready 事件，前端弹出修改版下载
+            if tool_name == "modify_attachment":
+                import json as _json
+                try:
+                    result = _json.loads(output)
+                    if result.get("status") == "ok":
+                        yield {
+                            "type": "modified_doc_ready",
+                            "file_id": result.get("file_id", ""),
+                            "filename": result.get("filename", ""),
+                            "modified_chars": result.get("modified_chars", 0),
+                            "summary": result.get("summary", ""),
+                        }
+                except Exception:
+                    pass
             # generate_section / revise_section 完成时发射 sections_ready 事件
             if tool_name in ("generate_section", "revise_section"):
                 yield {
@@ -693,6 +828,20 @@ async def resume_agent(
                             "download_id": result["download_id"],
                             "filename": result["filename"],
                             "size_bytes": result.get("size_bytes", 0),
+                        }
+                except Exception:
+                    pass
+            if tool_name == "modify_attachment":
+                import json as _json
+                try:
+                    result = _json.loads(output)
+                    if result.get("status") == "ok":
+                        yield {
+                            "type": "modified_doc_ready",
+                            "file_id": result.get("file_id", ""),
+                            "filename": result.get("filename", ""),
+                            "modified_chars": result.get("modified_chars", 0),
+                            "summary": result.get("summary", ""),
                         }
                 except Exception:
                     pass

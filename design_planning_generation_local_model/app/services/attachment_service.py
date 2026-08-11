@@ -26,27 +26,32 @@ def _do_extract(task_id: str, file_path: str, persist: bool, doc_type: str):
 
         paragraphs = extract_text_from_file(file_path)
 
-        # 如果结构化提取为空，尝试直接读取为纯文本
+        # 如果结构化提取为空，尝试直接读取为纯文本（仅限纯文本类格式）
+        # 注意：不得对 pdf/docx/doc/xlsx 等二进制格式做 latin1 兜底——
+        # latin1 对任意字节序列都不会解码失败，会把二进制读成乱码并当成"成功提取"，
+        # 导致上传"看似成功"却产生乱码文本。
         if not paragraphs:
-            try:
-                # 尝试多种编码直接读取原始文本
-                raw_text = ""
-                for enc in ["utf-8", "gbk", "gb18030", "latin1"]:
-                    try:
-                        with open(file_path, "r", encoding=enc) as f:
-                            raw_text = f.read().strip()
-                        if raw_text:
-                            break
-                    except Exception:
-                        continue
-                if raw_text:
-                    paragraphs = [("", raw_text)]
-            except Exception:
-                pass
+            _ext = os.path.splitext(file_path)[1].lower()
+            if _ext in (".txt", ".md"):
+                try:
+                    # 尝试多种编码直接读取原始文本
+                    raw_text = ""
+                    for enc in ["utf-8", "gbk", "gb18030", "latin1"]:
+                        try:
+                            with open(file_path, "r", encoding=enc) as f:
+                                raw_text = f.read().strip()
+                            if raw_text:
+                                break
+                        except Exception:
+                            continue
+                    if raw_text:
+                        paragraphs = [("", raw_text)]
+                except Exception:
+                    pass
 
         if not paragraphs:
             extract_tasks[task_id]["status"] = "failed"
-            extract_tasks[task_id]["message"] = "无法从文件中提取文本内容，文件可能为空或格式不支持"
+            extract_tasks[task_id]["message"] = "无法从文件中提取文本内容，文件可能为空、已加密或格式不支持"
             return
 
         # 合并为完整文本（不做结构处理，直接拼接）
@@ -164,7 +169,10 @@ def submit_extract_task(
     # 去重检查
     for existing_id, task in extract_tasks.items():
         if task.get("file_hash") == file_hash and task.get("status") == "completed":
-            # 已有相同文件，直接返回
+            # 已有相同文件，直接返回；
+            # 但若本次请求入库(persist=True)而既有任务未入库，则重建任务以确保入库
+            if persist and not task.get("persisted"):
+                continue
             return existing_id
 
     extract_tasks[task_id] = {

@@ -171,14 +171,18 @@ class TestAgentTools:
             assert "Network timeout" in result
 
     def test_phase1_tools_list(self):
-        """PHASE1_TOOLS 包含3个工具"""
+        """PHASE1_TOOLS 包含核心工具与 SQL 领域查询工具"""
         from app.services.agent_tools import PHASE1_TOOLS
-        assert len(PHASE1_TOOLS) == 4
         tool_names = [t.name for t in PHASE1_TOOLS]
+        # 核心工具
         assert "search_kb" in tool_names
         assert "generate_section" in tool_names
         assert "revise_section" in tool_names
         assert "build_docx" in tool_names
+        # SQL 领域数据库查询工具（2026-08-11 集成）
+        assert "sql_db_list_tables" in tool_names
+        assert "sql_db_schema" in tool_names
+        assert "sql_db_query" in tool_names
 
 
 # ═══════════════════════════════════════════════════════════════

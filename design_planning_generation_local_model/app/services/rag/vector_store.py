@@ -29,7 +29,9 @@ class VectorStore:
     COLLECTION_NAME_PREFIX = "qms_doc_"
 
     # 查询时使用的目标 collection 列表（优先级从高到低）
-    QUERY_COLLECTIONS = ["insulin_pump_kb"]
+    # 注意: 这里使用的是 ChromaDB 中的实际 collection 名。
+    # insulin_pump_kb 无前缀（历史遗留），uploads 实际名为 qms_doc_uploads。
+    QUERY_COLLECTIONS = ["insulin_pump_kb", "qms_doc_uploads"]
 
     # 额外的 ChromaDB 目录及其 collection 列表
     # 格式: {db_path: [collection_names]}
@@ -311,8 +313,9 @@ class VectorStore:
                             meta = vector_results["metadatas"][0][i] or {}
                             chunk_doc_type = meta.get("doc_type", "")
 
-                            # doc_type 过滤
-                            if doc_type and chunk_doc_type != doc_type:
+                            # doc_type 过滤（uploads 用户上传文件的 doc_type 恒为 unknown，
+                            # 豁免过滤以确保用户上传内容始终可被检索）
+                            if doc_type and chunk_doc_type != doc_type and coll_name != "qms_doc_uploads":
                                 continue
 
                             # 去重：同一 chunk_id 只保留相似度更高的
@@ -325,7 +328,8 @@ class VectorStore:
                                     "chunk_index": meta.get("chunk_index", 0),
                                     "similarity": similarity,
                                     "vector_score": similarity,
-                                    "bm25_score": 0.0
+                                    "bm25_score": 0.0,
+                                    "source_collection": coll_name
                                 }
             except Exception as e:
                 print(f"    [VectorStore] 混合检索 collection '{coll_name}' 失败: {e}")
@@ -359,7 +363,8 @@ class VectorStore:
                                         "chunk_index": meta.get("chunk_index", 0),
                                         "similarity": similarity,
                                         "vector_score": similarity,
-                                        "bm25_score": 0.0
+                                        "bm25_score": 0.0,
+                                        "source_collection": coll_name
                                     }
                 except Exception:
                     continue
@@ -413,7 +418,8 @@ class VectorStore:
                 "chunk_index": chunk_info.get("chunk_index", 0),
                 "similarity": combined_score,
                 "vector_score": vec_score,
-                "bm25_score": bm_score
+                "bm25_score": bm_score,
+                "source_collection": chunk_info.get("source_collection", "")
             })
 
         # 按综合分数排序

@@ -11,6 +11,7 @@ from docx.shared import Pt, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 from app.services.doc_types import DOC_TYPE_LABELS
+from app.services.doc_dedup import dedup_markdown
 
 # 模板目录
 TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "..", "templates")
@@ -85,6 +86,10 @@ class TemplateService:
         Returns:
             填充后的Document对象
         """
+        # 生成后全文档去重兜底：过滤冗余行、去除重复正文行、合并高相似度小节
+        # （fill_template 是 Markdown→Word 的唯一公共转换点，覆盖所有生成路径）
+        content = dedup_markdown(content)
+
         # 解析Markdown内容并写入文档
         self._parse_and_fill(doc, content, product_name, doc_type)
         return doc
