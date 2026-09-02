@@ -3,8 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>文档审阅 — 设计策划写作 Agent</title>
+    <title>文档审阅 — 设计开发文档写作 Agent</title>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -465,6 +466,7 @@
             }
             html += '</div>';
             area.innerHTML = html;
+            renderMermaidIn(area);
 
             // Highlight first nav item
             if (nav.firstElementChild) {
@@ -519,7 +521,34 @@
 
         function renderSection(sidx) {
             const el = document.getElementById('section-' + sidx);
-            if (el) el.innerHTML = renderSectionHTML(sidx);
+            if (el) {
+                el.innerHTML = renderSectionHTML(sidx);
+                renderMermaidIn(el);
+            }
+        }
+
+        // ── Mermaid 流程图渲染 ──
+        let _mmSeq = 0;
+        async function renderMermaidIn(container) {
+            if (typeof mermaid === 'undefined' || !container) return;
+            const blocks = container.querySelectorAll('pre code.language-mermaid');
+            if (!blocks.length) return;
+            try { mermaid.initialize({ startOnLoad: false, theme: 'default' }); } catch (e) {}
+            for (const code of blocks) {
+                const src = (code.textContent || '').trim();
+                if (!src) continue;
+                try {
+                    const id = 'mm-' + (++_mmSeq);
+                    const { svg } = await mermaid.render(id, src);
+                    const div = document.createElement('div');
+                    div.className = 'mermaid-render';
+                    div.innerHTML = svg;
+                    const pre = code.closest('pre');
+                    if (pre && pre.parentNode) pre.parentNode.replaceChild(div, pre);
+                } catch (e) {
+                    // 渲染失败：保留源码块
+                }
+            }
         }
 
         // ── 段落编辑 ──

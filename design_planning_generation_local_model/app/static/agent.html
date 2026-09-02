@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>设计策划写作 Agent</title>
+    <title>设计开发文档写作 Agent</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -103,6 +103,23 @@
             background: #1976d2; color: #fff;
             align-self: flex-end;
         }
+        /* 撤回按钮：仅出现在用户消息上，右下角 */
+        .recall-bar {
+            text-align: right;
+            margin-top: 8px;
+        }
+        .recall-btn {
+            background: rgba(255,255,255,0.18);
+            border: 1px solid rgba(255,255,255,0.3);
+            color: #fff;
+            font-size: 11px;
+            cursor: pointer;
+            padding: 2px 10px;
+            border-radius: 4px;
+            transition: background 0.2s;
+        }
+        .recall-btn:hover { background: rgba(255,255,255,0.35); }
+        .recall-btn:disabled { opacity: 0.5; cursor: not-allowed; }
         .msg pre { background: #f5f5f5; padding: 8px; border-radius: 4px; font-size: 12px; overflow-x: auto; }
         .msg code { font-family: monospace; font-size: 13px; }
         /* Collapsible long messages */
@@ -224,6 +241,18 @@
         }
         .input-area button:hover { background: #1565c0; }
         .input-area button:disabled { background: #bdbdbd; cursor: not-allowed; }
+        .input-area.drag-over {
+            background: #e3f2fd; outline: 2px dashed #1976d2; outline-offset: -4px;
+            border-radius: 8px;
+        }
+        /* 清空输入按钮：淡色小圆点，仅在有文字时显示 */
+        .input-area #clearBtn {
+            background: #eee; color: #888; border: none;
+            border-radius: 50%; width: 26px; height: 26px;
+            font-size: 16px; line-height: 1; padding: 0;
+            cursor: pointer; align-self: center; flex-shrink: 0;
+        }
+        .input-area #clearBtn:hover { background: #e0e0e0; color: #333; }
         /* Attachment area */
         .attachment-area {
             padding: 4px 20px 0;
@@ -233,14 +262,15 @@
             background: #e3f2fd; padding-top: 12px; padding-bottom: 8px;
         }
         .att-upload-btn {
-            width: 32px; height: 32px;
-            border-radius: 50%; border: 1px dashed #bbb;
-            background: #fafafa; color: #888;
-            font-size: 16px; cursor: pointer;
+            width: 36px; height: 36px;
+            border-radius: 50%; border: 2px solid #1976d2;
+            background: #e3f2fd; color: #1976d2;
+            font-size: 17px; cursor: pointer;
             display: flex; align-items: center; justify-content: center;
             transition: all 0.2s; flex-shrink: 0;
+            box-shadow: 0 1px 3px rgba(25, 118, 210, 0.2);
         }
-        .att-upload-btn:hover { border-color: #1976d2; color: #1976d2; background: #e3f2fd; }
+        .att-upload-btn:hover { background: #1976d2; color: #fff; box-shadow: 0 2px 6px rgba(25, 118, 210, 0.4); }
         .att-chip {
             display: flex; align-items: center; gap: 6px;
             padding: 4px 8px 4px 10px;
@@ -269,6 +299,21 @@
             border-top-color: #1976d2; border-radius: 50%;
             animation: spin 0.6s linear infinite; flex-shrink: 0;
         }
+        /* 可拖拽到输入框引用的 chip（附件/模板） */
+        .att-chip[draggable="true"], .tpl-chip[draggable="true"] { cursor: grab; }
+        .att-chip[draggable="true"]:active, .tpl-chip[draggable="true"]:active { cursor: grabbing; }
+        /* Folder upload progress */
+        .folder-progress {
+            width: 100%; height: 4px; background: #e0e0e0;
+            border-radius: 2px; margin: 4px 0; overflow: hidden;
+        }
+        .folder-progress-fill {
+            height: 100%; background: #5e35b1;
+            transition: width 0.3s ease;
+        }
+        .folder-progress-text {
+            font-size: 11px; color: #888; margin: 2px 0;
+        }
         /* Knowledge base upload button (prominent entry) */
         .kb-upload-btn {
             padding: 6px 14px; background: #5e35b1; color: #fff;
@@ -278,9 +323,58 @@
         }
         .kb-upload-btn:hover { background: #4527a0; }
         .kb-upload-btn:disabled { background: #b39ddb; cursor: not-allowed; }
+        .kb-list-btn {
+            padding: 6px 14px; background: #7e57c2; color: #fff;
+            border: none; border-radius: 6px; font-size: 12px;
+            cursor: pointer; margin-right: 12px; transition: background 0.2s;
+            display: inline-flex; align-items: center; gap: 4px;
+        }
+        .kb-list-btn:hover { background: #5e35b1; }
+        /* 添加模板按钮（独立入口，青绿色区分） */
+        .tpl-upload-btn {
+            padding: 6px 14px; background: #00897b; color: #fff;
+            border: none; border-radius: 6px; font-size: 12px;
+            cursor: pointer; margin-right: 12px; transition: background 0.2s;
+            display: inline-flex; align-items: center; gap: 4px;
+        }
+        .tpl-upload-btn:hover { background: #00695c; }
+        /* 添加附件按钮（顶部入口，蓝色主色，与模板/知识库按钮并列） */
+        .att-header-btn {
+            padding: 6px 14px; background: #1976d2; color: #fff;
+            border: none; border-radius: 6px; font-size: 12px;
+            cursor: pointer; margin-right: 12px; transition: background 0.2s;
+            display: inline-flex; align-items: center; gap: 4px;
+        }
+        .att-header-btn:hover { background: #1565c0; }
+        /* 模板 chips 区（区别于附件 chips，青绿色主题） */
+        .template-area {
+            padding: 4px 20px 0;
+            display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+        }
+        .tpl-chip {
+            display: flex; align-items: center; gap: 6px;
+            padding: 4px 8px 4px 10px;
+            background: #e0f2f1; border: 1px solid #b2dfdb;
+            border-radius: 16px; font-size: 12px; color: #00695c;
+            max-width: 260px;
+        }
+        .tpl-chip.uploading { opacity: 0.6; background: #f5f5f5; border-color: #e0e0e0; color: #999; }
+        .tpl-chip .tpl-name {
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+            max-width: 110px;
+        }
+        .tpl-chip .tpl-type {
+            background: #80cbc4; color: #004d40; font-size: 10px;
+            border-radius: 8px; padding: 1px 6px; flex-shrink: 0;
+        }
+        .tpl-chip .tpl-remove {
+            cursor: pointer; color: #999; font-size: 14px; line-height: 1;
+            flex-shrink: 0;
+        }
+        .tpl-chip .tpl-remove:hover { color: #f44336; }
         /* Toast notifications */
         .toast-container {
-            position: fixed; top: 16px; right: 16px; z-index: 2000;
+            position: fixed; top: 76px; right: 16px; z-index: 2000;
             display: flex; flex-direction: column; gap: 8px;
             max-width: 380px;
         }
@@ -312,6 +406,13 @@
             padding: 8px 12px; border-radius: 6px;
             font-size: 12px; align-self: flex-start;
         }
+        .retry-btn {
+            margin-left: 8px; padding: 3px 12px;
+            border: 1px solid #c62828; border-radius: 4px;
+            background: #c62828; color: #fff;
+            font-size: 12px; cursor: pointer;
+        }
+        .retry-btn:hover { background: #b71c1c; }
         /* Auto-gen dialog */
         .dialog-overlay {
             display: none;
@@ -341,6 +442,7 @@
             .sidebar { display: none; }
         }
     </style>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
 </head>
 <body>
     <!-- Toast notifications (knowledge base upload feedback) -->
@@ -407,6 +509,39 @@
         </div>
     </div>
 
+    <!-- Flowchart dialog -->
+    <div class="dialog-overlay" id="flowchartDialog">
+        <div class="dialog-box" style="width:860px;max-width:95vw">
+            <h3>🔀 流程图编辑器</h3>
+            <p style="font-size:12px;color:#999;margin-bottom:8px">用自然语言描述流程，AI 生成 mermaid 流程图；可在源码框手动微调，或用自然语言继续修改。生成后插入文档（后端渲染为图片）。</p>
+            <label>流程描述</label>
+            <div style="display:flex;gap:8px">
+                <textarea id="fcPrompt" rows="2" style="flex:1" placeholder="例如：贴敷式胰岛素泵风险管理流程，从风险分析到风险控制再到剩余风险评价"></textarea>
+                <button class="btn-start" id="btnGenerateFlowchart" onclick="generateFlowchart()" style="white-space:nowrap">生成流程图</button>
+            </div>
+            <div id="fcEditorWrap" style="display:none;margin-top:12px">
+                <label>预览</label>
+                <div id="fcPreview" style="min-height:120px;max-height:360px;overflow:auto;border:1px solid #e0e0e0;border-radius:8px;background:#fff;padding:12px;text-align:center"></div>
+                <label style="margin-top:12px">mermaid 源码（可手动微调）</label>
+                <textarea id="fcMermaid" rows="8" style="width:100%;font-family:monospace;font-size:12px" onchange="previewFlowchartMermaid(this.value)"></textarea>
+                <label style="margin-top:12px">修改指令（自然语言）</label>
+                <div style="display:flex;gap:8px">
+                    <input id="fcRevise" placeholder="例如：把「风险评价」改为判断分支，增加「上市后监测」节点" style="flex:1">
+                    <button class="btn-start" id="btnReviseFlowchart" onclick="reviseFlowchart()" style="white-space:nowrap">AI 修改</button>
+                </div>
+                <label style="margin-top:12px">插入到章节</label>
+                <div style="display:flex;gap:8px;align-items:center">
+                    <select id="fcSection" style="flex:1"><option value="">（新增独立「流程图」章节）</option></select>
+                    <button class="btn-start" onclick="insertFlowchart()" style="background:#4caf50;white-space:nowrap">插入文档</button>
+                    <button class="btn-cancel" onclick="exportFlowchartPng()" style="white-space:nowrap">⬇ 导出 PNG</button>
+                </div>
+            </div>
+            <div class="dialog-btns" style="margin-top:12px">
+                <button class="btn-cancel" onclick="closeFlowchartDialog()">关闭</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Modify attachment dialog -->
     <div class="dialog-overlay" id="modifyDialog">
         <div class="dialog-box">
@@ -424,18 +559,101 @@
         </div>
     </div>
 
+    <!-- Enrich (补全) attachment dialog -->
+    <div class="dialog-overlay" id="enrichDialog">
+        <div class="dialog-box">
+            <h3>📝 修改文档</h3>
+            <p style="font-size:12px;color:#999;margin-bottom:8px">上传或选择一篇文档，并描述处理需求（修改、精简、补全等），由 Agent 处理生成新文档供下载，不影响原文档和已生成的目标文档。</p>
+            <label>处理目标文档</label>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
+                <button type="button" onclick="document.getElementById('enrichFileInput').click()"
+                    style="padding:8px 16px;background:#00897b;color:#fff;border:none;border-radius:6px;font-size:13px;cursor:pointer">📤 上传新文档</button>
+                <span id="enrichFileName" style="font-size:12px;color:#999">未选择文件</span>
+            </div>
+            <input type="file" id="enrichFileInput" style="display:none"
+                accept=".pdf,.docx,.doc,.txt,.xlsx,.xls,.md"
+                onchange="handleEnrichFileSelect(event)">
+            <label style="margin-top:10px;display:block">或选择已上传的附件</label>
+            <select id="enrichExistingSelect" onchange="onEnrichExistingChange(this.value)" style="width:100%;margin-top:4px">
+                <option value="">— 从已上传附件中选择（可选）—</option>
+            </select>
+            <label style="margin-top:10px;display:block">处理需求（可选）</label>
+            <textarea id="enrichInstruction" rows="2" placeholder="例如：精简冗长内容并保留所有表格 / 修改第3章的结构 / 补充测试方法和验收标准（留空则由 Agent 自行判断）"></textarea>
+            <div class="dialog-btns">
+                <button class="btn-cancel" onclick="closeEnrichDialog()">取消</button>
+                <button class="btn-start" onclick="submitEnrich()">确认</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add template dialog -->
+    <div class="dialog-overlay" id="templateDialog">
+        <div class="dialog-box">
+            <h3>📄 添加模板</h3>
+            <p style="font-size:12px;color:#999;margin-bottom:8px">上传参考文档作为生成模板，支持一次选择多个文件，也可多次追加选择。Agent将参照模板的章节结构和写作风格生成你需要的文档。</p>
+            <label>模板名称（留空则使用文件名）</label>
+            <input id="tplName" placeholder="留空则使用文件名">
+            <label>目标文档类型</label>
+            <select id="tplDocType">
+                <option value="design_input">设计输入</option>
+                <option value="design_development_plan">项目开发计划书</option>
+                <option value="risk_management_plan">风险管理计划</option>
+                <option value="market_research_product_definition">市场调研与产品定义报告</option>
+                <option value="project_feasibility_study">项目可行性研究报告</option>
+                <option value="patent_analysis_report">专利分析报告</option>
+                <option value="project_approval_review">立项评审记录</option>
+                <option value="regulatory_strategy_document">注册路径策略</option>
+            </select>
+            <label>模板文件</label>
+            <input type="file" id="tplFileInput" style="display:none" multiple
+                accept=".pdf,.docx,.doc,.txt,.md"
+                onchange="handleTemplateFileSelect(event)">
+            <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
+                <button type="button" onclick="document.getElementById('tplFileInput').click()"
+                    style="padding:8px 16px;background:#00897b;color:#fff;border:none;border-radius:6px;font-size:13px;cursor:pointer">选择文件（可多选/可追加）</button>
+                <span id="tplFileName" style="font-size:12px;color:#999">未选择文件</span>
+            </div>
+            <div id="tplSelectedList" style="display:flex;flex-direction:column;gap:4px;margin-top:8px;max-height:160px;overflow-y:auto"></div>
+            <div class="dialog-btns">
+                <button class="btn-cancel" onclick="closeTemplateDialog()">取消</button>
+                <button class="btn-start" onclick="submitTemplate()">添加模板</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="dialog-overlay" id="kbFilesDialog">
+        <div class="dialog-box" style="max-width:600px">
+            <h3>📋 知识库文件列表</h3>
+            <p style="font-size:12px;color:#999;margin-bottom:12px">已上传到 upload 向量知识库的文件，供所有会话的 RAG 检索使用。</p>
+            <div id="kbFilesContent" style="max-height:400px;overflow-y:auto">
+                <p style="color:#999;text-align:center;padding:20px">加载中...</p>
+            </div>
+            <div class="dialog-btns">
+                <button class="btn-cancel" onclick="closeKbFilesDialog()">关闭</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Main: Chat Area -->
     <div class="main">
         <div class="main-header">
-            <h2>✏️ 设计策划写作 Agent</h2>
+            <h2>✏️ 设计开发文档写作 Agent</h2>
             <span class="badge" id="projectBadge">新项目</span>
             <span style="flex:1"></span>
+            <button id="attHeaderBtn" onclick="document.getElementById('fileInput').click()" class="att-header-btn" title="上传附件供 Agent 在对话中检索（PDF/Word/Excel/Txt/MD，≤20MB）">📎 添加附件</button>
+            <button id="enrichBtn" onclick="showEnrichDialog()" class="tpl-upload-btn" title="上传或选择一篇文档，由 Agent 自动识别简略内容并修改完善，生成修改版文档">📝 修改文档</button>
+            <button id="templateBtn" onclick="showTemplateDialog()" class="tpl-upload-btn" title="上传参考文档作为生成模板，Agent将参照其章节结构和写作风格生成文档">📄 添加模板</button>
             <button id="kbUploadBtn" onclick="triggerKbUpload()" class="kb-upload-btn" title="上传文件到 upload 向量知识库，供所有会话的 RAG 检索使用">📚 上传知识库</button>
+            <button id="kbListBtn" onclick="showKbFilesDialog()" class="kb-list-btn" title="查看已上传到知识库的文件列表">📋 查看知识库</button>
             <button id="conciseBtn" onclick="toggleConciseMode()" title="开启后 Agent 以简洁精炼语言生成文档内容（不影响聊天回复）">📄 精炼生成</button>
+            <button id="flowchartBtn" onclick="showFlowchartDialog()" style="padding:6px 14px;background:#7c4dff;color:#fff;border:none;border-radius:6px;font-size:12px;cursor:pointer;margin-right:12px" title="流程图编辑器：AI 生成初稿，画布拖拽微调，导出 PNG 或插入文档">🔀 流程图</button>
             <button id="autoGenBtn" onclick="showAutoGenDialog()" style="padding:6px 14px;background:#4caf50;color:#fff;border:none;border-radius:6px;font-size:12px;cursor:pointer;margin-right:12px">⚡ 一键生成</button>
             <button id="summarizeBtn" onclick="showSummarizeDialog()" style="padding:6px 14px;background:#ff9800;color:#fff;border:none;border-radius:6px;font-size:12px;cursor:pointer;margin-right:12px;display:none">✂ 精简文档</button>
+            <button id="undoBtn" onclick="undoLast()" style="padding:6px 14px;background:#e53935;color:#fff;border:none;border-radius:6px;font-size:12px;cursor:pointer;margin-right:12px" title="回退到最近一次修改/生成/精简/附件修改之前">↩️ 回退</button>
             <a href="#" id="reviewLink" style="font-size:12px;color:#1976d2;text-decoration:none;margin-right:16px;display:none">审阅文档</a>
             <a href="#" id="downloadLink" style="font-size:12px;color:#1976d2;text-decoration:none;margin-right:16px;display:none" onclick="downloadDocument()">下载文档</a>
+            <a href="#" id="downloadExcelLink" style="font-size:12px;color:#388e3c;text-decoration:none;margin-right:16px;display:none" onclick="downloadRiskExcel()">下载 Excel</a>
+            <a href="#" id="downloadModifiedLink" style="font-size:12px;color:#7c4dff;text-decoration:none;margin-right:16px" onclick="downloadLatestModified()" title="下载最近一次修改/补全/精简的附件文档（固定入口）">下载修改版</a>
             <a href="/" style="font-size:12px;color:#999;text-decoration:none">旧版表单 →</a>
         </div>
         <!-- 独立的知识库上传文件选择（不绑定项目，直接入库 uploads 向量库） -->
@@ -453,11 +671,18 @@
             <input type="file" id="fileInput" style="display:none"
                 accept=".pdf,.docx,.doc,.txt,.xlsx,.xls,.md"
                 onchange="handleFileSelect(event)" multiple>
+            <input type="file" id="folderInput" style="display:none"
+                webkitdirectory directory multiple
+                onchange="handleFolderSelect(event)">
             <button class="att-upload-btn" id="attUploadBtn" onclick="document.getElementById('fileInput').click()" title="上传附件">📎</button>
+            <button class="att-upload-btn" id="folderUploadBtn" onclick="document.getElementById('folderInput').click()" title="上传文件夹（保留目录结构）">📁</button>
         </div>
+        <div class="template-area" id="templateArea" style="display:none"></div>
         <div class="input-area">
             <textarea id="userInput" placeholder="输入消息..." rows="1"
-                onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}"></textarea>
+                onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage()}"
+                oninput="updateClearBtn()"></textarea>
+            <button id="clearBtn" onclick="clearInput()" title="清空输入" style="display:none">×</button>
             <button id="sendBtn" onclick="sendMessage()">发送</button>
         </div>
     </div>
@@ -476,8 +701,17 @@
         let isStreaming = false;
         let waitingApproval = null;
         let currentDocLabel = '文档';
+        let currentDocType = '';
+        // 风险分析总表类文档类型：支持导出 Excel
+        const RISK_EXCEL_DOC_TYPES = ['product_risk_analysis_matrix', 'cybersecurity_risk_analysis_matrix'];
         // 精炼生成模式（仅文档内容生成，不影响聊天回复）
         let conciseMode = false;
+        // 当前 SSE 流的 AbortController，用于撤回消息时中止进行中的请求
+        let currentAbortController = null;
+        // 记录最近一次操作，供出错时引导「一键重试」
+        let lastAction = null;        // 'send' | 'resume'
+        let lastUserMessage = null;    // send 场景的最后一条用户消息
+        let lastDecision = null;       // resume 场景的 HITL 决定
 
         document.getElementById('projectBadge').textContent =
             '项目: ' + (existingProject ? '已恢复会话' : new Date().toLocaleDateString());
@@ -488,6 +722,8 @@
 
         // ── Attachments ──
         let uploadedFiles = [];  // {file_id, filename, char_count, preview, status}
+        // 进行中的上传：uploadId -> AbortController，用于取消附件/模板/文件夹上传
+        const activeUploads = {};
 
         async function handleFileSelect(event) {
             const files = event.target.files;
@@ -498,58 +734,260 @@
             event.target.value = '';  // reset input
         }
 
-        async function uploadFile(file) {
-            // Validate size (10MB)
-            const maxSize = 10 * 1024 * 1024;
+        async function handleFolderSelect(event) {
+            const files = event.target.files;
+            if (!files.length) return;
+            event.target.value = '';  // reset input
+
+            // 从第一个文件的 webkitRelativePath 推断文件夹名
+            const firstPath = files[0].webkitRelativePath || files[0].name;
+            const folderName = firstPath.split('/')[0] || '未命名文件夹';
+
+            // 收集文件与相对路径
+            const fileList = [];
+            for (const file of files) {
+                const relPath = file.webkitRelativePath || file.name;
+                fileList.push({ file, relativePath: relPath });
+            }
+
+            // 显示进度
+            appendMessage('agent', `📁 正在上传文件夹「${folderName}」(${fileList.length} 个文件)...`);
+            const folderUploadId = 'folder_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+            const controller = new AbortController();
+            activeUploads[folderUploadId] = controller;
+            const progressDiv = document.createElement('div');
+            progressDiv.className = 'folder-progress-container';
+            progressDiv.innerHTML = `
+                <div class="folder-progress-text">准备上传... <a style="cursor:pointer;color:#f44336;margin-left:8px;text-decoration:none" onclick="cancelUpload('${folderUploadId}')" title="取消上传">取消</a></div>
+                <div class="folder-progress"><div class="folder-progress-fill" style="width:0%"></div></div>
+            `;
+            document.getElementById('chatArea').appendChild(progressDiv);
+
+            try {
+                const data = await uploadFolderBatch(fileList, folderName, controller.signal);
+
+                if (data.success) {
+                    let msg = `✅ 文件夹「${folderName}」上传完成！`;
+                    msg += `\n- ${data.total_files} 个文件，共 ${(data.total_chars / 1024).toFixed(1)} KB`;
+                    if (data.failed_count > 0) {
+                        msg += `\n- ${data.failed_count} 个失败: ${data.errors.join('; ')}`;
+                    }
+                    appendMessage('agent', msg);
+                    await fetchAttachments();
+                    fetchState();
+                } else {
+                    showError(data.message || '文件夹上传失败');
+                }
+            } catch (err) {
+                if (err.name !== 'AbortError') {
+                    showError('文件夹上传失败: ' + err.message);
+                }
+            } finally {
+                delete activeUploads[folderUploadId];
+                progressDiv.remove();
+            }
+        }
+
+        async function uploadFolderBatch(fileList, folderName, signal) {
+            const formData = new FormData();
+            const relativePaths = [];
+
+            for (const { file, relativePath } of fileList) {
+                relativePaths.push(relativePath);
+                formData.append('files', file);
+            }
+
+            formData.append('relative_paths', JSON.stringify(relativePaths));
+            formData.append('folder_name', folderName);
+
+            const resp = await fetch(`/api/agent/upload-folder/${PROJECT_ID}`, {
+                method: 'POST',
+                body: formData,
+                signal: signal,
+            });
+
+            if (!resp.ok) {
+                const errData = await resp.json().catch(() => ({}));
+                throw new Error(errData.detail || `HTTP ${resp.status}`);
+            }
+            return await resp.json();
+        }
+
+        async function uploadFile(file, hidden = false) {
+            // Validate size (20MB)
+            const maxSize = 20 * 1024 * 1024;
             if (file.size > maxSize) {
-                showError(`文件「${file.name}」超过10MB限制 (${(file.size/1024/1024).toFixed(1)}MB)`);
-                return;
+                showError(`文件「${file.name}」超过20MB限制 (${(file.size/1024/1024).toFixed(1)}MB)`);
+                return null;
             }
             // Validate format
             const ext = '.' + file.name.split('.').pop().toLowerCase();
             const allowed = ['.pdf', '.docx', '.doc', '.txt', '.xlsx', '.xls', '.md'];
             if (!allowed.includes(ext)) {
                 showError(`不支持的文件格式「${ext}」`);
-                return;
+                return null;
             }
 
-            // Add uploading chip
-            const tempId = 'uploading_' + Date.now();
-            uploadedFiles.push({ file_id: tempId, filename: file.name, char_count: 0, status: 'uploading' });
-            renderAttachmentChips();
+            let resultFileId = null;
+
+            // Add uploading chip（隐藏模式不上传为附件，仅作为「修改文档」处理对象）
+            const tempId = 'uploading_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+            if (!hidden) {
+                uploadedFiles.push({ file_id: tempId, filename: file.name, char_count: 0, status: 'uploading' });
+                renderAttachmentChips();
+            }
+
+            // 解析提示：隐藏模式（修改文档入口）上传后无附件 chip，需在聊天区单独提示解析进度
+            let parsingDiv = null;
+            if (hidden) {
+                parsingDiv = document.createElement('div');
+                parsingDiv.className = 'tool-indicator';
+                parsingDiv.id = 'parsing-indicator';
+                parsingDiv.innerHTML = `<div class="spinner"></div>📄 正在解析文档「${escapeHtml(file.name)}」，请稍候...`;
+                const area = document.getElementById('chatArea');
+                area.appendChild(parsingDiv);
+                area.scrollTop = area.scrollHeight;
+            }
+
+            const controller = new AbortController();
+            activeUploads[tempId] = controller;
 
             try {
                 const formData = new FormData();
                 formData.append('file', file);
+                if (hidden) {
+                    formData.append('hidden', 'true');
+                }
 
                 const resp = await fetch(`/api/agent/upload/${PROJECT_ID}`, {
                     method: 'POST',
                     body: formData,
+                    signal: controller.signal,
                 });
                 const data = await resp.json();
 
+                // HTTP 4xx/5xx 时后端错误信息在 detail 字段（如"文件提取超时"），
+                // 透传真实原因，避免只显示笼统的"上传失败"
+                if (!resp.ok) {
+                    if (!hidden) {
+                        uploadedFiles = uploadedFiles.filter(f => f.file_id !== tempId);
+                    }
+                    showError(data.detail || data.message || `上传失败 (HTTP ${resp.status})`);
+                    return null;
+                }
+
                 if (data.success) {
-                    // Replace temp with real entry
-                    uploadedFiles = uploadedFiles.filter(f => f.file_id !== tempId);
-                    uploadedFiles.push({
-                        file_id: data.file_id,
-                        filename: data.filename,
-                        char_count: data.char_count,
-                        preview: data.preview,
-                        status: 'completed',
-                    });
-                    // Brief success indicator in chat
-                    appendMessage('agent', `📎 已上传「${data.filename}」(${data.char_count} 字符)。我可以在对话中检索此文件内容。`);
+                    const taskId = data.file_id;
+                    if (!taskId) {
+                        if (!hidden) {
+                            uploadedFiles = uploadedFiles.filter(f => f.file_id !== tempId);
+                        }
+                        showError(data.message || '上传失败');
+                        return null;
+                    }
+
+                    // 后端已改为异步：上传接口立即返回 processing，
+                    // 此处轮询提取状态，完成后调用 finalize 把全文写入 Agent 状态
+                    let finalized = false;
+                    for (let i = 0; i < 600; i++) {
+                        if (controller.signal.aborted) {
+                            throw new DOMException('已取消', 'AbortError');
+                        }
+                        await new Promise(r => setTimeout(r, 1500));
+                        const statusResp = await fetch('/api/extract-status/' + taskId);
+                        if (statusResp.status === 404) {
+                            throw new Error('提取任务已丢失（服务可能重启），请重试');
+                        }
+                        if (!statusResp.ok) {
+                            throw new Error('查询提取状态失败');
+                        }
+                        const st = await statusResp.json();
+                        if (st.status === 'failed') {
+                            throw new Error(st.message || '提取失败');
+                        }
+                        if (st.status === 'completed') {
+                            // 提取完成，调用 finalize 将全文写入 Agent 状态
+                            const finResp = await fetch(`/api/agent/projects/${PROJECT_ID}/attachments/${taskId}/finalize`, { method: 'POST' });
+                            const finData = await finResp.json().catch(() => ({}));
+                            if (!finData.success) {
+                                throw new Error(finData.detail || '附件状态写入失败');
+                            }
+                            if (!hidden) {
+                                uploadedFiles = uploadedFiles.filter(f => f.file_id !== tempId);
+                                uploadedFiles.push({
+                                    file_id: taskId,
+                                    filename: finData.filename || data.filename,
+                                    char_count: finData.char_count,
+                                    preview: finData.preview,
+                                    status: 'completed',
+                                });
+                                // Brief success indicator in chat
+                                appendMessage('agent', `📎 已上传「${finData.filename || data.filename}」(${finData.char_count} 字符)。我可以在对话中检索此文件内容。`);
+                            }
+                            resultFileId = taskId;
+                            finalized = true;
+                            break;
+                        }
+                    }
+                    if (!finalized) {
+                        throw new Error('提取超时（超过 15 分钟），请重试或使用更小的文档');
+                    }
                 } else {
-                    uploadedFiles = uploadedFiles.filter(f => f.file_id !== tempId);
-                    showError(data.message || '上传失败');
+                    if (!hidden) {
+                        uploadedFiles = uploadedFiles.filter(f => f.file_id !== tempId);
+                    }
+                    showError(data.detail || data.message || '上传失败');
                 }
             } catch (err) {
-                uploadedFiles = uploadedFiles.filter(f => f.file_id !== tempId);
-                showError('上传失败: ' + err.message);
+                if (!hidden) {
+                    uploadedFiles = uploadedFiles.filter(f => f.file_id !== tempId);
+                }
+                if (err.name !== 'AbortError') {
+                    showError('上传失败: ' + err.message);
+                }
+            } finally {
+                delete activeUploads[tempId];
+                if (parsingDiv) parsingDiv.remove();
             }
-            renderAttachmentChips();
-            fetchState();  // refresh sidebar
+            if (!hidden) {
+                renderAttachmentChips();
+                fetchState();  // refresh sidebar
+            }
+            return resultFileId;
+        }
+
+        // 在输入框光标处插入一段引用文本（如 @文件名），仅插入文字、不上传文件
+        function insertReferenceToken(token) {
+            const input = document.getElementById('userInput');
+            const pos = (input.selectionStart != null) ? input.selectionStart : input.value.length;
+            const before = input.value.slice(0, pos);
+            const after = input.value.slice(pos);
+            const sep = (before && !before.endsWith(' ') && !before.endsWith('\n')) ? ' ' : '';
+            const tail = (after && !after.startsWith(' ')) ? ' ' : '';
+            input.value = before + sep + token + tail + after;
+            const newPos = (before + sep + token + tail).length;
+            input.setSelectionRange(newPos, newPos);
+            input.focus();
+            // 手动自适应高度
+            input.style.height = 'auto';
+            input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+            updateClearBtn();
+        }
+
+        // 快速清空输入框（点击"×"按钮）
+        function clearInput() {
+            const input = document.getElementById('userInput');
+            input.value = '';
+            input.style.height = 'auto';
+            updateClearBtn();
+            input.focus();
+        }
+
+        // 根据输入框是否有文字，显示/隐藏清空按钮
+        function updateClearBtn() {
+            const input = document.getElementById('userInput');
+            const btn = document.getElementById('clearBtn');
+            if (btn) btn.style.display = input.value ? 'inline-block' : 'none';
         }
 
         async function removeAttachment(fileId) {
@@ -565,35 +1003,82 @@
             fetchState();
         }
 
+        // 取消一个进行中的上传（附件/模板/文件夹）。
+        // abort 对应的 fetch（其 catch 分支会识别 AbortError 而不弹错误），
+        // 并立即清理本地占位 chip；对不存在的 uploadId 是幂等空操作。
+        function cancelUpload(uploadId) {
+            const controller = activeUploads[uploadId];
+            if (controller) {
+                controller.abort();
+                delete activeUploads[uploadId];
+            }
+            uploadedFiles = uploadedFiles.filter(f => f.file_id !== uploadId);
+            templates = templates.filter(t => t.template_id !== uploadId);
+            renderAttachmentChips();
+            renderTemplateChips();
+        }
+
         function renderAttachmentChips() {
             const area = document.getElementById('attachmentArea');
-            // Clear all chips but keep the upload button
+            // Clear all chips but keep the upload buttons
             const uploadBtn = document.getElementById('attUploadBtn');
             const fileInput = document.getElementById('fileInput');
+            const folderInput = document.getElementById('folderInput');
+            const folderBtn = document.getElementById('folderUploadBtn');
             area.innerHTML = '';
             area.appendChild(fileInput);
             area.appendChild(uploadBtn);
+            area.appendChild(folderInput);
+            area.appendChild(folderBtn);
 
-            uploadedFiles.forEach(f => {
-                const chip = document.createElement('span');
-                chip.className = 'att-chip' + (f.status === 'uploading' ? ' uploading' : '');
-                if (f.status === 'uploading') {
-                    chip.innerHTML = `
-                        <span class="att-spinner"></span>
-                        <span class="att-name">${escapeHtml(f.filename)}</span>
-                        <span class="att-size">上传中...</span>
-                    `;
-                } else {
-                    const sizeKB = (f.char_count / 1024).toFixed(1);
-                    chip.innerHTML = `
-                        <span class="att-name" title="${escapeHtml(f.filename)}">${escapeHtml(f.filename)}</span>
-                        <span class="att-size">${sizeKB}KB</span>
-                        <span class="att-modify" onclick="openModifyDialog('${f.file_id}', '${f.filename.replace(/'/g, "\\'")}')" title="修改文档">✏️</span>
-                        <span class="att-remove" onclick="removeAttachment('${f.file_id}')" title="移除附件">×</span>
-                    `;
-                }
-                area.appendChild(chip);
+            const folderFiles = uploadedFiles.filter(f => f.relative_path);
+            const regularFiles = uploadedFiles.filter(f => !f.relative_path);
+
+            // 渲染普通文件（无 relative_path）
+            regularFiles.forEach(f => {
+                area.appendChild(buildAttachmentChip(f));
             });
+
+            // 渲染文件夹文件（按根文件夹分组）
+            if (folderFiles.length > 0) {
+                const folderName = (folderFiles[0].relative_path || '').split('/')[0] || '文件夹';
+                const folderHeader = document.createElement('span');
+                folderHeader.className = 'att-chip folder-header';
+                folderHeader.style.background = '#ede7f6';
+                folderHeader.style.borderColor = '#d1c4e9';
+                folderHeader.style.color = '#5e35b1';
+                folderHeader.innerHTML = `<span class="att-name" title="${escapeHtml(folderName)}">📁 ${escapeHtml(folderName)}</span><span class="att-size">${folderFiles.length} 文件</span>`;
+                area.appendChild(folderHeader);
+
+                folderFiles.forEach(f => {
+                    area.appendChild(buildAttachmentChip(f));
+                });
+            }
+        }
+
+        function buildAttachmentChip(f) {
+            const chip = document.createElement('span');
+            chip.className = 'att-chip' + (f.status === 'uploading' ? ' uploading' : '');
+            if (f.status === 'uploading') {
+                chip.innerHTML = `
+                    <span class="att-spinner"></span>
+                    <span class="att-name">${escapeHtml(f.filename)}</span>
+                    <span class="att-size">上传中...</span>
+                    <span class="att-remove" onclick="cancelUpload('${f.file_id}')" title="取消上传">×</span>
+                `;
+            } else {
+                const sizeKB = (f.char_count / 1024).toFixed(1);
+                const displayName = f.relative_path ? f.relative_path.split('/').slice(1).join('/') : f.filename;
+                chip.innerHTML = `
+                    <span class="att-name" title="${escapeHtml(displayName)}">${escapeHtml(displayName)}</span>
+                    <span class="att-size">${sizeKB}KB</span>
+                    <span class="att-modify" onclick="openModifyDialog('${f.file_id}', '${(f.filename || '').replace(/'/g, "\\'")}')" title="修改文档">✏️</span>
+                    <span class="att-remove" onclick="removeAttachment('${f.file_id}')" title="移除附件">×</span>
+                `;
+                // 文件夹文件用完整相对路径，普通文件用文件名（与 Agent 提示中标注一致）
+                makeChipDraggable(chip, f.relative_path || f.filename);
+            }
+            return chip;
         }
 
         async function fetchAttachments() {
@@ -611,6 +1096,339 @@
             const div = document.createElement('div');
             div.textContent = str;
             return div.innerHTML;
+        }
+
+        // 让附件/模板 chip 可拖拽到输入框：dragstart 时携带「引用文本」（原始文件名/相对路径）
+        function makeChipDraggable(el, refText) {
+            el.draggable = true;
+            el.addEventListener('dragstart', function(e) {
+                e.dataTransfer.setData('application/x-file-ref', refText);
+                e.dataTransfer.setData('text/plain', refText);
+                e.dataTransfer.effectAllowed = 'copy';
+            });
+        }
+
+        // ── Templates (模板管理) ──
+        let templates = [];  // {template_id, name, filename, doc_type, char_count, status}
+        let _selectedTemplateFiles = [];  // File[]，支持一次选择多个模板文件批量添加
+        const TPL_ALLOWED = ['.pdf', '.docx', '.doc', '.txt', '.md'];
+        const TPL_MAX_SIZE = 20 * 1024 * 1024;  // 20MB
+        const TPL_DOC_TYPE_LABELS = {
+            'design_input': '设计输入',
+            'design_development_plan': '项目开发计划书',
+            'risk_management_plan': '风险管理计划',
+            'market_research_product_definition': '市场调研与产品定义报告',
+            'project_feasibility_study': '项目可行性研究报告',
+            'patent_analysis_report': '专利分析报告',
+            'project_approval_review': '立项评审记录',
+            'regulatory_strategy_document': '注册路径策略'
+        };
+
+        // 从后端 /api/doc-types 加载完整文档类型（9 大生命周期 140+ 种），
+        // 动态填充「目标文档类型」下拉框，并按分类分组展示。
+        async function loadDocTypes() {
+            try {
+                const resp = await fetch('/api/doc-types');
+                const data = await resp.json();
+                if (!data.categories || !Array.isArray(data.types)) return;
+
+                // 合并完整 value→label 映射，供模板列表展示用
+                const labelMap = {};
+                for (const t of data.types) {
+                    if (t.value && t.label) labelMap[t.value] = t.label;
+                }
+                Object.assign(TPL_DOC_TYPE_LABELS, labelMap);
+
+                // 按分类分组填充下拉框
+                const sel = document.getElementById('tplDocType');
+                if (!sel) return;
+                sel.innerHTML = '';
+                for (const cat of data.categories) {
+                    const og = document.createElement('optgroup');
+                    og.label = cat.name + '（' + (cat.count || 0) + '）';
+                    const types = data.types.filter(t => t.category_key === cat.key);
+                    for (const t of types) {
+                        const opt = document.createElement('option');
+                        opt.value = t.value;
+                        opt.textContent = t.label;
+                        og.appendChild(opt);
+                    }
+                    sel.appendChild(og);
+                }
+                sel.value = 'design_development_plan';
+            } catch (e) {
+                // 加载失败则保留硬编码的 8 个选项作为降级
+            }
+        }
+
+        function showTemplateDialog() {
+            const nameInput = document.getElementById('tplName');
+            nameInput.value = '';
+            nameInput.disabled = false;
+            nameInput.placeholder = '留空则使用文件名';
+            document.getElementById('tplDocType').value = 'design_development_plan';
+            document.getElementById('tplFileName').textContent = '未选择文件';
+            document.getElementById('tplFileName').title = '';
+            document.getElementById('tplFileInput').value = '';
+            _selectedTemplateFiles = [];
+            renderSelectedTemplateFiles();
+            document.getElementById('templateDialog').style.display = 'flex';
+        }
+
+        function closeTemplateDialog() {
+            document.getElementById('templateDialog').style.display = 'none';
+        }
+
+        // 渲染对话框内「已选文件列表」，每个文件可单独移除
+        function renderSelectedTemplateFiles() {
+            const container = document.getElementById('tplSelectedList');
+            if (!container) return;
+            container.innerHTML = '';
+            _selectedTemplateFiles.forEach((file, idx) => {
+                const row = document.createElement('div');
+                row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:4px 8px;background:#e0f2f1;border:1px solid #b2dfdb;border-radius:6px;font-size:12px;color:#00695c';
+                const sizeKB = (file.size / 1024).toFixed(1);
+                row.innerHTML = `
+                    <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(file.name)}">📄 ${escapeHtml(file.name)}</span>
+                    <span style="color:#80cbc4;font-size:10px;flex-shrink:0">${sizeKB}KB</span>
+                    <span style="cursor:pointer;color:#999;font-size:14px;line-height:1;flex-shrink:0" onclick="removeSelectedTemplateFile(${idx})" title="移除该文件">×</span>
+                `;
+                container.appendChild(row);
+            });
+        }
+
+        function removeSelectedTemplateFile(idx) {
+            _selectedTemplateFiles.splice(idx, 1);
+            // 重新计算 UI 状态
+            const nameInput = document.getElementById('tplName');
+            const fileNameEl = document.getElementById('tplFileName');
+            const total = _selectedTemplateFiles.length;
+            if (total > 1) {
+                fileNameEl.textContent = `已选择 ${total} 个文件`;
+                fileNameEl.title = _selectedTemplateFiles.map(f => f.name).join('\n');
+                nameInput.value = '';
+                nameInput.disabled = true;
+                nameInput.placeholder = '（多文件批量添加时使用各文件名）';
+            } else if (total === 1) {
+                fileNameEl.textContent = _selectedTemplateFiles[0].name;
+                fileNameEl.title = '';
+                nameInput.disabled = false;
+                nameInput.placeholder = '留空则使用文件名';
+            } else {
+                fileNameEl.textContent = '未选择文件';
+                fileNameEl.title = '';
+                nameInput.disabled = false;
+                nameInput.placeholder = '留空则使用文件名';
+            }
+            renderSelectedTemplateFiles();
+        }
+
+        function handleTemplateFileSelect(event) {
+            const files = Array.from(event.target.files || []);
+            // 重置 input.value，允许下一次选择同一文件（例如误选后重新点选）
+            event.target.value = '';
+            if (!files.length) return;
+
+            // 逐个校验格式与大小；对已选列表做去重（同名同大小视为重复）
+            const valid = [];
+            const rejected = [];
+            for (const file of files) {
+                const ext = '.' + (file.name.split('.').pop() || '').toLowerCase();
+                if (!TPL_ALLOWED.includes(ext)) {
+                    rejected.push(`${file.name}（格式不支持）`);
+                    continue;
+                }
+                if (file.size > TPL_MAX_SIZE) {
+                    rejected.push(`${file.name}（超过20MB限制）`);
+                    continue;
+                }
+                const dup = _selectedTemplateFiles.some(existing =>
+                    existing.name === file.name && existing.size === file.size);
+                if (dup) {
+                    rejected.push(`${file.name}（已选择）`);
+                    continue;
+                }
+                valid.push(file);
+            }
+            if (rejected.length) {
+                showError(`以下文件已跳过：${rejected.join('、')}。支持格式: ${TPL_ALLOWED.join(', ')}`);
+            }
+
+            // 追加到已选列表（而非替换），支持「一次选一个、多次追加」的批量添加方式
+            _selectedTemplateFiles = _selectedTemplateFiles.concat(valid);
+
+            const nameInput = document.getElementById('tplName');
+            const fileNameEl = document.getElementById('tplFileName');
+            const total = _selectedTemplateFiles.length;
+            if (total > 1) {
+                // 多文件：名称输入框禁用，各模板以文件名命名
+                fileNameEl.textContent = `已选择 ${total} 个文件`;
+                fileNameEl.title = _selectedTemplateFiles.map(f => f.name).join('\n');
+                nameInput.value = '';
+                nameInput.disabled = true;
+                nameInput.placeholder = '（多文件批量添加时使用各文件名）';
+            } else if (total === 1) {
+                fileNameEl.textContent = _selectedTemplateFiles[0].name;
+                fileNameEl.title = '';
+                nameInput.disabled = false;
+                nameInput.placeholder = '留空则使用文件名';
+            } else {
+                fileNameEl.textContent = '未选择文件';
+                fileNameEl.title = '';
+                nameInput.disabled = false;
+                nameInput.placeholder = '留空则使用文件名';
+            }
+            renderSelectedTemplateFiles();
+        }
+
+        async function submitTemplate() {
+            const name = document.getElementById('tplName').value.trim();
+            const docType = document.getElementById('tplDocType').value;
+            const files = _selectedTemplateFiles;
+            if (!files.length) { showError('请选择模板文件'); return; }
+
+            closeTemplateDialog();
+
+            let successCount = 0;
+            const failures = [];
+            // 逐个串行上传：后端每个文件都要提取文本（可能触发 MinerU 解析），串行避免资源争用
+            for (const file of files) {
+                // 名称优先级：用户输入的名称（仅单文件时生效） > 文件名
+                // 多文件批量添加时，每个模板以各自文件名命名
+                const tplName = (files.length === 1 && name) ? name : file.name;
+                const chipId = 'uploading-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
+
+                // 先显示上传中的 chip 占位
+                templates.push({ template_id: chipId, name: tplName, filename: file.name,
+                                 doc_type: docType, char_count: 0, status: 'uploading' });
+                renderTemplateChips();
+
+                const fd = new FormData();
+                fd.append('file', file);
+                fd.append('name', tplName);
+                fd.append('doc_type', docType);
+
+                const controller = new AbortController();
+                activeUploads[chipId] = controller;
+
+                try {
+                    const resp = await fetch(`/api/agent/projects/${PROJECT_ID}/templates`, { method: 'POST', body: fd, signal: controller.signal });
+                    const data = await resp.json();
+                    if (!data.success) {
+                        throw new Error(data.message || data.detail || '添加失败');
+                    }
+
+                    const taskId = data.template_id;
+                    // 轮询提取状态（最长约 15 分钟，适配 MinerU 首次加载模型 + 多页推理耗时）
+                    let finalized = false;
+                    for (let i = 0; i < 600; i++) {
+                        if (controller.signal.aborted) {
+                            throw new DOMException('已取消', 'AbortError');
+                        }
+                        await new Promise(r => setTimeout(r, 1500));
+                        const statusResp = await fetch('/api/extract-status/' + taskId);
+                        if (statusResp.status === 404) {
+                            throw new Error('提取任务已丢失（服务可能重启），请重试');
+                        }
+                        if (!statusResp.ok) {
+                            throw new Error('查询提取状态失败');
+                        }
+                        const st = await statusResp.json();
+                        if (st.status === 'failed') {
+                            throw new Error(st.message || '提取失败');
+                        }
+                        if (st.status === 'completed') {
+                            // 提取完成，调用 finalize 将全文写入 Agent 状态
+                            const finResp = await fetch(`/api/agent/projects/${PROJECT_ID}/templates/${taskId}/finalize`, { method: 'POST' });
+                            const finData = await finResp.json().catch(() => ({}));
+                            if (!finData.success) {
+                                throw new Error(finData.detail || '模板状态写入失败');
+                            }
+                            templates = templates.filter(t => t.template_id !== chipId);
+                            templates.push({
+                                template_id: taskId, name: finData.name, filename: finData.filename,
+                                doc_type: finData.doc_type, char_count: finData.char_count, status: 'completed'
+                            });
+                            successCount++;
+                            finalized = true;
+                            break;
+                        }
+                    }
+                    if (!finalized) {
+                        throw new Error('提取超时（超过 15 分钟），请重试或使用更小的文档');
+                    }
+                } catch (e) {
+                    templates = templates.filter(t => t.template_id !== chipId);
+                    if (e.name === 'AbortError') {
+                        renderTemplateChips();
+                        break;  // 用户取消：停止整个批量上传
+                    }
+                    failures.push(`${file.name}: ${e.message}`);
+                } finally {
+                    delete activeUploads[chipId];
+                }
+                renderTemplateChips();
+            }
+
+            if (successCount) showToast(`成功添加 ${successCount} 个模板，已作为文档风格参照`);
+            if (failures.length) showError(`部分模板添加失败：${failures.join('；')}`);
+        }
+
+        function renderTemplateChips() {
+            const area = document.getElementById('templateArea');
+            if (!templates.length) {
+                area.style.display = 'none';
+                area.innerHTML = '';
+                return;
+            }
+            area.style.display = 'flex';
+            area.innerHTML = '';
+            templates.forEach(t => {
+                const chip = document.createElement('span');
+                chip.className = 'tpl-chip' + (t.status === 'uploading' ? ' uploading' : '');
+                const sizeText = t.status === 'uploading' ? '上传中...' :
+                    (t.char_count ? (t.char_count / 1024).toFixed(1) + 'KB' : '');
+                chip.innerHTML = `
+                    <span class="tpl-name" title="${escapeHtml(t.filename)}">${t.status === 'uploading' ? '⏳ ' : '📄 '}${escapeHtml(t.name || t.filename)}</span>
+                    <span class="tpl-type">${escapeHtml(TPL_DOC_TYPE_LABELS[t.doc_type] || t.doc_type || '模板')}</span>
+                    <span style="color:#80cbc4;font-size:10px;flex-shrink:0">${sizeText}</span>
+                    ${t.status === 'uploading'
+                        ? `<span class="tpl-remove" onclick="cancelUpload('${t.template_id}')" title="取消上传">×</span>`
+                        : `<span class="tpl-remove" onclick="removeTemplate('${t.template_id}')" title="移除模板">×</span>`}
+                `;
+                if (t.status !== 'uploading') {
+                    // 模板引用名与 Agent 提示一致：name（用户命名）优先，回退文件名
+                    makeChipDraggable(chip, t.name || t.filename);
+                }
+                area.appendChild(chip);
+            });
+        }
+
+        async function removeTemplate(templateId) {
+            try {
+                const resp = await fetch(`/api/agent/projects/${PROJECT_ID}/templates/${templateId}`, { method: 'DELETE' });
+                const data = await resp.json();
+                if (data.success) {
+                    templates = templates.filter(t => t.template_id !== templateId);
+                    renderTemplateChips();
+                    showToast('模板已移除');
+                } else {
+                    showError(data.message || '移除模板失败');
+                }
+            } catch (e) {
+                showError('移除模板失败: ' + e.message);
+            }
+        }
+
+        async function fetchTemplates() {
+            try {
+                const resp = await fetch(`/api/agent/projects/${PROJECT_ID}/templates`);
+                const data = await resp.json();
+                if (data.success && data.templates) {
+                    templates = data.templates.map(t => ({ ...t, status: 'completed' }));
+                    renderTemplateChips();
+                }
+            } catch (e) { /* Silently fail */ }
         }
 
         // Drag-and-drop on chat area
@@ -661,6 +1479,56 @@
             });
             attArea.addEventListener('dragleave', function(e) {
                 attArea.classList.remove('drag-over');
+            });
+        })();
+
+        // 拖拽到输入框 → 仅把「@文件名/@相对路径」作为引用插入输入框（不上传、不入附件）
+        // 支持两种来源：1) 从系统拖入的文件；2) 从附件/模板 chip 拖来的已上传文件
+        (function setupInputDragDrop() {
+            const inputArea = document.querySelector('.input-area');
+            if (!inputArea) return;
+
+            function isAcceptableDrag(e) {
+                if (!e.dataTransfer) return false;
+                const types = Array.from(e.dataTransfer.types || []);
+                return types.includes('Files') || types.includes('application/x-file-ref');
+            }
+
+            ['dragenter', 'dragover'].forEach(evt => {
+                inputArea.addEventListener(evt, function(e) {
+                    if (!isAcceptableDrag(e)) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    inputArea.classList.add('drag-over');
+                });
+            });
+            ['dragleave', 'drop'].forEach(evt => {
+                inputArea.addEventListener(evt, function(e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    inputArea.classList.remove('drag-over');
+                });
+            });
+            inputArea.addEventListener('drop', function(e) {
+                const dt = e.dataTransfer;
+                e.preventDefault();
+                e.stopPropagation();
+                inputArea.classList.remove('drag-over');
+                if (!dt) return;
+
+                // 1) 从附件/模板 chip 拖来的引用（精确文件名/相对路径）
+                if (Array.from(dt.types || []).includes('application/x-file-ref')) {
+                    const refText = dt.getData('application/x-file-ref');
+                    if (refText) insertReferenceToken('@' + refText);
+                    return;
+                }
+                // 2) 从系统拖入的文件 → 引用其文件名
+                const files = dt.files;
+                if (files && files.length) {
+                    for (const file of files) {
+                        insertReferenceToken('@' + file.name);
+                    }
+                }
             });
         })();
 
@@ -728,8 +1596,79 @@
             div.className = `msg ${role}`;
             div.innerHTML = formatContent(content);
             area.appendChild(div);
+            renderMermaidIn(div);
+
+            // 用户消息：追加「撤回」按钮，点击后移除该消息及其后所有内容
+            if (role === 'user') {
+                const recallBar = document.createElement('div');
+                recallBar.className = 'recall-bar';
+                const btn = document.createElement('button');
+                btn.className = 'recall-btn';
+                btn.textContent = '↩ 撤回';
+                btn.title = '撤回此消息及其后的所有内容（含 Agent 回复）';
+                btn.onclick = function () { recallMessage(div, btn); };
+                recallBar.appendChild(btn);
+                div.appendChild(recallBar);
+            }
+
             area.scrollTop = area.scrollHeight;
             return div;
+        }
+
+        // 撤回用户消息：移除该消息及其后所有内容；若 Agent 正在生成则中止当前流
+        // 同时调用后端 checkpoint 回滚 API，确保 Agent 状态也回到发送前
+        async function recallMessage(userMsgDiv, btn) {
+            const area = document.getElementById('chatArea');
+            const allChildren = Array.from(area.children);
+            const msgIndex = allChildren.indexOf(userMsgDiv);
+            if (msgIndex === -1) return;
+
+            // 确认撤回（避免误触丢失 Agent 回复）
+            if (!confirm('确认撤回此消息及其后的所有内容？')) return;
+
+            // 若 Agent 正在生成，先中止当前 SSE 流
+            if (isStreaming && currentAbortController) {
+                try { currentAbortController.abort(); } catch (e) { /* ignore */ }
+            }
+
+            // 调用后端 checkpoint 回滚 API
+            btn.textContent = '⏳ 撤回中...';
+            btn.disabled = true;
+            try {
+                const resp = await fetch(`/api/agent/projects/${PROJECT_ID}/recall`, { method: 'POST' });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    console.warn('后端撤回失败:', data.detail || data.message);
+                    // 即使后端失败，前端仍继续清理 DOM（至少视觉上撤回）
+                }
+            } catch (e) {
+                console.warn('后端撤回请求异常:', e);
+                // 网络错误时继续前端清理
+            }
+
+            // 移除审批条（若存在）
+            const approvalBar = document.getElementById('approvalBar');
+            if (approvalBar) approvalBar.remove();
+
+            // 从该用户消息起，倒序移除所有后续元素
+            for (let i = allChildren.length - 1; i >= msgIndex; i--) {
+                allChildren[i].remove();
+            }
+
+            // 重置流式状态，允许用户重新发送
+            isStreaming = false;
+            currentAbortController = null;
+            waitingApproval = null;
+            document.getElementById('sendBtn').disabled = false;
+
+            // 若聊天区已空，恢复空状态提示
+            if (!area.children.length) {
+                area.innerHTML = `<div class="empty-state">
+                    <h3>👋 你好！我是设计策划文档写作助手</h3>
+                    <p>我会按 SOP 流程引导你完成贴敷式胰岛素泵<br>设计策划阶段文档的编写。</p>
+                    <p style="margin-top:12px;color:#bbb">你可以随时提问、跳过、或调整顺序。<br>输一条消息开始吧。</p>
+                </div>`;
+            }
         }
 
         function toolLabel(tool) {
@@ -737,12 +1676,42 @@
             if (tool === 'search_attachment') return '检索附件';
             if (tool === 'generate_section') return '生成章节';
             if (tool === 'modify_attachment') return '修改附件';
+            if (tool === 'enrich_attachment') return '补充附件';
+            if (tool === 'summarize_attachment') return '精简附件';
             if (tool === 'revise_section') return '修改章节';
+            if (tool === 'revise_paragraph') return '修改段落';
             if (tool === 'build_docx') return '构建文档';
             if (tool === 'design_outline' || tool === 'outline_from_attachment') return '设计文档框架';
             if (tool === 'write_chapter') return '编写章节';
             if (tool === 'summarize_section' || tool === 'summarize_document') return '精简章节';
+            if (tool === 'viking_find') return '检索历史记忆';
+            if (tool === 'viking_search') return '搜索当前会话记忆';
+            if (tool === 'viking_read') return '读取记忆详情';
+            if (tool === 'viking_store') return '保存记忆';
+            if (tool === 'viking_add_resource') return '添加记忆资源';
+            if (tool === 'sql_db_list_tables') return '查询数据库表';
+            if (tool === 'sql_db_schema') return '查看数据库表结构';
+            if (tool === 'sql_db_query') return '执行数据库查询';
+            if (tool === 'pgsql_list_tables') return '查询PG库表';
+            if (tool === 'pgsql_schema') return '查看PG库表结构';
+            if (tool === 'pgsql_query') return '执行PG库查询';
             return '处理';
+        }
+
+        function appendThinkingIndicator() {
+            const area = document.getElementById('chatArea');
+            const div = document.createElement('div');
+            div.className = 'tool-indicator';
+            div.id = 'thinking-indicator';
+            div.innerHTML = `<div class="spinner"></div>🤔 Agent 正在思考...`;
+            area.appendChild(div);
+            area.scrollTop = area.scrollHeight;
+            return div;
+        }
+
+        function removeThinkingIndicator() {
+            const el = document.getElementById('thinking-indicator');
+            if (el) el.remove();
         }
 
         function appendToolIndicator(tool, isStart) {
@@ -826,9 +1795,11 @@ function downloadDocx(downloadId) {
     window.open('/api/agent/download/' + downloadId, '_blank');
 }
 
-function showQuickDownloadBox() {
+async function showQuickDownloadBox() {
     // Don't add duplicate download boxes
     if (document.getElementById('quickDownloadBox')) return;
+    // 文档类型在对话过程中才确定，这里实时拉取一次，决定是否显示「下载 Excel」按钮
+    await refreshCurrentDocType();
     const area = document.getElementById('chatArea');
     const div = document.createElement('div');
     div.className = 'download-box';
@@ -836,13 +1807,31 @@ function showQuickDownloadBox() {
     div.innerHTML = `
         <div class="dl-icon">📄</div>
         <div class="dl-info">
-            <strong>${currentDocLabel || '文档'}.docx</strong>
+            <strong>${currentDocLabel || '文档'}.${RISK_EXCEL_DOC_TYPES.includes(currentDocType) ? 'xlsx' : 'docx'}</strong>
             <div class="dl-size">点击按钮下载已生成的文档</div>
         </div>
         <button onclick="downloadDocument()">下载文档</button>
+        ${RISK_EXCEL_DOC_TYPES.includes(currentDocType) ? `<button onclick="downloadRiskExcel()" style="background:#388e3c">下载 Excel</button>` : ''}
     `;
     area.appendChild(div);
     area.scrollTop = area.scrollHeight;
+}
+
+async function refreshCurrentDocType() {
+    try {
+        const resp = await fetch(`/api/agent/projects/${PROJECT_ID}/state`);
+        const data = await resp.json();
+        if (data.success) {
+            const docType = data.state?.document_generation?.doc_type || '';
+            if (docType) currentDocType = docType;
+        }
+    } catch (e) { /* 静默失败，沿用 currentDocType */ }
+    // 同步更新顶部「下载 Excel」链接可见性
+    const link = document.getElementById('downloadExcelLink');
+    if (link) {
+        link.style.display = RISK_EXCEL_DOC_TYPES.includes(currentDocType) ? 'inline' : 'none';
+    }
+    return currentDocType;
 }
 
 function editAndResume() {
@@ -854,6 +1843,26 @@ function editAndResume() {
 
         function downloadDocument() {
             window.open('/api/agent/projects/' + PROJECT_ID + '/download', '_blank');
+        }
+
+        function downloadRiskExcel() {
+            window.open('/api/agent/projects/' + PROJECT_ID + '/download-excel', '_blank');
+        }
+
+        // 固定「下载修改版」入口：下载最近一次修改/补全/精简的附件文档
+        async function downloadLatestModified() {
+            try {
+                const resp = await fetch(`/api/agent/projects/${PROJECT_ID}/modified-documents`);
+                const data = await resp.json();
+                if (!data.success || !data.modifications || data.modifications.length === 0) {
+                    showToast('暂无修改/补全/精简的文档结果，请先通过「修改文档」处理一篇文档', 'info');
+                    return;
+                }
+                const latest = data.modifications[data.modifications.length - 1];
+                window.open(`/api/agent/projects/${PROJECT_ID}/modified-documents/${encodeURIComponent(latest.file_id)}/download`, '_blank');
+            } catch (e) {
+                showToast('获取修改结果失败: ' + e.message, 'error');
+            }
         }
 
         // ========== 精简文档功能 ==========
@@ -901,21 +1910,116 @@ function editAndResume() {
             sendMessage();
         }
 
+        // ========== 补充文档功能 ==========
+        function showEnrichDialog() {
+            // 动态填充「已上传附件」下拉框
+            const sel = document.getElementById('enrichExistingSelect');
+            sel.innerHTML = '<option value="">— 从已上传附件中选择（可选）—</option>';
+            (uploadedFiles || []).forEach(f => {
+                if (f.status !== 'completed' || !f.file_id) return;
+                const opt = document.createElement('option');
+                opt.value = f.file_id;
+                opt.textContent = f.filename || f.file_id;
+                sel.appendChild(opt);
+            });
+            // 重置字段
+            document.getElementById('enrichFileInput').value = '';
+            document.getElementById('enrichFileName').textContent = '未选择文件';
+            sel.value = '';
+            document.getElementById('enrichInstruction').value = '';
+            document.getElementById('enrichDialog').style.display = 'flex';
+            setTimeout(() => document.getElementById('enrichInstruction').focus(), 50);
+        }
+
+        function closeEnrichDialog() {
+            document.getElementById('enrichDialog').style.display = 'none';
+        }
+
+        function handleEnrichFileSelect(event) {
+            const file = event.target.files && event.target.files[0];
+            if (!file) return;
+            document.getElementById('enrichFileName').textContent = file.name;
+            // 选择了新上传文件后，清空「已上传附件」选择
+            document.getElementById('enrichExistingSelect').value = '';
+        }
+
+        function onEnrichExistingChange(value) {
+            if (value) {
+                // 选择了已上传附件后，清空「上传新文档」选择
+                document.getElementById('enrichFileInput').value = '';
+                document.getElementById('enrichFileName').textContent = '未选择文件';
+            }
+        }
+
+        async function submitEnrich() {
+            const instruction = document.getElementById('enrichInstruction').value.trim();
+
+            // 1) 优先：上传新文档
+            const fileInput = document.getElementById('enrichFileInput');
+            let fileId = null;
+            let filename = null;
+
+            if (fileInput.files && fileInput.files.length > 0) {
+                const file = fileInput.files[0];
+                filename = file.name;
+                closeEnrichDialog();
+                fileId = await uploadFile(file, true);
+                if (!fileId) {
+                    // 上传失败已在 uploadFile 内提示
+                    showEnrichDialog();
+                    return;
+                }
+            } else {
+                // 2) 其次：从已上传附件中选择
+                const existingId = document.getElementById('enrichExistingSelect').value;
+                if (existingId) {
+                    const f = (uploadedFiles || []).find(x => x.file_id === existingId);
+                    if (!f) { alert('未找到所选附件，请重新选择'); return; }
+                    fileId = f.file_id;
+                    filename = f.filename || f.file_id;
+                }
+            }
+
+            if (!fileId || !filename) {
+                alert('请先上传新文档，或从已上传附件中选择一篇文档');
+                return;
+            }
+
+            closeEnrichDialog();
+
+            if (instruction) {
+                // 用户已填写处理需求：直接交由 Agent 处理
+                const input = document.getElementById('userInput');
+                input.value = `请处理附件「${filename}」，处理需求：${instruction}`;
+                sendMessage();
+            } else {
+                // 用户未填写需求：解析完成后追加引导消息，让用户明确选择处理方式
+                appendMessage('agent',
+                    `文档「${filename}」已解析完成。请告诉我是要 **修改**、**精简** 还是 **补全**，以及具体需求。`);
+            }
+        }
+
         function showModifiedDownloadButton(data) {
             const area = document.getElementById('chatArea');
             const div = document.createElement('div');
             div.className = 'download-box';
             div.id = 'modifiedDownloadBox_' + (data.file_id || 'x');
             if (document.getElementById(div.id)) return; // 去重
+            const kindLabels = {
+                modify: { noun: '修改版', done: '修改完成', action: '下载修改版', suffix: '修改后' },
+                enrich: { noun: '补全版', done: '补充完成', action: '下载补全版', suffix: '补充后' },
+                summarize: { noun: '精简版', done: '精简完成', action: '下载精简版', suffix: '精简后' },
+            };
+            const k = kindLabels[data.kind] || kindLabels.modify;
             const summaryHtml = (data.summary || '').replace(/\n/g, '<br>');
             div.innerHTML = `
                 <div class="dl-icon">📝</div>
                 <div class="dl-info">
-                    <strong>${escapeHtml(data.filename || '修改版文档')}</strong>
-                    <div class="dl-size">修改完成${data.modified_chars ? ' · 修改后 ' + data.modified_chars + ' 字符' : ''}</div>
+                    <strong>${escapeHtml(data.filename || (k.noun + '文档'))}</strong>
+                    <div class="dl-size">${k.done}${data.modified_chars ? ' · ' + k.suffix + ' ' + data.modified_chars + ' 字符' : ''}</div>
                     ${summaryHtml ? `<div class="dl-summary">${summaryHtml}</div>` : ''}
                 </div>
-                <button onclick="downloadModifiedDoc('${data.file_id || ''}')">下载修改版</button>
+                <button onclick="downloadModifiedDoc('${data.file_id || ''}')">${k.action}</button>
             `;
             area.appendChild(div);
             area.scrollTop = area.scrollHeight;
@@ -1064,15 +2168,68 @@ function editAndResume() {
             const div = document.createElement('div');
             div.className = 'error-msg';
             div.textContent = '⚠ ' + msg;
+            // 出错时引导重试：若有可重试的最近操作，附带一键重试按钮
+            if (lastAction) {
+                const retryBtn = document.createElement('button');
+                retryBtn.className = 'retry-btn';
+                retryBtn.textContent = '↻ 重试';
+                retryBtn.title = '重新执行上一次操作';
+                retryBtn.onclick = () => { div.remove(); retryLastAction(); };
+                div.appendChild(retryBtn);
+            }
             area.appendChild(div);
+        }
+
+        // 一键重试：根据最近一次操作重新发起请求
+        function retryLastAction() {
+            if (isStreaming) return;
+            if (lastAction === 'resume' && lastDecision != null) {
+                resumeAgent(lastDecision);
+            } else if (lastAction === 'send' && lastUserMessage != null) {
+                sendMessage(lastUserMessage);
+            }
+        }
+
+        // 兜底：将 LLM 偶尔输出的 HTML <table> 归一化为 Markdown 管道表格
+        // （正常应已由 prompt 禁止 HTML 表格，此处作为前端保险）
+        function htmlTableToMarkdown(text) {
+            if (!text) return text;
+            return text.replace(/<table[\s\S]*?<\/table>/gi, (tableBlock) => {
+                const rows = [];
+                const trRegex = /<tr[\s\S]*?<\/tr>/gi;
+                let trMatch;
+                while ((trMatch = trRegex.exec(tableBlock)) !== null) {
+                    const cells = [];
+                    const cellRegex = /<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi;
+                    let cellMatch;
+                    while ((cellMatch = cellRegex.exec(trMatch[1])) !== null) {
+                        cells.push(cellMatch[1].replace(/<[^>]+>/g, '').trim());
+                    }
+                    if (cells.length) rows.push(cells);
+                }
+                if (!rows.length) return '';
+                const colCount = rows[0].length;
+                const lines = [
+                    '| ' + rows[0].join(' | ') + ' |',
+                    '| ' + rows[0].map(() => '---').join(' | ') + ' |',
+                ];
+                for (let i = 1; i < rows.length; i++) {
+                    const row = rows[i];
+                    while (row.length < colCount) row.push('');
+                    lines.push('| ' + row.join(' | ') + ' |');
+                }
+                return '\n' + lines.join('\n') + '\n';
+            });
         }
 
         function formatContent(text) {
             if (!text) return '';
+            // 兜底：先把 HTML 表格转成 Markdown 管道表格
+            text = htmlTableToMarkdown(text);
             // Basic markdown rendering
             return text
                 .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-                .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
+                .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code class="language-$1">$2</code></pre>')
                 .replace(/`([^`]+)`/g, '<code>$1</code>')
                 .replace(/^### (.+)$/gm, '<h4>$1</h4>')
                 .replace(/^## (.+)$/gm, '<h3>$1</h3>')
@@ -1085,6 +2242,165 @@ function editAndResume() {
                     const cells = match.split('|').filter(c => c.trim());
                     return '<br>' + cells.map(c => `<span style="padding:2px 8px;border:1px solid #ddd">${c.trim()}</span>`).join('') + '<br>';
                 });
+        }
+
+        // ── Mermaid 流程图渲染（对话内预览）──
+        let _mmSeq = 0;
+        async function renderMermaidIn(container) {
+            if (typeof mermaid === 'undefined' || !container) return;
+            const blocks = container.querySelectorAll('pre code.language-mermaid');
+            if (!blocks.length) return;
+            try { mermaid.initialize({ startOnLoad: false, theme: 'default' }); } catch (e) {}
+            for (const code of blocks) {
+                const src = (code.textContent || '').trim();
+                if (!src) continue;
+                try {
+                    const id = 'mm-' + (++_mmSeq);
+                    const { svg } = await mermaid.render(id, src);
+                    const div = document.createElement('div');
+                    div.className = 'mermaid-render';
+                    div.innerHTML = svg;
+                    const pre = code.closest('pre');
+                    if (pre && pre.parentNode) pre.parentNode.replaceChild(div, pre);
+                } catch (e) {
+                    // 渲染失败：保留源码块
+                }
+            }
+        }
+
+        // ── 流程图编辑器（mermaid：生成 / 预览 / 修改 / 导出 / 插入文档）──
+        let currentFlowchartMermaid = null;
+
+        function showFlowchartDialog() {
+            document.getElementById('flowchartDialog').classList.add('active');
+            loadFlowchartSections();
+        }
+        function closeFlowchartDialog() {
+            document.getElementById('flowchartDialog').classList.remove('active');
+        }
+
+        async function loadFlowchartSections() {
+            const sel = document.getElementById('fcSection');
+            sel.innerHTML = '<option value="">（新增独立「流程图」章节）</option>';
+            try {
+                const resp = await fetch(`/api/agent/projects/${PROJECT_ID}/document`);
+                if (!resp.ok) return;
+                const data = await resp.json();
+                const sections = data.sections || [];
+                for (const s of sections) {
+                    const opt = document.createElement('option');
+                    opt.value = s.title;
+                    opt.textContent = s.title;
+                    sel.appendChild(opt);
+                }
+            } catch (e) { /* 无已生成章节时保持空列表 */ }
+        }
+
+        async function previewFlowchartMermaid(code) {
+            const box = document.getElementById('fcPreview');
+            if (!box) return;
+            if (typeof mermaid === 'undefined' || !code) { box.innerHTML = ''; return; }
+            try {
+                mermaid.initialize({ startOnLoad: false, theme: 'default' });
+                const id = 'fc-mmd-' + Date.now();
+                const { svg } = await mermaid.render(id, code);
+                box.innerHTML = svg;
+            } catch (e) {
+                box.innerHTML = '<div style="color:#c00;padding:12px">mermaid 渲染失败，请检查源码语法</div>';
+            }
+        }
+
+        async function generateFlowchart() {
+            const prompt = document.getElementById('fcPrompt').value.trim();
+            if (!prompt) { alert('请输入流程描述'); return; }
+            const btn = document.getElementById('btnGenerateFlowchart');
+            btn.disabled = true; btn.textContent = '生成中...';
+            try {
+                const resp = await fetch('/api/agent/flowchart/generate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ prompt }),
+                });
+                const data = await resp.json();
+                if (!resp.ok || !data.success) { alert(data.detail || '生成失败'); return; }
+                currentFlowchartMermaid = data.mermaid;
+                document.getElementById('fcMermaid').value = currentFlowchartMermaid;
+                await previewFlowchartMermaid(currentFlowchartMermaid);
+                document.getElementById('fcEditorWrap').style.display = 'block';
+            } catch (e) {
+                alert('生成失败: ' + e.message);
+            } finally {
+                btn.disabled = false; btn.textContent = '生成流程图';
+            }
+        }
+
+        async function reviseFlowchart() {
+            const instruction = document.getElementById('fcRevise').value.trim();
+            if (!instruction) { alert('请输入修改指令'); return; }
+            const current = document.getElementById('fcMermaid').value.trim() || currentFlowchartMermaid;
+            if (!current) { alert('请先生成流程图'); return; }
+            const btn = document.getElementById('btnReviseFlowchart');
+            btn.disabled = true; btn.textContent = '修改中...';
+            try {
+                const resp = await fetch('/api/agent/flowchart/generate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ prompt: instruction, current_mermaid: current }),
+                });
+                const data = await resp.json();
+                if (!resp.ok || !data.success) { alert(data.detail || '修改失败'); return; }
+                currentFlowchartMermaid = data.mermaid;
+                document.getElementById('fcMermaid').value = currentFlowchartMermaid;
+                document.getElementById('fcRevise').value = '';
+                await previewFlowchartMermaid(currentFlowchartMermaid);
+            } catch (e) {
+                alert('修改失败: ' + e.message);
+            } finally {
+                btn.disabled = false; btn.textContent = 'AI 修改';
+            }
+        }
+
+        async function exportFlowchartPng() {
+            const code = document.getElementById('fcMermaid').value.trim() || currentFlowchartMermaid;
+            if (!code) { alert('请先生成流程图'); return; }
+            try {
+                const resp = await fetch('/api/agent/flowchart/render', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mermaid: code }),
+                });
+                if (!resp.ok) {
+                    const d = await resp.json().catch(() => ({}));
+                    alert(d.detail || '导出失败'); return;
+                }
+                const blob = await resp.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url; a.download = 'flowchart.png';
+                document.body.appendChild(a); a.click(); a.remove();
+                URL.revokeObjectURL(url);
+            } catch (e) {
+                alert('导出失败: ' + e.message);
+            }
+        }
+
+        async function insertFlowchart() {
+            const code = document.getElementById('fcMermaid').value.trim() || currentFlowchartMermaid;
+            if (!code) { alert('请先生成流程图'); return; }
+            const sectionName = document.getElementById('fcSection').value;
+            try {
+                const resp = await fetch(`/api/agent/projects/${PROJECT_ID}/flowchart/insert`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mermaid: code, section_name: sectionName }),
+                });
+                const data = await resp.json();
+                if (!resp.ok) { alert(data.detail || '插入失败'); return; }
+                alert(data.message || '已插入文档');
+                closeFlowchartDialog();
+            } catch (e) {
+                alert('插入失败: ' + e.message);
+            }
         }
 
         const COLLAPSE_THRESHOLD = 500;  // chars
@@ -1110,17 +2426,27 @@ function editAndResume() {
         }
 
         // ── SSE ──
-        async function sendMessage() {
+        async function sendMessage(retryText) {
             if (isStreaming) return;
 
             const input = document.getElementById('userInput');
-            const message = input.value.trim();
+            // retryText 传入非空值时表示「一键重试」，复用已显示的用户消息，不重复 append
+            const isRetry = (retryText != null && retryText !== '');
+            const message = isRetry ? retryText : input.value.trim();
             if (!message) return;
 
-            // Show user message
-            appendMessage('user', message);
-            input.value = '';
-            input.style.height = 'auto';
+            if (!isRetry) {
+                // Show user message
+                appendMessage('user', message);
+                input.value = '';
+                input.style.height = 'auto';
+                updateClearBtn();
+            }
+
+            // 记录最近操作，供出错时一键重试
+            lastAction = 'send';
+            lastUserMessage = message;
+            lastDecision = null;
 
             // Disable input during streaming
             isStreaming = true;
@@ -1129,6 +2455,13 @@ function editAndResume() {
             let agentDiv = null;
             let currentTool = null;
 
+            // 创建 AbortController，供撤回消息时中止流
+            currentAbortController = new AbortController();
+
+            // 思考中提示：Agent 尚未返回首个 token/工具调用前显示转圈
+            let thinkingShown = true;
+            appendThinkingIndicator();
+
             try {
                 const formData = new FormData();
                 formData.append('message', message);
@@ -1136,6 +2469,7 @@ function editAndResume() {
                 const response = await fetch(`/api/agent/projects/${PROJECT_ID}/messages`, {
                     method: 'POST',
                     body: formData,
+                    signal: currentAbortController.signal,
                 });
 
                 const reader = response.body.getReader();
@@ -1153,6 +2487,12 @@ function editAndResume() {
                     for (const line of lines) {
                         if (!line.startsWith('data: ')) continue;
                         const data = JSON.parse(line.slice(6));
+
+                        // 首个事件到达即结束「思考中」提示
+                        if (thinkingShown) {
+                            removeThinkingIndicator();
+                            thinkingShown = false;
+                        }
 
                         switch (data.type) {
                             case 'token':
@@ -1173,7 +2513,7 @@ function editAndResume() {
                                 if (currentTool) {
                                     const el = document.getElementById(`tool-${currentTool}`);
                                     if (el) {
-                                        el.innerHTML = `<div class="icon">✅</div>${currentTool === 'search_kb' ? '知识库检索完成' : currentTool === 'generate_section' ? '章节生成完成' : '修改完成'}`;
+                                        el.innerHTML = `<div class="icon">✅</div>${toolLabel(currentTool)}完成`;
                                     }
                                 }
                                 currentTool = null;
@@ -1211,20 +2551,30 @@ function editAndResume() {
                     }
                 }
             } catch (err) {
-                showError('连接失败: ' + err.message);
+                // 撤回触发的 abort 不算错误，静默处理
+                if (err && err.name !== 'AbortError') {
+                    showError('连接失败: ' + err.message);
+                }
             } finally {
+                removeThinkingIndicator();
                 isStreaming = false;
+                currentAbortController = null;
                 document.getElementById('sendBtn').disabled = false;
                 document.getElementById('userInput').focus();
 
                 // Refresh state sidebar and attachments
                 fetchState();
                 fetchAttachments();
+                fetchTemplates();
             }
         }
 
         async function resumeAgent(decision) {
             if (isStreaming) return;
+
+            // 记录最近操作，供出错时一键重试
+            lastAction = 'resume';
+            lastDecision = decision;
 
             // Remove approval bar
             const bar = document.getElementById('approvalBar');
@@ -1233,6 +2583,13 @@ function editAndResume() {
             isStreaming = true;
             document.getElementById('sendBtn').disabled = true;
 
+            // 创建 AbortController，供撤回消息时中止流
+            currentAbortController = new AbortController();
+
+            // 思考中提示：继续处理（确认/跳过）后，Agent 返回首个事件前显示转圈
+            let thinkingShown = true;
+            appendThinkingIndicator();
+
             try {
                 const formData = new FormData();
                 formData.append('decision', decision);
@@ -1240,6 +2597,7 @@ function editAndResume() {
                 const response = await fetch(`/api/agent/projects/${PROJECT_ID}/resume`, {
                     method: 'POST',
                     body: formData,
+                    signal: currentAbortController.signal,
                 });
 
                 const reader = response.body.getReader();
@@ -1258,6 +2616,12 @@ function editAndResume() {
                     for (const line of lines) {
                         if (!line.startsWith('data: ')) continue;
                         const data = JSON.parse(line.slice(6));
+
+                        // 首个事件到达即结束「思考中」提示
+                        if (thinkingShown) {
+                            removeThinkingIndicator();
+                            thinkingShown = false;
+                        }
 
                         switch (data.type) {
                             case 'token':
@@ -1299,10 +2663,12 @@ function editAndResume() {
             } catch (err) {
                 showError('恢复失败: ' + err.message);
             } finally {
+                removeThinkingIndicator();
                 isStreaming = false;
                 document.getElementById('sendBtn').disabled = false;
                 fetchState();
                 fetchAttachments();
+                fetchTemplates();
             }
         }
 
@@ -1376,7 +2742,7 @@ function editAndResume() {
                             case 'tool_end':
                                 const el = document.getElementById(`tool-${data.tool}`);
                                 if (el) {
-                                    el.innerHTML = `<div class="icon">✅</div>${data.tool === 'search_kb' ? '知识库检索完成' : data.tool === 'generate_section' ? '章节生成完成' : data.tool === 'build_docx' ? '文档构建完成' : '工具执行完成'}`;
+                                    el.innerHTML = `<div class="icon">✅</div>${toolLabel(data.tool)}完成`;
                                 }
                                 break;
                             case 'sections_ready':
@@ -1405,6 +2771,7 @@ function editAndResume() {
                 document.getElementById('autoGenBtn').disabled = false;
                 fetchState();
                 fetchAttachments();
+                fetchTemplates();
             }
         }
 
@@ -1438,8 +2805,36 @@ function editAndResume() {
                         'regulatory_strategy_document': '注册路径策略',
                     };
                     currentDocLabel = docLabels[docType] || '文档';
+                    currentDocType = docType;
+                    // 风险分析总表类文档显示「下载 Excel」入口
+                    document.getElementById('downloadExcelLink').style.display =
+                        (hasSections && RISK_EXCEL_DOC_TYPES.includes(docType)) ? 'inline' : 'none';
                 }
             } catch (e) { /* Silently fail */ }
+        }
+
+        // ── 回退到上一次修改/生成/精简/附件修改之前 ──
+        async function undoLast() {
+            try {
+                const resp = await fetch(`/api/agent/projects/${PROJECT_ID}/undo`, { method: 'POST' });
+                const data = await resp.json();
+                if (!resp.ok) throw new Error(data.detail || 'HTTP ' + resp.status);
+                if (!data.success) {
+                    showToast(data.message || '没有可回退的操作', 'info');
+                    return;
+                }
+                // 清理被回退的附件修改/补全下载按钮（如有）
+                const removedFileIds = data.removed_file_ids || [];
+                removedFileIds.forEach(fid => {
+                    const box = document.getElementById('modifiedDownloadBox_' + fid);
+                    if (box) box.remove();
+                });
+                showToast(data.message || '已回退', 'success');
+                fetchState();
+                fetchAttachments();
+            } catch (e) {
+                showToast('回退失败: ' + e.message, 'error');
+            }
         }
 
         // ── 精炼生成模式开关 ──
@@ -1476,7 +2871,7 @@ function editAndResume() {
         // ── Knowledge Base Upload (独立上传到 upload 向量知识库) ──
         // 复用后端 POST /api/upload?persist=true + GET /api/extract-status/{file_id}，
         // 上传不绑定任何项目会话，入库后任意对话的 RAG 检索均可命中。
-        const KB_MAX_SIZE_BYTES = 10 * 1024 * 1024;
+        const KB_MAX_SIZE_BYTES = 20 * 1024 * 1024;
         // 与后端 SUPPORTED_UPLOAD_FORMATS 保持一致（含 MinerU 启用时的扩展格式）
         const KB_ALLOWED_FORMATS = ['.docx', '.pdf', '.txt', '.doc', '.ppt', '.pptx', '.xls', '.xlsx',
             '.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.html', '.htm'];
@@ -1532,7 +2927,7 @@ function editAndResume() {
                 return `不支持的文件格式「${ext}」。支持: ${KB_ALLOWED_FORMATS.join(' ')}`;
             }
             if (file.size > KB_MAX_SIZE_BYTES) {
-                return `文件「${file.name}」超过 10MB 限制 (${(file.size / 1024 / 1024).toFixed(1)}MB)`;
+                return `文件「${file.name}」超过 20MB 限制 (${(file.size / 1024 / 1024).toFixed(1)}MB)`;
             }
             if (file.size === 0) {
                 return '文件为空，请上传有效文件';
@@ -1595,6 +2990,57 @@ function editAndResume() {
             }
         }
 
+        // ── KB Files List (查看知识库文件列表) ──
+        async function showKbFilesDialog() {
+            const overlay = document.getElementById('kbFilesDialog');
+            overlay.classList.add('active');
+            const content = document.getElementById('kbFilesContent');
+            content.innerHTML = '<p style="color:#999;text-align:center;padding:20px">加载中...</p>';
+            try {
+                const resp = await fetch('/api/kb/files');
+                if (!resp.ok) {
+                    const errData = await resp.json().catch(() => ({}));
+                    throw new Error(errData.detail || `请求失败 (HTTP ${resp.status})`);
+                }
+                const data = await resp.json();
+                if (data.status !== 'ok') {
+                    throw new Error(data.detail || '未知错误');
+                }
+                if (!data.files || data.files.length === 0) {
+                    content.innerHTML = '<p style="color:#999;text-align:center;padding:40px">知识库中暂无文件，请先上传。</p>';
+                    return;
+                }
+                let html = '<table style="width:100%;border-collapse:collapse;font-size:13px">';
+                html += '<thead><tr style="border-bottom:2px solid #e0e0e0;text-align:left;color:#666">';
+                html += '<th style="padding:8px">文件名</th>';
+                html += '<th style="padding:8px;width:80px;text-align:right">分块数</th>';
+                html += '</tr></thead><tbody>';
+                for (const f of data.files) {
+                    const hasOriginal = f.original_filename && f.original_filename !== f.source_file;
+                    const displayName = hasOriginal ? f.original_filename : f.source_file;
+                    const note = hasOriginal ? '' : ' <span style="color:#ff9800;font-size:11px">(旧文件，原始文件名已丢失)</span>';
+                    html += '<tr style="border-bottom:1px solid #f0f0f0">';
+                    html += `<td style="padding:8px;word-break:break-all">${escapeHtml(displayName)}${note}</td>`;
+                    html += `<td style="padding:8px;text-align:right;color:#888">${f.chunk_count}</td>`;
+                    html += '</tr>';
+                }
+                html += '</tbody></table>';
+                html += `<p style="font-size:11px;color:#999;margin-top:8px">共 ${data.files.length} 个文件</p>`;
+                content.innerHTML = html;
+            } catch (e) {
+                content.innerHTML = `<p style="color:#e53935;text-align:center;padding:20px">加载失败: ${escapeHtml(e.message)}</p>`;
+            }
+        }
+
+        function closeKbFilesDialog() {
+            document.getElementById('kbFilesDialog').classList.remove('active');
+        }
+
+        // 点击遮罩层关闭
+        document.getElementById('kbFilesDialog').addEventListener('click', function(e) {
+            if (e.target === this) closeKbFilesDialog();
+        });
+
         // ── Init ──
         if (existingProject) {
             // 恢复已有项目：清除空状态，显示恢复提示
@@ -1605,6 +3051,10 @@ function editAndResume() {
         }
         // 始终从服务端加载附件列表（新项目也可能已有上传记录）
         fetchAttachments();
+        // 加载已添加的模板
+        fetchTemplates();
+        // 加载完整文档类型列表（填充模板「目标文档类型」下拉框）
+        loadDocTypes();
         renderSteps({});
         document.getElementById('userInput').focus();
     </script>

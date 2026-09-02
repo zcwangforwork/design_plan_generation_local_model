@@ -60,6 +60,9 @@ class AgentState(TypedDict, total=False):
     # ── 生成模式 ──
     concise_mode: Optional[bool]  # True时Agent以简洁精炼语言生成文档内容（仅文档内容，不影响聊天回复）
 
+    # ── 补充提示词 ──
+    supplementary_prompts: Optional[str]  # 累积的用户补充提示词，追加到文档生成提示词末尾（纯补充，不破坏原有提示词）
+
     # ── 多代理协作 ──
     outline: Optional[str]          # JSON字符串, 完整的文档框架
     outline_status: Optional[str]   # "not_started" | "draft" | "confirmed" | "revised"
@@ -70,11 +73,25 @@ class AgentState(TypedDict, total=False):
     # 结构: [{"file_id": str, "filename": str, "char_count": int, "preview": str, "full_text": str, "status": str}, ...]
     attachments: list[dict]
 
+    # ── 模板管理 (添加模板功能) ──
+    # 结构: [{"template_id": str, "name": str, "filename": str, "doc_type": str,
+    #         "char_count": int, "preview": str, "toc": str, "full_text": str,
+    #         "status": str}, ...]
+    # 模板作为文档风格/结构参照，区别于普通附件：agent 生成文档时模仿其章节结构与写作风格
+    templates: list[dict]
+
     # ── 附件修改结果 ──
     # 结构: [{"file_id": str, "filename": str, "modified_markdown": str, "summary": str,
     #         "modified_chars": int, "timestamp": str, "download_id": str}, ...]
     # 独立于 generated_sections：修改的是上传附件的副本，不污染目标文档章节
     attachment_modifications: list[dict]
+
+    # ── 撤销栈（单步回退） ──
+    # 每次覆盖 generated_sections 章节 或 追加 attachment_modifications 前，压入一个快照条目。
+    # 结构: [{"sections_before": {章节名: 旧内容或None}, "attachments_before_len": int,
+    #         "removed_file_ids": [file_id, ...], "description": str}, ...]
+    # None 表示该章节在变更前不存在（回退时应删除）；attachments_before_len 为变更前列表长度（回退时截断）。
+    undo_stack: list[dict]
 
 
 # ── 默认初始状态 ──
@@ -98,12 +115,15 @@ def create_initial_state() -> AgentState:
         unresolved_items=[],
         auto_mode=False,
         concise_mode=False,
+        supplementary_prompts=None,
         outline=None,
         outline_status="not_started",
         current_chapter=None,
         chapter_write_queue=[],
         attachments=[],
         attachment_modifications=[],
+        undo_stack=[],
+        templates=[],
     )
 
 
@@ -168,6 +188,7 @@ def build_state_snapshot(state: AgentState) -> dict:
     """
     return {
         "concise_mode": bool(state.get("concise_mode", False)),
+        "supplementary_prompts": state.get("supplementary_prompts"),
         "product": {
             "name": state.get("product_name"),
             "classification": state.get("product_classification"),
@@ -200,11 +221,23 @@ def build_state_snapshot(state: AgentState) -> dict:
             {
                 "file_id": a.get("file_id"),
                 "filename": a.get("filename"),
+                "relative_path": a.get("relative_path"),
                 "char_count": a.get("char_count", 0),
                 "preview": a.get("preview", ""),
                 "status": a.get("status", "unknown"),
             }
             for a in state.get("attachments", [])
+        ],
+        "templates": [
+            {
+                "template_id": t.get("template_id"),
+                "name": t.get("name"),
+                "filename": t.get("filename"),
+                "doc_type": t.get("doc_type"),
+                "char_count": t.get("char_count", 0),
+                "status": t.get("status", "unknown"),
+            }
+            for t in state.get("templates", [])
         ],
     }
 

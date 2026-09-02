@@ -137,7 +137,8 @@ async def maybe_compress_messages(
     summary = await summarize_old_messages(old_messages)
 
     compressed = [
-        SystemMessage(content=f"[进度回顾] {summary}"),
+        SystemMessage(content=f"（系统内部上下文摘要，仅供你了解此前对话的进度，"
+                               f"切勿在回复中复述或引用其原文）\n{summary}"),
         *recent_messages,
     ]
 

@@ -79,6 +79,8 @@ def _do_extract(task_id: str, file_path: str, persist: bool, doc_type: str):
                     file_path, vector_store,
                     force_doc_type=doc_type,
                     pre_parsed_paragraphs=paragraphs,
+                    file_id=task_id,
+                    original_filename=extract_tasks[task_id].get("filename", ""),
                 )
                 extract_tasks[task_id]["persisted"] = True
                 extract_tasks[task_id]["chunk_count"] = chunk_count
@@ -95,12 +97,17 @@ def _do_extract(task_id: str, file_path: str, persist: bool, doc_type: str):
         extract_tasks[task_id]["status"] = "failed"
         extract_tasks[task_id]["message"] = f"提取失败: {str(e)}"
     finally:
-        # 清理临时文件
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        except Exception:
-            pass
+        # 段落级手术（修改/精简/补全上传文档）需要以原 .docx 为基底，保留原文件并记录路径；
+        # 其余格式的临时文件照常清理。
+        _ext = os.path.splitext(file_path)[1].lower()
+        if _ext == ".docx":
+            extract_tasks[task_id]["original_path"] = file_path
+        else:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception:
+                pass
         # 注意: 保留 full_text 不清除 — Agent模式附件功能需要访问全文
 
 

@@ -380,6 +380,61 @@ def extract_text_from_xlsx(xlsx_path: str) -> List[Tuple[str, str]]:
     return paragraphs
 
 
+def extract_text_from_pptx(pptx_path: str) -> List[Tuple[str, str]]:
+    """
+    从 .pptx 文件提取文本内容（幻灯片文本 + 表格，支持组合形状）
+
+    Args:
+        pptx_path: .pptx 文件路径
+
+    Returns:
+        [(section_title, paragraph_text), ...] 列表
+    """
+    try:
+        from pptx import Presentation
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+    except ImportError:
+        print("  [PPTX] 需要安装 python-pptx: pip install python-pptx")
+        return []
+
+    paragraphs = []
+
+    def _collect_shapes(shapes, parts):
+        for shape in shapes:
+            # 组合形状：递归遍历子形状
+            if getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.GROUP:
+                if getattr(shape, "shapes", None):
+                    _collect_shapes(shape.shapes, parts)
+                continue
+            # 文本框 / 占位符
+            if getattr(shape, "has_text_frame", False) and shape.text_frame:
+                text = "\n".join(
+                    p.text for p in shape.text_frame.paragraphs
+                    if p.text and p.text.strip()
+                )
+                if text.strip():
+                    parts.append(text.strip())
+            # 表格
+            if getattr(shape, "has_table", False):
+                rows = []
+                for row in shape.table.rows:
+                    rows.append(" | ".join(c.text.strip() for c in row.cells))
+                if rows:
+                    parts.append("\n".join(rows))
+
+    try:
+        prs = Presentation(pptx_path)
+        for slide_idx, slide in enumerate(prs.slides, start=1):
+            parts = []
+            _collect_shapes(slide.shapes, parts)
+            if parts:
+                paragraphs.append((f"[幻灯片 {slide_idx}]", "\n\n".join(parts)))
+    except Exception as e:
+        print(f"  [PPTX] 读取失败: {e}")
+
+    return paragraphs
+
+
 def extract_text_from_md(md_path: str) -> List[Tuple[str, str]]:
     """
     从 .md 文件提取文本内容
@@ -492,6 +547,8 @@ def extract_text_from_file(file_path: str) -> List[Tuple[str, str]]:
         return extract_text_from_txt(file_path)
     elif ext == '.xlsx':
         return extract_text_from_xlsx(file_path)
+    elif ext == '.pptx':
+        return extract_text_from_pptx(file_path)
     elif ext == '.md':
         return extract_text_from_md(file_path)
     else:
@@ -593,7 +650,7 @@ def generate_chunk_id(source_file: str, chunk_index: int) -> str:
 def get_supported_files(root_dir: str) -> List[str]:
     """递归获取目录下所有支持的文件"""
     supported_files = []
-    supported_exts = ['.docx', '.pdf', '.doc', '.txt', '.xlsx', '.md']
+    supported_exts = ['.docx', '.pdf', '.doc', '.txt', '.xlsx', '.pptx', '.md']
 
     # MinerU 启用时追加扩展格式
     try:
@@ -621,6 +678,8 @@ def ingest_document(
     vector_store: VectorStore,
     force_doc_type: Optional[str] = None,
     pre_parsed_paragraphs: Optional[List[Tuple[str, str]]] = None,
+    file_id: Optional[str] = None,
+    original_filename: Optional[str] = None,
 ) -> int:
     """
     摄入单个文档到向量库
@@ -631,6 +690,8 @@ def ingest_document(
         force_doc_type: 强制指定文档类型
         pre_parsed_paragraphs: 预解析的段落列表，传入时跳过 extract_text_from_file
             避免对同一文件重复解析（尤其是 MinerU 等耗时解析器）
+        file_id: 文件唯一标识（用于追溯和删除）
+        original_filename: 用户上传的原始文件名（用于展示）
 
     Returns:
         成功摄入的 chunk 数量
@@ -668,6 +729,10 @@ def ingest_document(
         chunks[i]["chunk_id"] = generate_chunk_id(source_file, i)
         chunks[i]["doc_type"] = doc_type
         chunks[i]["source_file"] = source_file
+        if file_id:
+            chunks[i]["file_id"] = file_id
+        if original_filename:
+            chunks[i]["original_filename"] = original_filename
 
     # 批量添加到向量库
     vector_store.add_chunks(chunks)

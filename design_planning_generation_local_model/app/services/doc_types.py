@@ -8,7 +8,7 @@
 
 DOC_TYPES = [
     # ========== 一、设计策划阶段 (Design Planning) — 10份 ==========
-    "design_development_plan",           # 设计开发策划书
+    "design_development_plan",           # 项目开发计划书
     "product_requirements_spec",         # 产品需求规格书(PRS)
     "risk_management_plan",              # 风险管理计划
     "software_development_plan",         # 软件开发生命周期计划
@@ -209,7 +209,7 @@ DOC_TYPES = list(dict.fromkeys(DOC_TYPES))
 
 DOC_TYPE_LABELS = {
     # 一、设计策划阶段
-    "design_development_plan": "设计开发策划书",
+    "design_development_plan": "项目开发计划书",
     "product_requirements_spec": "产品需求规格书(PRS)",
     "risk_management_plan": "风险管理计划",
     "software_development_plan": "软件开发生命周期计划",
@@ -551,10 +551,10 @@ DOC_CATEGORIES = {
 }
 
 # 基础上传格式（始终支持，使用本地解析器）
-_BASE_UPLOAD_FORMATS = [".docx", ".pdf", ".txt"]
+_BASE_UPLOAD_FORMATS = [".docx", ".pdf", ".txt", ".pptx"]
 
 # MinerU 启用时可额外支持的格式
-_MINERU_EXTRA_FORMATS = [".doc", ".ppt", ".pptx", ".xls", ".xlsx",
+_MINERU_EXTRA_FORMATS = [".doc", ".ppt", ".xls", ".xlsx",
                          ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif",
                          ".html", ".htm"]
 
@@ -584,5 +584,5 @@ def _compute_supported_upload_formats():
 
 
 SUPPORTED_UPLOAD_FORMATS = _compute_supported_upload_formats()
-MAX_UPLOAD_SIZE_MB = 10
+MAX_UPLOAD_SIZE_MB = 20
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024

@@ -171,12 +171,17 @@ class VectorStore:
 
         ids = [c["chunk_id"] for c in chunks]
         texts = [c["text"] for c in chunks]
+        # 记录入库时间戳，供知识库文件列表按"最新上传优先"排序
+        ingested_at = time.time()
         metadatas = [
             {
                 "doc_type": c.get("doc_type", ""),
                 "source_file": c.get("source_file", ""),
                 "section_title": c.get("section_title", ""),
-                "chunk_index": c.get("chunk_index", 0)
+                "chunk_index": c.get("chunk_index", 0),
+                "file_id": c.get("file_id", ""),
+                "original_filename": c.get("original_filename", ""),
+                "ingested_at": ingested_at,
             }
             for c in chunks
         ]
@@ -723,4 +728,49 @@ class VectorStore:
                     sources.add(meta["source_file"])
             return sorted(list(sources))
         except Exception:
+            return []
+
+    def list_uploaded_files(self) -> list[dict]:
+        """
+        列出上传知识库中所有文件及其统计信息
+
+        遍历 qms_doc_uploads 集合的所有 chunk 元数据，按 source_file 聚合，
+        返回每个文件的：文件名、原始文件名、file_id、chunk 数量、入库时间戳，
+        按入库时间倒序排列（最新上传的文件排最前）。
+
+        Returns:
+            [{"source_file": str, "original_filename": str, "file_id": str,
+              "chunk_count": int, "ingested_at": float}, ...]
+        """
+        try:
+            result = self.collection.get(include=["metadatas"])
+            files: dict[str, dict] = {}
+            for meta in result.get("metadatas", []):
+                if not meta:
+                    continue
+                sf = meta.get("source_file", "")
+                if not sf:
+                    continue
+                if sf not in files:
+                    files[sf] = {
+                        "source_file": sf,
+                        "original_filename": meta.get("original_filename", "") or "",
+                        "file_id": meta.get("file_id", "") or "",
+                        "ingested_at": meta.get("ingested_at", 0) or 0,
+                        "chunk_count": 0,
+                    }
+                files[sf]["chunk_count"] += 1
+                # 优先使用非空的 file_id 和 original_filename
+                if not files[sf]["file_id"] and meta.get("file_id"):
+                    files[sf]["file_id"] = meta["file_id"]
+                if not files[sf]["original_filename"] and meta.get("original_filename"):
+                    files[sf]["original_filename"] = meta["original_filename"]
+                # 取该文件各 chunk 中最新的入库时间（同一文件各 chunk 时间戳相同）
+                ts = meta.get("ingested_at", 0) or 0
+                if ts > files[sf]["ingested_at"]:
+                    files[sf]["ingested_at"] = ts
+            # 按入库时间倒序：最新上传的文件排最前；旧文件（无时间戳=0）排最后
+            return sorted(list(files.values()), key=lambda x: x["ingested_at"], reverse=True)
+        except Exception as e:
+            print(f"[VectorStore] list_uploaded_files 异常: {e}")
             return []

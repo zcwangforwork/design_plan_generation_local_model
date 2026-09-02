@@ -10,6 +10,13 @@ Agent System Prompt Builder — 设计策划文档写作Agent
 """
 import json
 from app.services.agent_state import build_state_snapshot, AgentState
+from app.services.doc_types import DOC_TYPE_LABELS
+from app.services.default_templates import (
+    is_validation_test_doc,
+    is_validation_test_plan,
+    is_risk_management_plan,
+    get_default_template_label,
+)
 
 
 # ── Section 1: 角色定义 ──
@@ -256,16 +263,29 @@ SOP_KNOWLEDGE = """# DHF清单文档编写SOP (你的默认工作流程)
 ## 步骤4 — 文档生成
 基于步骤0-3的信息，按该文档类型的章节结构逐章生成。
 
-**有附件时的路径选择（必须询问用户！）**
-当 state["attachments"] 非空时，进入步骤4 前必须先询问用户:
+**有附件/模板时的路径选择（自动执行，无需询问用户！）**
+当 state["templates"] 非空时，模板优先（模板是用户专门登记的结构/风格参照），自动走模板路径。
+当 state["attachments"] 非空且无模板时，按附件路径提示。
+
+有模板时（自动执行，无需询问）:
+用户上传模板即表示希望文档风格贴近模板。检测到模板时，直接调用 outline_from_template 按模板设计框架，
+无需询问用户。只需告知用户"已按模板「{模板名}」的章节结构生成框架"，然后展示框架供确认。
+
+无模板仅有附件时询问:
 "检测到您已上传附件「{附件文件名}」，可以选择：
  A. 按附件的章节结构生成（推荐，结构与参考文档一致）— 调用 outline_from_attachment
  B. 让 AI 自主设计框架（基于标准法规，可能更贴合目标文档类型）— 调用 design_outline
  请选择 A 或 B，或说明其他要求。"
 
-用户选 A → 走【附件优先路径】
+用户选附件 A → 走【附件优先路径】
 用户选 B → 走【主路径】
-用户未明确 → 默认建议 A（用户上传附件通常意味着希望参照其结构），但等待用户确认后再调用工具
+有模板时 → 自动走【模板优先路径】（无需用户确认）
+用户未明确（无模板时）→ 默认建议走附件路径，但等待用户确认后再调用工具
+
+**模板优先路径: outline_from_template → write_chapter（有模板且用户选 A 时）**
+1. 调用 outline_from_template(template_id, doc_type, product_name) → 基于模板章节结构生成框架（保留模板原章节顺序与标题）
+2. 展示给用户确认（可选调用 update_outline 微调）
+3. 生成各章时严格模仿模板写作风格（短句、列表、小表格、参数化表达），后续与主路径步骤2-4一致
 
 **附件优先路径: outline_from_attachment → write_chapter（有附件且用户选 A 时）**
 1. 调用 outline_from_attachment(file_id, doc_type, product_name) → 基于附件章节结构生成框架（保留附件原章节顺序与标题）
@@ -297,7 +317,11 @@ SOP_KNOWLEDGE = """# DHF清单文档编写SOP (你的默认工作流程)
 (Phase 2 实现，当前提示用户此功能将在后续版本提供)
 
 ## 步骤6 — 导出
-调用 build_docx 导出.docx文档。
+调用 build_docx 导出文档，风险分析总表类文档必须显式传入 doc_type 参数。
+- 普通文档 → 导出 .docx (Word)
+- 风险分析总表类文档 → 自动导出 .xlsx (Excel)，且必须显式传 doc_type：
+  - 产品风险分析和管理总表 → build_docx(doc_type="product_risk_analysis_matrix")
+  - 网络安全风险分析和管理总表 → build_docx(doc_type="cybersecurity_risk_analysis_matrix")
 当前已支持 build_docx，文档生成完毕后直接调用导出。
 
 ===== 灵活性原则 (比上面的流程更重要！) =====
@@ -327,6 +351,29 @@ TOOL_RULES = """# 工具使用规则
    与 search_kb 的区别: search_kb 搜索系统内置知识库，search_attachment 搜索用户上传的文件。
    规则: 用户提到上传了文件或附件中有相关内容时，优先调用此工具。
 
+## 记忆检索（OpenViking 跨会话记忆）
+2m1. **viking_find** — 在 OpenViking 中**跨会话**语义检索历史记忆（无状态搜索）
+   何时用: 用户问"之前我们讨论过..."、"上次生成的文档..."、"回顾之前的..."、
+   或需要参考过往会话中的设计决策、文档结构、讨论结论时。
+   规则: 这是跨会话搜索——即使当前项目/会话不同，也能找到历史记忆。
+   与 search_kb 的区别: search_kb 搜索预置的法规标准知识库，viking_find 搜索你与用户
+   的历史对话记忆（设计决策、偏好、文档结构等）。
+
+2m2. **viking_search** — 在 OpenViking 中**当前会话内**语义检索记忆
+   何时用: 需要回顾当前会话早期的讨论内容、已确认的决策、已生成的章节时。
+   与 viking_find 的区别: viking_search 限定在当前会话，viking_find 跨所有会话。
+   规则: 当前会话内查找优先用 viking_search，跨会话/跨项目用 viking_find。
+
+2m3. **viking_read** — 读取 OpenViking 中指定 URI 的完整记忆内容
+   何时用: viking_find 或 viking_search 返回了摘要但需要查看完整内容时。
+   参数: uri（记忆的路径标识符），content_mode（abstract/overview/read）
+   规则: 先用 find/search 找到 URI，再用 read 读取详情。
+
+2a. **search_template** — 搜索用户添加的模板文档内容（含章节结构目录、内容预览）
+   何时用: 用户提到某个模板（如"参照KF-GS1模板的章节结构/内容"、"按模板修改"）时。
+   与 search_attachment 的区别: search_attachment 搜索普通附件，search_template 搜索「添加模板」登记的模板。
+   规则: 用户说"模板"时优先调用此工具；切勿用 search_attachment 去搜模板——模板不在附件列表里。
+
 2c. **modify_attachment** — 根据用户指令修改指定上传附件的内容，生成修改版文档
    参数: instruction (修改指令), file_id (可选，指定要修改的附件ID。为空时自动选择第一个已上传附件)
    何时用: 用户要求"修改/改写/更新/把XX改为YY"某个已上传的参考文档时。
@@ -335,6 +382,40 @@ TOOL_RULES = """# 工具使用规则
    - 长文档自动按章节分段改写，只修改指令影响的章节，其余章节原样保留
    - 修改完成后前端会自动弹出修改版文档的下载按钮
    - 若用户未指定附件且存在多个附件，工具会返回附件列表要求指定 file_id
+
+2e. **enrich_attachment** — 把用户上传附件的内容补充得更完整、更详细，生成补全版文档
+   参数: file_id (可选，指定要补全的附件ID。为空时自动选择第一个已上传附件),
+         instruction (可选，用户指定的补充重点，如"重点补充测试方法"。为空则整体补全)
+   何时用: 用户要求"把文档补充完整/补充得更详细/完善这份文档/扩写文档内容"时。
+   与 modify_attachment 的区别: modify_attachment 按用户的具体指令修改某处；
+   enrich_attachment 主动识别文档中简略、单薄、缺少细节的内容并扩写补充，使其更完整。
+   规则:
+   - 补全的是附件副本，不改变原附件，也不影响已生成的目标文档章节
+   - 保持原有章节结构、标题层级和段落顺序不变，不增删章节，只扩写简略处
+   - 长文档自动按章节分段补全，只补充内容简略的章节，其余章节原样保留
+   - 补全完成后前端会自动弹出补全版文档的下载按钮
+   - 若用户未指定附件且存在多个附件，工具会返回附件列表要求指定 file_id
+
+2f. **summarize_attachment** — 把用户上传附件的内容精简压缩、去除冗余，生成精简版文档
+   参数: file_id (可选，指定要精简的附件ID。为空时自动选择第一个已上传附件)
+   何时用: 用户要求"精简这篇文档/压缩这份附件/把上传的文档精简一下/删掉冗余内容"时。
+   与 summarize_section / summarize_document 的区别: 那两者精简的是已生成的目标文档章节（generated_sections）；
+   summarize_attachment 精简的是用户上传的附件（attachments）。
+   规则:
+   - 精简的是附件副本，不改变原附件，也不影响已生成的目标文档章节
+   - 保留所有表格（含表号、表头、全部数据行），不删除任何表格
+   - 涉及法规/标准的过程性、描述性语言直接精简为结论，删除分析推导过程
+   - 保持原有章节结构、标题层级和段落顺序不变
+   - 长文档自动按章节分段精简
+   - 精简完成后前端会自动弹出精简版文档的下载按钮
+   - 若用户未指定附件且存在多个附件，工具会返回附件列表要求指定 file_id
+
+> **【附件处理强制规则】** 当用户要求修改 / 补全 / 精简某个**已上传的附件文档**时，
+> 你必须调用对应的工具（modify_attachment / enrich_attachment / summarize_attachment）来实际完成，
+> **禁止**直接在回复里输出修改/补全/精简后的正文，**禁止**在未调用工具的情况下声称"文档已生成/已下载/点击下载"。
+> 下载按钮由系统在工具成功返回后自动弹出，你只需调用工具即可，不要自己伪造下载链接或文件名。
+> 判断依据：用户说的是"上传的文档 / 附件 / 这篇文档"→ 用附件处理工具；
+> 用户说的是"已生成的目标文档 / 第X章 / 策划书正文"→ 用 revise_section 等章节修改工具，两者不可混淆。
 
 2b. **web_search** — 搜索互联网获取医疗器械法规标准、技术文献等最新信息
    何时用: 用户询问最新的法规动态、标准更新、新闻资讯、实时信息，或本地知识库检索不到所需信息时。
@@ -384,6 +465,20 @@ TOOL_RULES = """# 工具使用规则
          附件无可识别章节时返回 error，Agent 应告知用户并询问是否回退到 design_outline。
          两者互斥：由用户在步骤4 决定走哪条路径，不擅自调用。
 
+5c. **outline_from_template** — 基于用户添加的模板文档的章节结构生成文档框架（模板优先路径）
+   参数: template_id (可选，指定参照的模板。为空时自动取第一个有章节结构的模板),
+         doc_type (目标文档类型), product_name (产品名称)
+   何时用: 用户通过「添加模板」功能上传了模板 + 在步骤4 选择"按模板生成"(选项C)时，
+           或用户明确要求"参照模板/模仿模板风格"时。
+   与 outline_from_attachment 的区别:
+   - outline_from_attachment 参照普通上传附件
+   - outline_from_template 参照专门登记的模板，生成时应同时模仿模板的写作风格
+     （短句、列表、小表格、参数化表达等），使输出文档在结构与文风上贴近模板。
+   规则: 输出与 design_outline 完全兼容，后续可直接调用 write_chapter。
+         模板无可识别章节时返回 error，Agent 应告知用户并询问是否回退到
+         outline_from_attachment 或 design_outline。
+         模板、附件、AI 自主设计三者由用户在步骤4 决定走哪条路径，不擅自调用。
+
 6. **write_chapter** — [子代理B] 调用章节编写专家，根据框架编写指定章节
    参数: chapter_name (章节名称), outline_json (完整框架JSON), doc_type (文档类型)
    何时用: 框架已确认，需要生成某章节内容时。
@@ -393,11 +488,15 @@ TOOL_RULES = """# 工具使用规则
    - 每次调用前确认该章节的大纲信息完备
    - outline_json 必须传入完整的框架 (从状态中取)
    - 并行调用时给每个章节分配一条 write_chapter
+   - 增加新章节时，chapter_name 的序号必须顺延（现有最后一章为"第X章"时，新章节为"第X+1章"），不得与现有章节序号重复
 
 7. **update_outline** — [子代理A] 根据用户指令修改文档框架
    参数: outline_json (当前框架), instruction (修改指令)
    何时用: 用户要求增删章节、调整顺序、修改标题时。
    规则: 如果只是微调一个标题，可以直接修改JSON而不调用此工具。
+   ⚠️ 章节序号必须连续递增（"第一章"→"第二章"→...），新增章节的序号必须顺延
+      （现有最后一章为"第六章"时，新章节应为"第七章"），不得与现有章节序号重复；
+      删除或插入章节后需重新连续编号。
 
 ## 直接工具 (原有)
 8. **generate_section** — 直接生成指定章节（无需框架，降级路径）
@@ -408,10 +507,28 @@ TOOL_RULES = """# 工具使用规则
 9. **revise_section** — 根据用户指令修改指定章节
    参数: section_name (章节名称), instruction (修改指令), doc_type (文档类型)
 
-10. **build_docx** — 将已生成的全部章节构建为Word文档并提供下载
-   参数: 所有参数均可省略 (doc_type, product_name, markdown 会自动从上下文获取)
-   何时用: 用户要求导出/下载文档时。无需传入参数，直接调用 build_docx() 即可。
-   规则: 调用后前端会自动弹出下载按钮，用户点击即可获取.docx文件。
+9b. **revise_paragraph** — 精确修改文档中指定章节的某个段落，不影响其他段落
+   参数: section_name (章节名称), anchor_text (段落锚定文本，10-30字即可定位目标段落),
+         instruction (修改指令), doc_type (文档类型)
+   何时用: 用户说"把第3章第2段改成..."、"风险管理那章里提到EO灭菌的那段加一句..."、
+   或需要精准修改某个段落而不想重写整章时。
+   与 revise_section 的区别: revise_section 重写整章（可能意外改动其他段落），
+   revise_paragraph 只修改锚定文本所在的段落，其余内容逐字保留。
+   规则:
+   - anchor_text 必须是目标段落中实际存在的特征性文本（10-30字），工具会搜索定位
+   - 如果锚定文本匹配不到段落，工具会返回错误并提示修正
+   - 修改后只替换目标段落，不影响其他段落和章节结构
+   - 如果不确定段落位置或需要大范围修改，优先用 revise_section
+
+10. **build_docx** — 将已生成的文档内容构建为可下载文件并提供下载
+   参数: doc_type (文档类型标识，风险总表必须显式传入), product_name/markdown (可选，自动从上下文获取)
+   何时用: 用户要求导出/下载文档时。
+   规则: 调用后前端会自动弹出下载按钮，用户点击即可获取文件。
+   ⚠️ 风险分析总表类文档必须显式传入 doc_type 参数，否则会被误判为普通 Word 文档导出：
+   - 「产品风险分析和管理总表」→ 必须调用 build_docx(doc_type="product_risk_analysis_matrix")
+   - 「网络安全风险分析和管理总表」→ 必须调用 build_docx(doc_type="cybersecurity_risk_analysis_matrix")
+   这类文档会自动导出为 Excel (.xlsx) 而非 Word——本身是 17 列两行表头的风险矩阵表格，
+   无需逐章写正文，直接按上述方式调用 build_docx 即可生成符合参考文件格式的 Excel。
 
 ## 文档精简工具
 11. **summarize_section** - 对已生成章节中的每个 ### 小节内容进行精简，用精简后内容替换原小节
@@ -428,6 +545,45 @@ TOOL_RULES = """# 工具使用规则
    参数: mode ("words"|"ratio"), target (字数int|比例float), doc_type (可选)
    何时用: 用户说"精简整个文档"、"压缩整篇文档"、"把全文缩短到 XXXX 字"时。
    规则: 内部循环调用 summarize_section 处理每章。字数模式下按章节数均分总预算。
+
+## 本地文件系统工具
+13. **list_local_directory** — 列出指定本地目录的内容（文件与子目录）
+    参数: directory_path (要列出内容的本地目录的绝对路径)
+    何时用: 用户在对话中指定了一个本地目录路径，需要查看其内容时。
+    规则:
+    - 返回条目按名称排序，目录优先于文件
+    - 每个条目包含名称、类型（文件/目录）、文件大小（仅文件）
+    - 路径必须是绝对路径，支持 ~ 展开
+
+14. **read_local_file** — 读取指定本地文件的文本内容
+    参数: file_path (要读取的本地文件绝对路径), start_line (起始行号默认0),
+          max_lines (最大行数默认500), encoding (编码默认"utf-8")
+    何时用: 用户指定了本地文件路径，需要读取其内容时。
+    规则:
+    - 支持任意文本文件（代码、文档、配置、日志等）
+    - 默认最多读取500行，超出部分截断并提示
+    - 文件大小超过10MB会拒绝读取
+    - 默认使用UTF-8编码，失败时自动尝试GBK编码
+    - 路径必须是绝对路径，支持 ~ 展开
+    - 先用 list_local_directory 浏览目录，再用此工具读取具体文件
+
+## 文档格式规范（流程图）
+生成章节内容时，凡涉及流程、步骤或逻辑关系的描述，优先用 mermaid 代码块画流程图
+（Word 导出时系统会自动把 ```mermaid 代码块渲染为图片插入正文，前端审阅页也会显示为图）：
+- 语法: 用 ```mermaid 围栏，内部使用 flowchart TD（自上而下）
+- 节点: [文本] 表示步骤，{文本} 表示判断分支，([文本]) 表示起止
+- 连接: A --> B 表示顺序，A -->|条件| B 表示带条件标签的走向
+- 节点文字用中文、简短，每张图节点数控制在 5~15 个，避免过于复杂
+- 适用场景: 工艺流程图、软件开发流程、风险管理流程、设计评审/审批流程、试验验证流程等
+- 示例:
+```mermaid
+flowchart TD
+    A([开始]) --> B{是否通过评审?}
+    B -->|是| C[进入下一阶段]
+    B -->|否| D[修改后重新评审]
+    D --> B
+    C --> E([结束])
+```
 
 ## 标准工作流
 用户说"生成XX文档"时:
@@ -464,6 +620,41 @@ TOOL_RULES = """# 工具使用规则
 - 查询结果用于回答问题，必要时可结合 search_kb 补充标准条款原文
 
 工具调用过程对用户可见——用户会看到"正在检索知识库..."的提示。
+
+## PostgreSQL 数据库查询（用户自有业务库）
+当用户明确提到"PostgreSQL 数据库"、"PG 库"或要求查询其自有业务数据时，
+使用 pgsql_* 工具（与内置 SQLite 领域库是两套独立库）：
+- 何时用: 用户要求查询其配置的 PostgreSQL 库中的业务数据时。
+- 何时不用: 贴敷式胰岛素泵领域数据（产品/标准/材料等）用 sql_db_* 查内置 SQLite。
+
+查询顺序（与 sql_db 相同）:
+1. **pgsql_list_tables** — 查看 PG 库有哪些表
+2. **pgsql_schema** — 查看目标表的列名与示例数据
+3. **pgsql_query** — 编写 SELECT 查询执行
+
+规则:
+- PG 库同样只读：禁止任何 INSERT/UPDATE/DELETE/DROP 写操作（工具会拒绝）
+- 查询务必用 LIMIT 控制行数（工具最多返回 50 行，超时 10 秒）
+- 若报"表/列不存在"，先用 pgsql_schema 确认真实表名和列名再重写查询
+- 若 PG 未启用（返回"未启用"提示），告知用户需在 .env 配置 PGSQL_* 连接信息
+
+## 计算/统计工具（验证/测试报告、可靠性文档必用）
+这些工具做**真实数值计算**，用于取代 LLM 凭空编造的测试数据。生成验证/测试方案、验证/测试报告、
+可靠性文档时，凡涉及可量化数值，都应调用对应工具得到可追溯的结果，并把公式与结果写进文档。
+
+- **calculate_sample_size** — 样本量计算（估计均值 / 估计比例 / 两样本比较）
+  何时用: 文档需说明"样本量如何确定"（如输注精度测多少个样品、加速老化测多少个批次）。
+- **calculate_process_capability** — 过程能力 Cp/Cpk
+  何时用: 评估关键质量特性（输注精度、关键尺寸）的过程能力，需给定 USL/LSL 和实测数据。
+- **calculate_reliability** — 可靠性（MTBF / Arrhenius 加速老化 / 可靠度 R(t)）
+  何时用: 可靠性文档、加速老化验证、有效期评估需要 MTBF、加速因子、可靠度时。
+- **calculate_statistics** — 描述统计 / 两样本 t 检验
+  何时用: 汇总一组测量数据的均值/标准差/置信区间，或比较两组测试数据差异是否显著。
+
+规则:
+- 测量数据用逗号/空格/分号分隔的字符串传入（如 "12.3, 12.5, 12.4"），不要传入非数字文本
+- 不要凭空编写测试数据或统计结论——要么调用工具计算，要么引用知识库/附件中的真实数据
+- 工具返回含公式与代入值，写文档时保留计算依据（公式 + 关键参数），便于评审追溯
 """
 
 # ── Section 4: 回复风格 ──
@@ -480,13 +671,65 @@ REPLY_STYLE = """# 回复风格
 - 不要在回复中逐条重复列出所有已确认的策划内容项 (可在需要时引用关键项)
 - 提供建议值时给出依据 (来自哪个标准、条款号)，并说明适用条件和取值逻辑
 - 不确定的事情明确说"需要进一步查证"，不编造
+- 不得在未调用工具（如 build_docx / modify_attachment / enrich_attachment / summarize_attachment）的情况下，
+  在回复中声称"文档已生成/已下载/请点击下载"或伪造文件名、下载链接
 - 使用中文回复 (标准号和必要缩写除外)
 """
 
 
 # ── System Prompt 构建函数 ──
 
-def build_system_prompt(state: AgentState) -> str:
+def _infer_folder_name(folder_files: list) -> str:
+    """从文件夹文件的相对路径推断根文件夹名"""
+    if not folder_files:
+        return "未命名文件夹"
+    paths = [f.get("relative_path", "").replace("\\", "/").lstrip("/") for f in folder_files]
+    if not paths:
+        return "未命名文件夹"
+    parts = paths[0].split("/")
+    return parts[0] if len(parts) > 1 else "未命名文件夹"
+
+
+def _build_directory_tree(folder_files: list) -> dict:
+    """将文件列表构建为嵌套字典目录树"""
+    tree = {}
+    for f in folder_files:
+        rp = f.get("relative_path", f.get("filename", "?"))
+        parts = rp.replace("\\", "/").split("/")
+        node = tree
+        for part in parts[:-1]:
+            if part not in node:
+                node[part] = {}
+            node = node[part]
+        filename = parts[-1]
+        node[filename] = {
+            "chars": f.get("char_count", 0),
+            "has_text": bool(f.get("full_text")),
+        }
+    return tree
+
+
+def _render_tree(tree: dict, indent: str = "") -> str:
+    """将嵌套字典目录树渲染为 ASCII 树形字符串"""
+    lines = []
+    # 目录优先，同类按名称排序（不区分大小写）
+    items = sorted(tree.items(), key=lambda x: (0 if (isinstance(x[1], dict) and "chars" not in x[1]) else 1, x[0].lower()))
+    for i, (name, value) in enumerate(items):
+        is_last = (i == len(items) - 1)
+        prefix = "└── " if is_last else "├── "
+        if isinstance(value, dict) and "chars" not in value:
+            lines.append(f"{indent}{prefix}{name}/")
+            sub_indent = indent + ("    " if is_last else "│   ")
+            lines.append(_render_tree(value, sub_indent))
+        else:
+            size = value.get("chars", 0) if isinstance(value, dict) else 0
+            has_text = value.get("has_text", True) if isinstance(value, dict) else True
+            marker = "" if has_text else " [二进制]"
+            lines.append(f"{indent}{prefix}{name} ({size} 字符{marker})")
+    return "\n".join(lines)
+
+
+def build_system_prompt(state: AgentState, memory_context: str = "") -> str:
     """根据当前状态构建完整的Agent System Prompt
 
     对应PRD Section 6.1的5段结构:
@@ -495,6 +738,7 @@ def build_system_prompt(state: AgentState) -> str:
 
     Args:
         state: 当前Agent状态
+        memory_context: Phase 3 recall 自动注入的 OpenViking 记忆上下文（可选）
 
     Returns:
         完整的System Prompt字符串
@@ -506,15 +750,151 @@ def build_system_prompt(state: AgentState) -> str:
     # 附件全文直接注入（不做结构处理，完整内容给大模型）
     attachments = state.get("attachments", [])
     attachment_info = ""
-    if attachments:
-        filenames = [a.get("filename", "?") for a in attachments]
-        total_chars = sum(a.get("char_count", 0) for a in attachments)
-        attachment_info = f"\n## 用户已上传附件\n{len(attachments)} 个文件, 共 {total_chars} 字符: {', '.join(filenames)}\n"
-        for i, att in enumerate(attachments):
+
+    # 分离文件夹文件（有 relative_path）和普通文件
+    folder_files = [a for a in attachments if a.get("relative_path")]
+    regular_files = [a for a in attachments if not a.get("relative_path")]
+
+    if regular_files:
+        filenames = [a.get("filename", "?") for a in regular_files]
+        total_chars = sum(a.get("char_count", 0) for a in regular_files)
+        attachment_info = f"\n## 用户已上传附件\n{len(regular_files)} 个文件, 共 {total_chars} 字符: {', '.join(filenames)}\n"
+        for i, att in enumerate(regular_files):
             full_text = att.get("full_text", "")
             if full_text:
-                attachment_info += f"\n### 附件 {i+1}: {att.get('filename', '?')}\n\n{full_text}\n"
-        attachment_info += "\n以上附件全文已提供，可直接引用分析。\n"
+                attachment_info += (
+                    f"\n### 附件 {i+1}: {att.get('filename', '?')}"
+                    f"（file_id: {att.get('file_id', '')}）\n\n{full_text}\n"
+                )
+        attachment_info += "\n以上附件全文已提供，可直接引用分析。"
+        attachment_info += "调用 analyze_document_structure/outline_from_attachment/modify_attachment 时，"
+        attachment_info += "必须使用上方标注的 file_id，不得自行编造。\n"
+
+    if folder_files:
+        SMALL_FILE_THRESHOLD = 5000
+        small_files = [f for f in folder_files
+                       if f.get("full_text") and len(f.get("full_text", "")) <= SMALL_FILE_THRESHOLD]
+        large_files = [f for f in folder_files
+                       if f.get("full_text") and len(f.get("full_text", "")) > SMALL_FILE_THRESHOLD]
+        binary_files = [f for f in folder_files if not f.get("full_text")]
+
+        folder_name = _infer_folder_name(folder_files)
+        tree_str = _render_tree(_build_directory_tree(folder_files))
+        total_chars = sum(f.get("char_count", 0) for f in folder_files)
+
+        folder_info = (
+            f"\n## 用户已上传文件夹: {folder_name}\n"
+            f"{len(folder_files)} 个文件, 共 {total_chars} 字符\n"
+            f"（{len(small_files)} 个小文件全文已附上，{len(large_files)} 个大文件需通过工具访问）\n"
+            f"\n### 目录结构\n```\n{tree_str}\n```\n"
+        )
+
+        if small_files:
+            folder_info += "\n### 小文件全文（可直接引用）\n"
+            for f in small_files:
+                rp = f.get("relative_path", f.get("filename", "?"))
+                fid = f.get("file_id", "")
+                content = f.get("full_text", "")
+                folder_info += (
+                    f"\n#### {rp}（file_id: {fid}）\n\n"
+                    f"```\n{content}\n```\n"
+                )
+
+        if large_files:
+            folder_info += (
+                f"\n### 大文件（{len(large_files)} 个，需通过工具访问）\n"
+                f"以下文件因内容较大未直接注入。请使用 read_folder_file 工具按需读取:\n"
+            )
+            for f in large_files:
+                rp = f.get("relative_path", f.get("filename", "?"))
+                folder_info += f"- `{rp}` ({f.get('char_count', 0)} 字符, file_id: {f.get('file_id', '')})\n"
+
+        if binary_files:
+            folder_info += (
+                f"\n### 二进制/非文本文件（{len(binary_files)} 个）\n"
+            )
+            for f in binary_files:
+                rp = f.get("relative_path", f.get("filename", "?"))
+                folder_info += f"- `{rp}`\n"
+
+        folder_info += (
+            "\n> 提示: 使用 search_attachment 在整个文件夹中搜索关键词，"
+            "使用 read_folder_file 读取特定文件的完整内容。"
+            "调用 analyze_document_structure 或 modify_attachment 时，"
+            "必须使用 file_id，而非 relative_path。\n"
+        )
+        attachment_info += folder_info
+
+    # 模板全文注入（添加模板功能）：用户登记的文档风格/结构参照，生成时须模仿
+    templates = state.get("templates", [])
+    template_info = ""
+    if templates:
+        names = [t.get("name") or t.get("filename", "?") for t in templates]
+        template_info = (
+            f"\n## 用户已添加模板（文档风格参照，最高优先级！）\n"
+            f"{len(templates)} 个模板: {', '.join(names)}\n"
+            f"**强制规则**：用户上传模板即表示希望文档风格贴近模板。"
+            f"在生成任何文档内容时，你必须自动模仿模板的章节结构、层级、措辞语气和写作风格，"
+            f"无需等待用户再次强调。即使对话中用户没有明确提及模板，也要默认按模板风格生成。\n"
+        )
+        for i, tpl in enumerate(templates):
+            doc_type_key = tpl.get("doc_type") or ""
+            doc_type = DOC_TYPE_LABELS.get(doc_type_key, doc_type_key or "未指定")
+            preview = (tpl.get("preview") or "").strip()
+            template_info += (
+                f"\n### 模板 {i+1}: {tpl.get('name') or tpl.get('filename', '?')}"
+                f"（template_id: {tpl.get('template_id', '')}，文档类型: {doc_type}）\n"
+            )
+            if preview:
+                template_info += f"\n内容预览:\n{preview}\n"
+            if tpl.get("toc"):
+                template_info += f"\n目录（章节结构）:\n{tpl['toc']}\n"
+        template_info += (
+            "\n**自动执行规则（无需用户确认）**：\n"
+            "1. 在步骤4 生成文档时，默认使用 outline_from_template 按模板设计框架，"
+            "无需询问用户是否使用模板——用户上传模板即表示同意使用。\n"
+            "2. 设计框架和编写章节时，自动严格模仿模板的章节结构、层级与写作风格"
+            "（短句、列表、小表格、参数化表达等）。\n"
+            "3. 调用 outline_from_template 时必须使用上方标注的 template_id，不得自行编造；"
+            "模板与附件是两个独立列表，模板用 template_id、附件用 file_id，切勿混用。\n"
+            "4. 即使 write_chapter / generate_section 中没有显式提及模板，"
+            "系统也会自动注入模板风格提示——你只需正常调用工具即可。\n"
+        )
+
+    # 内置默认模板说明：验证/测试类文档（报告或方案）或风险管理计划，未上传用户模板时以默认模板为风格参照
+    default_template_note = ""
+    current_doc_type = state.get("doc_type", "")
+    if current_doc_type and not templates:
+        label = get_default_template_label(current_doc_type)
+        if is_validation_test_doc(current_doc_type):
+            if is_validation_test_plan(current_doc_type):
+                # 方案类：表格为「测试项目 | 接收准则」，无测试结果/结论列
+                table_style = "短句、列表、小表格（测试项目 | 接收准则）的参数化表达"
+                doc_kind = "验证/测试方案"
+            else:
+                # 报告类：表格为「测试项目 | 接收准则 | 测试结果 | 测试结论」
+                table_style = "短句、列表、小表格（测试项目 | 接收准则 | 测试结果 | 测试结论）的参数化表达"
+                doc_kind = "验证/测试报告"
+            default_template_note = (
+                f"\n## 默认模板风格参照（{doc_kind}类文档）\n"
+                f"当前文档类型为{doc_kind}类，且用户未上传自定义模板。"
+                f"系统将以内置{label}为默认风格参照，生成时模仿其写作风格：\n"
+                "- 章节结构：概述（测试目的/范围/人员/时间）→ 配置（样品/设备/环境）→ 测试项 → 测试结论\n"
+                f"- {table_style}\n"
+                "- 措辞语气、术语表达与编号方式\n"
+                "若用户后续上传了模板，则自动改为优先参照用户模板。\n"
+            )
+        elif is_risk_management_plan(current_doc_type):
+            default_template_note = (
+                "\n## 默认模板风格参照（风险管理计划类文档）\n"
+                f"当前文档类型为风险管理计划，且用户未上传自定义模板。"
+                f"系统将以内置{label}为默认风格参照，生成时模仿其写作风格：\n"
+                "- 章节结构：风险管理的范围（产品概述/预期用途/寿命周期阶段）→ 人员和职责 → 风险管理活动及评审要求 → 验证活动 → 上市后风险管理 → 风险可接受性准则\n"
+                "- 表格化表达：参与人员及职责表、风险管理活动表、阶段输出及评审要求表、严重度S分级表、发生概率O分级表、风险可接受准则矩阵\n"
+                "- 风险可接受准则：R = S × O，R≤4 广泛可接受(ACC)、4<R<10 合理可行降低(ALARP)、R≥10 不可接受(NACC)\n"
+                "- 措辞语气、术语表达（YY/T 0316 / ISO 14971 术语）与编号方式\n"
+                "若用户后续上传了模板，则自动改为优先参照用户模板。\n"
+            )
 
     state_section = f"""# 当前会话状态
 
@@ -524,6 +904,8 @@ def build_system_prompt(state: AgentState) -> str:
 {snapshot_json}
 ```
 {attachment_info}
+{template_info}
+{default_template_note}
 状态字段说明:
 - status 取值: "not_started" | "in_progress" | "confirmed" | "partial" | "completed"
 - unresolved_items: 用户跳过或待补充的项目
@@ -556,9 +938,14 @@ def build_system_prompt(state: AgentState) -> str:
 """
 
     # 组装完整Prompt
+    # Phase 3 recall: memory_context 由 _agent_node 在调用前从 OpenViking 自动检索，
+    # 包含跨会话相关的历史记忆（设计决策、文档结构、用户偏好等）。
+    memory_section = (memory_context + "\n") if memory_context else ""
+
     return (
         ROLE_DEFINITION + "\n"
         + DOMAIN_PRIMING + "\n"
+        + memory_section
         + SOP_KNOWLEDGE + "\n"
         + TOOL_RULES + "\n"
         + REPLY_STYLE + "\n"

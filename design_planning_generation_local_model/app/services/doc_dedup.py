@@ -68,8 +68,17 @@ def _similarity(a: str, b: str) -> float:
 def _filter_redundant_lines(content: str) -> str:
     """过滤冗余前缀行与独立冗余行"""
     out = []
+    in_fence = False
     for line in content.split('\n'):
         s = line.strip()
+        # 围栏代码块（mermaid / 普通代码）整体保留，避免误删围栏内行
+        if s.startswith('```'):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            continue
         if not s:
             out.append(line)
             continue
@@ -94,8 +103,19 @@ def _remove_duplicate_lines(content: str) -> str:
     seen_exact: dict = {}     # normalized -> None（精确匹配集合）
     seen_by_len: dict = {}    # 长度桶 -> [normalized, ...]（近似匹配候选，仅非列表项）
     out = []
+    in_fence = False
     for line in content.split('\n'):
         s = line.strip()
+        # 围栏代码块（mermaid / 普通代码）整体保留，不去重：
+        # 否则第二个 ```mermaid 围栏及其内部与首块重复的行（如 flowchart TD）
+        # 会被当作重复正文行删除，导致围栏结构被破坏、后续内容被吞入孤立代码块
+        if s.startswith('```'):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            continue
         if (not s
                 or _is_heading(line)
                 or _is_table_line(line)

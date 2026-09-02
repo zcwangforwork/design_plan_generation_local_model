@@ -13,6 +13,8 @@ import os
 import time
 import asyncio
 import contextvars
+import math
+import statistics
 from langchain_core.tools import tool
 
 # 跨工具共享: _after_tools_node 写入, build_docx 读取
@@ -32,6 +34,11 @@ _current_attachments: contextvars.ContextVar[list[dict]] = contextvars.ContextVa
     'attachments', default=[]
 )
 
+# 模板上下文（添加模板功能）：存储用户添加的模板文档列表，供 outline_from_template 读取
+_current_templates: contextvars.ContextVar[list[dict]] = contextvars.ContextVar(
+    'templates', default=[]
+)
+
 # 产品画像上下文（供 generate_search_query 等工具读取）
 _current_product_classification: contextvars.ContextVar[str] = contextvars.ContextVar(
     'product_classification', default=''
@@ -41,6 +48,11 @@ _current_product_intended_use: contextvars.ContextVar[str] = contextvars.Context
 )
 _current_confirmed_standards: contextvars.ContextVar[list] = contextvars.ContextVar(
     'confirmed_standards', default=[]
+)
+
+# 补充提示词上下文：累积的用户补充要求，追加到文档生成提示词末尾
+_current_supplementary_prompts: contextvars.ContextVar[str] = contextvars.ContextVar(
+    'supplementary_prompts', default=''
 )
 
 # write_chapter 完整内容旁路: 工具返回简短摘要，完整内容通过此字典
@@ -67,6 +79,7 @@ def set_current_doc_context(
     product_classification: str = '',
     product_intended_use: str = '',
     confirmed_standards: list = None,
+    supplementary_prompts: str = '',
 ) -> None:
     """由 agent_engine 在每轮开始前调用，同步当前文档上下文"""
     _current_doc_type.set(doc_type)
@@ -75,11 +88,29 @@ def set_current_doc_context(
     _current_product_classification.set(product_classification or '')
     _current_product_intended_use.set(product_intended_use or '')
     _current_confirmed_standards.set(confirmed_standards or [])
+    _current_supplementary_prompts.set(supplementary_prompts or '')
 
 
 def set_current_attachments(attachments: list[dict]) -> None:
     """由 agent_engine 在每轮开始前调用，同步当前附件列表"""
     _current_attachments.set(attachments or [])
+
+
+def set_current_templates(templates: list[dict]) -> None:
+    """由 agent_engine 在每轮开始前调用，同步当前模板列表"""
+    _current_templates.set(templates or [])
+
+
+def _attachments_hint(attachments: list[dict]) -> str:
+    """生成可用附件清单（file_id + filename），供 not_found 错误提示 LLM 用正确 id 重试"""
+    return ", ".join(f"{a.get('file_id')} ({a.get('filename', '?')})" for a in attachments) or "（无）"
+
+
+def _templates_hint(templates: list[dict]) -> str:
+    """生成可用模板清单（template_id + name），供 not_found 错误提示 LLM 用正确 id 重试"""
+    return ", ".join(
+        f"{t.get('template_id')} ({t.get('name') or t.get('filename', '?')})" for t in templates
+    ) or "（无）"
 
 
 def get_pending_chapter_content(chapter_name: str) -> dict:
@@ -102,6 +133,21 @@ def _regulation_clause_rule(doc_type: str) -> str:
     return "- 所有标准条款引用必须有明确的条款号\n"
 
 
+# 表格格式强制规则：统一使用 Markdown 管道表格，禁止输出 HTML <table> 标签
+_TABLE_FORMAT_RULE = (
+    "- 表格必须使用 Markdown 管道表格语法（表头行如 `| 列1 | 列2 |`，"
+    "下一行用 `| --- | --- |` 分隔），禁止输出 HTML 的 <table>/<tr>/<td> 标签\n"
+)
+
+# 缺失表格补充规则：识别并补全文档中"应有表格却缺失"的位置
+_MISSING_TABLE_RULE = (
+    "- 识别并补全文档中\"应有表格却缺失\"的位置：当文中出现\"见表X\"、\"如下表所示\"、"
+    "\"下表\"、\"以下表格\"、\"参数如下\"、\"技术要求如下\"等表格引用，或内容明显适合用表格"
+    "呈现（如参数清单、阶段/资源/时间安排、检验项目、指标对比等）但当前没有表格时，"
+    "必须按上下文补全一个合理的 Markdown 管道表格（含表头、分隔行、至少2-3行数据）\n"
+)
+
+
 def _output_structure_requirement(doc_type: str, is_revision: bool = False) -> str:
     """输出结构要求：项目计划书类文档不引用法规条款/合规要点，其余文档保持法规导向结构。"""
     if doc_type in _PLAN_DOC_TYPES:
@@ -121,6 +167,22 @@ def _output_structure_requirement(doc_type: str, is_revision: bool = False) -> s
         f"2. 然后逐个详细阐述每个关键要求（每个要求至少200字，包含法规条款原文引用、产品参数映射、实施建议）\n"
         f"3. 如涉及数据/参数对比，以表格形式呈现（至少3列）\n"
         f"4. 最后用1段总结本节的合规要点和与贴敷式胰岛素泵的关联性"
+    )
+
+
+def _supplementary_block() -> str:
+    """返回累积的用户补充提示词块，追加到各文档生成工具 system_prompt 末尾。
+
+    纯附加（appended）——只在原有提示词之后追加，不修改、不覆盖原有提示词。
+    无补充提示词时返回空字符串，不影响原有提示词结构。
+    """
+    prompts = _current_supplementary_prompts.get()
+    if not prompts or not prompts.strip():
+        return ""
+    return (
+        f"\n\n"
+        f"## 补充提示词（用户额外要求，必须遵守，且优先于上述默认规则）\n"
+        f"{prompts.strip()}\n"
     )
 
 
@@ -197,7 +259,7 @@ def _build_covered_digest(exclude_chapter: str) -> str:
 # ── Tool 1: search_kb ──
 
 @tool
-async def search_kb(query: str, top_k: int = 10, use_rerank: bool = True) -> str:
+async def search_kb(query: str, top_k: int = 15, use_rerank: bool = True) -> str:
     """检索贴敷式胰岛素泵知识库 (标准、法规、技术文档、测试报告等)。
 
     同时检索两个 collection 并合并结果:
@@ -209,7 +271,7 @@ async def search_kb(query: str, top_k: int = 10, use_rerank: bool = True) -> str
 
     Args:
         query: 搜索查询关键词。应为具体的标准号、参数名或技术问题。
-        top_k: 返回结果数量，默认10条。
+        top_k: 返回结果数量，默认15条。
         use_rerank: 是否启用Cross-Encoder精排（默认开启，提升精确率）。
                     两阶段检索：粗召回40条→BGE-Reranker精排→Top-K。
                     注：精排仅作用于主知识库；uploads 集合较小，直接向量检索即可。
@@ -228,7 +290,7 @@ async def search_kb(query: str, top_k: int = 10, use_rerank: bool = True) -> str
                 return store.retrieve_and_rerank(
                     query=query,
                     top_k=top_k,
-                    candidate_pool_size=40,
+                    candidate_pool_size=50,
                     vector_weight=0.85,
                 )
             else:
@@ -255,8 +317,8 @@ async def search_kb(query: str, top_k: int = 10, use_rerank: bool = True) -> str
                 if count == 0:
                     return []
                 query_embedding = store.embedder.encode_single(query)
-                # uploads 集合较小，给主库让出 top_k 半数配额，避免 uploads 占满结果
-                uploads_n = max(top_k // 2, 3)
+                # uploads 集合独立检索，给予与主库同等的配额
+                uploads_n = max(top_k, 5)
                 raw = store.collection.query(
                     query_embeddings=[query_embedding],
                     n_results=uploads_n,
@@ -375,7 +437,7 @@ async def search_kb(query: str, top_k: int = 10, use_rerank: bool = True) -> str
                 continue
             seen.add(key)
             unique.append(r)
-            if len(unique) >= top_k:
+            if len(unique) >= top_k * 2:
                 break
 
         # 格式化输出
@@ -584,7 +646,7 @@ async def generate_search_query(
 # ── Tool 1b: search_attachment ──
 
 @tool
-async def search_attachment(query: str, top_k: int = 5) -> str:
+async def search_attachment(query: str, top_k: int = 10) -> str:
     """搜索用户上传的附件内容。当需要查找用户上传文件中的具体信息时使用此工具。
 
     适用场景: 用户上传了PDF/Word/Excel等参考文档，需要从中提取特定信息。
@@ -592,7 +654,7 @@ async def search_attachment(query: str, top_k: int = 5) -> str:
 
     Args:
         query: 搜索查询。应包含具体关键词或问题。
-        top_k: 返回结果数量，默认5条。
+        top_k: 返回结果数量，默认10条。
 
     Returns:
         JSON格式的搜索结果，每项包含匹配的文本片段、来源文件名和相关度评分。
@@ -709,6 +771,110 @@ async def search_attachment(query: str, top_k: int = 5) -> str:
     }, ensure_ascii=False)
 
 
+# ── Tool: search_template ──
+
+@tool
+async def search_template(query: str, top_k: int = 5) -> str:
+    """搜索用户添加的模板文档内容（模板是通过「添加模板」登记的结构/风格参照文档）。
+
+    与 search_attachment 的区别:
+    - search_attachment 搜索普通上传附件
+    - search_template 搜索用户登记的模板文档（含章节结构目录、内容预览）
+
+    适用场景: 用户提到某个模板（如"参照KF-GS1模板的章节结构"）并需要查找该模板内容时。
+
+    Args:
+        query: 搜索查询，可包含模板名或关键词。
+        top_k: 返回结果数量，默认5条。
+
+    Returns:
+        JSON格式的搜索结果，含匹配文本片段、来源模板名、template_id 和相关度评分。
+    """
+    import re as _re
+    templates = _current_templates.get()
+    if not templates:
+        return json.dumps({
+            "status": "no_templates",
+            "message": "当前项目没有添加模板。请提示用户先通过「添加模板」上传参考文档，"
+                       "或改用 search_attachment / search_kb。",
+            "results": [],
+        }, ensure_ascii=False)
+
+    query_lower = query.lower()
+    query_terms = query_lower.split()
+    all_matches = []
+
+    for tpl in templates:
+        name = tpl.get("name") or tpl.get("filename", "?")
+        template_id = tpl.get("template_id", "")
+        full_text = tpl.get("full_text", "")
+
+        # 目录（章节结构）视为高价值命中对象，单独作为一条结果，便于 LLM 直接拿到结构
+        toc = (tpl.get("toc") or "").strip()
+        if toc:
+            name_hit = name and name.lower() in query_lower
+            all_matches.append({
+                "content": toc,
+                "source": name,
+                "template_id": template_id,
+                "kind": "目录(章节结构)",
+                "score": 1.0 if name_hit or query_lower in toc.lower() else 0.3,
+            })
+
+        # 正文 TF 匹配
+        if full_text:
+            paragraphs = _re.split(r'\n\s*\n', full_text)
+            if len(paragraphs) < 2:
+                paragraphs = _re.split(r'(?<=[。！？.!?])\s*', full_text)
+            for para in paragraphs:
+                para = para.strip()
+                if len(para) < 10:
+                    continue
+                para_lower = para.lower()
+                score = 0
+                for term in query_terms:
+                    count = para_lower.count(term)
+                    if count > 0:
+                        score += count * (1.0 / len(query_terms))
+                if query_lower in para_lower:
+                    score += 2.0
+                if score > 0:
+                    all_matches.append({
+                        "content": para,
+                        "source": name,
+                        "template_id": template_id,
+                        "kind": "正文",
+                        "score": round(min(score / 3.0, 1.0), 3),
+                    })
+
+    if not all_matches:
+        return json.dumps({
+            "status": "no_match",
+            "message": f"在已添加的{len(templates)}个模板中未找到与\"{query}\"相关的内容。"
+                       f"可用模板: {_templates_hint(templates)}。",
+            "results": [],
+        }, ensure_ascii=False)
+
+    all_matches.sort(key=lambda x: x["score"], reverse=True)
+    seen = set()
+    unique = []
+    for m in all_matches:
+        key = m["content"][:100]
+        if key not in seen:
+            seen.add(key)
+            unique.append(m)
+        if len(unique) >= top_k:
+            break
+
+    return json.dumps({
+        "status": "ok",
+        "query": query,
+        "count": len(unique),
+        "source": "template_text",
+        "results": unique,
+    }, ensure_ascii=False)
+
+
 # ── Tool: modify_attachment ──
 # 根据用户指令修改上传附件的内容。短文档单遍改写，长文档按章节分段改写
 # （先识别受影响章节，再逐段改写，避免无关章节被 LLM 顺手改动）。
@@ -717,6 +883,131 @@ async def search_attachment(query: str, top_k: int = 5) -> str:
 _MODIFY_SINGLE_PASS_LIMIT = 6000
 # 修改要点标记：标记行之前为文档正文，之后为修改要点
 _MODIFY_SUMMARY_MARKER = "@@CHANGES@@"
+
+
+# ── 段落级手术（docx 编辑指令）──────────────────────────────────────────
+# 当附件保留了原 .docx 文件时，修改/精简/补全不再让 LLM 重写全文，
+# 而是输出「基于原文档块清单的编辑指令 JSON」，由 docx_edit.apply_edit_ops
+# 在原 docx 上执行，未涉及的段落/表格样式原样保留。
+_DOCX_EDIT_MAX_INVENTORY_CHARS = 30000  # 块清单字符上限，超过则退回全文重写
+
+
+def _can_use_docx_edit(target: dict) -> bool:
+    """判断附件是否可用段落级手术：有原 .docx 路径且文件存在。"""
+    p = target.get("original_path", "")
+    return bool(p) and p.lower().endswith(".docx") and os.path.isfile(p)
+
+
+async def _build_docx_inventory(original_path: str) -> str:
+    """异步读取原 docx 的块清单文本（IO 放线程池）。"""
+    from app.services.docx_edit import inventory_text_from_path
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(inventory_text_from_path, original_path), timeout=60.0
+        )
+    except Exception:
+        return ""
+
+
+def _parse_edit_ops(resp: str) -> tuple:
+    """解析 LLM 输出的编辑指令 JSON，返回 (ops, summary)。容错：提取首个 JSON 对象。"""
+    import re as _re
+    if not resp:
+        return [], ""
+    s = resp.strip()
+    if s.startswith("```"):
+        s = _re.sub(r"^```[a-zA-Z]*\s*", "", s)
+        s = _re.sub(r"\s*```$", "", s)
+    idx = s.find("{")
+    end = s.rfind("}")
+    if idx == -1 or end <= idx:
+        return [], ""
+    try:
+        data = json.loads(s[idx:end + 1])
+    except Exception:
+        return [], ""
+    ops = data.get("ops", [])
+    if not isinstance(ops, list):
+        ops = []
+    return ops, data.get("summary", "")
+
+
+def _ops_modified_chars(ops: list) -> int:
+    """粗略估算编辑指令产生的字符量（replace/insert 的 text 长度之和）。"""
+    return sum(len(o.get("text", "")) for o in ops if isinstance(o, dict) and o.get("text"))
+
+
+async def _llm_summarize_ops(inventory_text: str) -> tuple:
+    """让 LLM 基于块清单输出「精简」编辑指令。返回 (ops, summary)。"""
+    system_prompt = (
+        "你是一位专业的文档精简专家。下面是一份 Word 文档的「块清单」，每块以 [序号] 开头，"
+        "标题块、正文块、[表格] 块按文档顺序编号。\n"
+        "请判断哪些块需要精简，输出编辑指令 JSON，格式：\n"
+        '{"ops": [...], "summary": "精简要点（一句话）"}\n'
+        "指令类型：\n"
+        '- {"op":"delete","block":N}  删除第 N 块（冗余段落、铺垫、过渡句、重复表述）\n'
+        '- {"op":"replace","block":N,"text":"压缩后的文字"}  把第 N 块压缩为更精炼文字（保留核心观点、法规条款号、技术参数）\n'
+        "规则：\n"
+        "- [表格] 块只能 delete 或保留，不得 replace、不得 insert\n"
+        "- 标题块尽量保留，不删除\n"
+        "- 意思不变：保留核心观点、结论、法规条款号、技术参数，不编造、不篡改\n"
+        "- 涉及法规/标准的过程性、描述性语言直接精简为结论\n"
+        "- replace 的 text 为单段文字（不含换行）\n"
+        "- 不需要改动的块不要出现在 ops 里\n"
+        "- 严格输出 JSON，不要输出任何其他内容\n"
+    )
+    user_prompt = f"请精简这份文档（保留核心要点）：\n\n块清单:\n{inventory_text}"
+    response = await _llm_rewrite(system_prompt, user_prompt)
+    return _parse_edit_ops(response)
+
+
+async def _llm_modify_ops(instruction: str, inventory_text: str) -> tuple:
+    """让 LLM 基于块清单输出「修改」编辑指令。返回 (ops, summary)。"""
+    system_prompt = (
+        "你是一位专业的文档改写专家。下面是一份 Word 文档的「块清单」，每块以 [序号] 开头，"
+        "标题块、正文块、[表格] 块按文档顺序编号。\n"
+        "请根据用户修改指令，输出编辑指令 JSON，格式：\n"
+        '{"ops": [...], "summary": "修改要点（一句话）"}\n'
+        "指令类型：\n"
+        '- {"op":"replace","block":N,"text":"修改后的文字"}  替换第 N 块文字（保留块样式）\n'
+        '- {"op":"insert_after","block":N,"text":"新增段落文字"}  在第 N 块之后插入新段落\n'
+        '- {"op":"delete","block":N}  删除第 N 块\n'
+        "规则：\n"
+        "- 严格按用户指令修改；指令未涉及的块不要出现在 ops 里，保持原样\n"
+        "- [表格] 块只能 delete 或保留，不得 replace、不得 insert\n"
+        "- 标题块尽量保留，不删除\n"
+        "- 技术参数要具体、可测量；用中文表述（标准号和必要缩写除外）\n"
+        "- replace/insert 的 text 为单段文字（不含换行）\n"
+        "- 严格输出 JSON，不要输出任何其他内容\n"
+    )
+    user_prompt = f"修改指令: {instruction}\n\n块清单:\n{inventory_text}"
+    response = await _llm_rewrite(system_prompt, user_prompt)
+    return _parse_edit_ops(response)
+
+
+async def _llm_enrich_ops(instruction: str, inventory_text: str) -> tuple:
+    """让 LLM 基于块清单输出「补全」编辑指令。返回 (ops, summary)。"""
+    system_prompt = (
+        "你是一位专业的文档内容补全专家。下面是一份 Word 文档的「块清单」，每块以 [序号] 开头，"
+        "标题块、正文块、[表格] 块按文档顺序编号。\n"
+        "请判断哪些块内容简略、单薄、缺少细节，输出补全编辑指令 JSON，格式：\n"
+        '{"ops": [...], "summary": "补全要点（一句话）"}\n'
+        "指令类型：\n"
+        '- {"op":"replace","block":N,"text":"扩写后的文字"}  把第 N 块扩写补充得更详细（保留块样式）\n'
+        '- {"op":"insert_after","block":N,"text":"新增段落文字"}  在第 N 块之后补充新段落\n'
+        "规则：\n"
+        "- 不得删除、篡改或替换已有内容，只能扩写补充（replace 时原文要点必须保留并扩展）\n"
+        "- [表格] 块只能 delete 或保留，不得 replace、不得 insert\n"
+        "- 内容已足够详实的块不要出现在 ops 里\n"
+        "- 补充内容与原文主题一致，不引入新主题\n"
+        "- replace/insert 的 text 为单段文字（不含换行）\n"
+        "- 严格输出 JSON，不要输出任何其他内容\n"
+    )
+    user_prompt = f"请把这份文档内容补充得更完整：\n\n块清单:\n{inventory_text}"
+    if instruction and instruction.strip():
+        user_prompt += f"\n\n补充重点：{instruction.strip()}"
+    response = await _llm_rewrite(system_prompt, user_prompt)
+    return _parse_edit_ops(response)
 
 
 async def _llm_rewrite(system_prompt: str, user_prompt: str, timeout: float = 180.0) -> str:
@@ -803,7 +1094,9 @@ async def _rewrite_single_pass(full_text: str, instruction: str) -> tuple[str, s
         "要求:\n"
         "- 严格按用户指令修改；指令未涉及的部分保持原样，不得擅自增删\n"
         "- 保持原有的Markdown格式和标题层级\n"
-        "- 技术参数要具体、可测量\n"
+        + _TABLE_FORMAT_RULE
+        + _MISSING_TABLE_RULE
+        + "- 技术参数要具体、可测量\n"
         "- 用中文表述（标准号和必要缩写除外）\n"
         f"- 在文档正文结束后空一行，输出标记行 `{_MODIFY_SUMMARY_MARKER}`，"
         "标记行之后逐条列出本次修改要点（每条一行，以-开头）\n"
@@ -849,7 +1142,9 @@ async def _rewrite_section_wise(full_text: str, instruction: str) -> tuple[str, 
             "要求:\n"
             "- 严格按指令修改本节；指令与本节点内容无关时，原样输出本节内容，不要改动\n"
             "- 保持Markdown格式和标题层级\n"
-            "- 只输出修改后的**这一节**的完整内容，不要输出章节列表或解释\n"
+            + _TABLE_FORMAT_RULE
+            + _MISSING_TABLE_RULE
+            + "- 只输出修改后的**这一节**的完整内容，不要输出章节列表或解释\n"
             f"- 在本节内容结束后空一行，输出标记行 `{_MODIFY_SUMMARY_MARKER}`，"
             "标记行之后用一行概括本节的修改要点；若本节未修改则标记行后写“无”\n"
         )
@@ -897,7 +1192,7 @@ async def modify_attachment(instruction: str, file_id: str = "") -> str:
             if target is None:
                 return json.dumps({
                     "status": "error",
-                    "message": f"未找到附件 {file_id}。可用附件: {[a.get('filename') for a in attachments]}",
+                    "message": f"未找到附件 {file_id}。可用附件: {_attachments_hint(attachments)}",
                 }, ensure_ascii=False)
         else:
             completed = [a for a in attachments if a.get("status") == "completed" and a.get("full_text")]
@@ -909,9 +1204,36 @@ async def modify_attachment(instruction: str, file_id: str = "") -> str:
             if len(completed) > 1:
                 return json.dumps({
                     "status": "error",
-                    "message": f"有多个附件，请指定要修改的附件 file_id。可用附件: {[a.get('filename') for a in completed]}",
+                    "message": f"有多个附件，请指定要修改的附件 file_id。可用附件: {_attachments_hint(completed)}",
                 }, ensure_ascii=False)
             target = completed[0]
+
+        filename = target.get("filename", "document.md")
+
+        # ── 段落级手术：保留原 docx 时，基于块清单输出编辑指令，避免全文重写破坏样式 ──
+        if _can_use_docx_edit(target):
+            original_path = target.get("original_path")
+            inventory = await _build_docx_inventory(original_path)
+            if inventory and len(inventory) <= _DOCX_EDIT_MAX_INVENTORY_CHARS:
+                ops, summary = await _llm_modify_ops(instruction, inventory)
+                if ops:
+                    file_id_actual = target.get("file_id", "")
+                    _pending_modified_documents[file_id_actual] = {
+                        "ops": ops,
+                        "original_path": original_path,
+                        "filename": filename,
+                        "kind": "modify",
+                    }
+                    return json.dumps({
+                        "status": "ok",
+                        "kind": "modify",
+                        "file_id": file_id_actual,
+                        "filename": filename,
+                        "modified_chars": _ops_modified_chars(ops),
+                        "summary": summary,
+                        "message": f"附件「{filename}」修改完成，已生成修改版文档供下载。",
+                    }, ensure_ascii=False)
+            # 块清单生成失败 / 超长 / ops 为空 → 回退到全文重写
 
         full_text = target.get("full_text", "") or ""
         if not full_text.strip():
@@ -920,7 +1242,6 @@ async def modify_attachment(instruction: str, file_id: str = "") -> str:
                 "message": f"附件「{target.get('filename', '?')}」内容为空，无法修改。",
             }, ensure_ascii=False)
 
-        filename = target.get("filename", "document.md")
         if len(full_text) <= _MODIFY_SINGLE_PASS_LIMIT:
             modified_md, summary = await _rewrite_single_pass(full_text, instruction)
         else:
@@ -941,6 +1262,7 @@ async def modify_attachment(instruction: str, file_id: str = "") -> str:
 
         return json.dumps({
             "status": "ok",
+            "kind": "modify",
             "file_id": file_id_actual,
             "filename": filename,
             "modified_chars": len(modified_md),
@@ -952,6 +1274,405 @@ async def modify_attachment(instruction: str, file_id: str = "") -> str:
         return json.dumps({
             "status": "error",
             "message": f"修改附件时发生异常: {str(e)}。请稍后重试。",
+        }, ensure_ascii=False)
+
+
+# ── Tool: enrich_attachment ──
+# 把用户上传附件的内容补充得更完整、更详细。与 modify_attachment 的区别：
+# modify_attachment 按用户具体指令修改某处；enrich_attachment 主动识别简略/单薄处并扩写补充。
+# 复用 modify_attachment 的旁路存储与前端下载链路（_pending_modified_documents + attachment_modifications）。
+
+
+async def _enrich_single_pass(full_text: str, instruction: str = "") -> tuple[str, str]:
+    """单遍补全整个文档。instruction 为用户指定的补充重点（可空）。返回 (补全后文档, 补充要点)"""
+    system_prompt = (
+        "你是一位专业的文档内容补全专家。用户上传了一份文档，要求把内容补充得更完整、更详细。\n"
+        "请输出补全后的完整文档。\n"
+        "要求:\n"
+        "- 保持原有章节结构、标题层级和段落顺序完全不变，不得增删章节\n"
+        "- 对内容简略、单薄、缺少细节的段落进行扩写补充，使其更详细、更完整、更有说服力\n"
+        "- 不得删除、篡改或替换已有的任何内容，只能在原有内容基础上增加细节、说明、数据、示例等\n"
+        "- 补充的内容必须与原文主题一致，不得引入文档未涉及的新主题或无关内容\n"
+        "- 保持原有的Markdown格式和标题层级\n"
+        + _TABLE_FORMAT_RULE
+        + _MISSING_TABLE_RULE
+        + "- 技术参数要具体、可测量\n"
+        "- 用中文表述（标准号和必要缩写除外）\n"
+        f"- 在文档正文结束后空一行，输出标记行 `{_MODIFY_SUMMARY_MARKER}`，"
+        "标记行之后逐条列出本次补充的要点（每条一行，以-开头）\n"
+    )
+    user_prompt = f"请把下面这份文档的内容补充得更完整、更详细：\n\n原文:\n{full_text}"
+    if instruction and instruction.strip():
+        user_prompt += f"\n\n补充重点（请优先补充、加强该方面内容）：{instruction.strip()}"
+    response = await _llm_rewrite(system_prompt, user_prompt)
+    if not response:
+        return "", ""
+    return _split_summary(response)
+
+
+async def _enrich_section_wise(full_text: str, instruction: str = "") -> tuple[str, str]:
+    """长文档分段补全：先识别内容简略需补充的章节，再逐节补全，其余章节原样保留。
+
+    instruction 为用户指定的补充重点（可空）。返回 (补全后文档, 补充要点)。
+    """
+    sections = _split_sections_by_heading(full_text)
+
+    # 步骤1: 识别内容简略、需要补充的章节（内容已足够详实的章节不列入）
+    outline = "\n".join(f"[{i}] {_one_line(s)}" for i, s in enumerate(sections))
+    focus_line = ""
+    if instruction and instruction.strip():
+        focus_line = f"\n用户补充重点：{instruction.strip()}（相关章节若内容简略或缺失表格应优先列入）"
+    detect_prompt = (
+        "以下是一份文档的章节列表。用户要求把文档内容补充得更完整。\n"
+        "请判断哪些章节需要补充：内容简略、单薄、缺少细节的章节，以及文中引用了表格"
+        "（如\"见表X\"、\"如下表所示\"、\"参数如下\"、\"技术要求如下\"等）但实际缺失表格的章节。\n"
+        "只把**确实需要补充**的章节编号列入 affected；内容已足够详实且无缺失表格的章节不要列入。\n"
+        "严格输出JSON，格式: {\"affected\": [章节编号]}，不要输出任何其他内容。\n"
+        + focus_line
+        + f"\n\n章节列表:\n{outline}"
+    )
+    detect_resp = await _llm_rewrite(
+        "你只输出JSON，不输出任何其他内容。", detect_prompt, timeout=120.0
+    )
+    affected = _parse_affected_indices(detect_resp)
+    if not affected:
+        # 无法识别 → 保守处理：全部章节视为需补充
+        affected = list(range(len(sections)))
+
+    # 步骤2: 逐个补全受影响章节
+    notes = []
+    for idx in affected:
+        if not (0 <= idx < len(sections)):
+            continue
+        sec = sections[idx]
+        sys_p = (
+            "你是一位专业的文档内容补全专家。下面是文档中的一个章节，请把它补充得更完整、更详细。\n"
+            "要求:\n"
+            "- 保持本节标题和结构不变\n"
+            "- 对内容简略、单薄处进行扩写补充，使其更详细、更完整\n"
+            "- 不得删除、篡改或替换已有内容，只能在原有基础上增加细节\n"
+            "- 若本节内容已足够完整，原样输出本节，不要改动\n"
+            + _TABLE_FORMAT_RULE
+            + _MISSING_TABLE_RULE
+            + "- 只输出补全后的**这一节**的完整内容，不要输出章节列表或解释\n"
+            f"- 在本节内容结束后空一行，输出标记行 `{_MODIFY_SUMMARY_MARKER}`，"
+            "标记行之后用一行概括本节的补充要点；若本节未补充则标记行后写“无”\n"
+        )
+        user_p = f"请把下面这一节的内容补充得更完整：\n\n本节原文:\n{sec}"
+        if instruction and instruction.strip():
+            user_p += f"\n\n补充重点（请优先补充、加强该方面内容）：{instruction.strip()}"
+        resp = await _llm_rewrite(sys_p, user_p)
+        if not resp:
+            continue  # 失败保留原文
+        new_sec, note = _split_summary(resp)
+        if new_sec.strip():
+            sections[idx] = new_sec.strip()
+        if note.strip() and note.strip() != "无":
+            notes.append(note.strip())
+
+    enriched_md = "\n\n".join(s.strip() for s in sections if s.strip())
+    summary = "\n".join(notes)
+    return enriched_md, summary
+
+
+@tool
+async def enrich_attachment(file_id: str = "", instruction: str = "") -> str:
+    """把用户上传附件的内容补充得更完整、更详细，生成补全版文档并提供下载。
+
+    调用时机: 用户要求"把文档补充完整/补充得更详细/完善这份文档/扩写文档内容"时。
+    补全的是附件副本，不改变原附件，也不影响已生成的目标文档。
+
+    与 modify_attachment 的区别: modify_attachment 按用户的具体指令修改某处；
+    enrich_attachment 主动识别文档中简略、单薄的内容并扩写补充，使其更完整。
+
+    Args:
+        file_id: 要补全的附件ID（来自附件列表）。为空时自动选择第一个已上传附件。
+        instruction: 可选，用户指定的补充重点（如"重点补充测试方法"）。
+                     为空时对文档整体补全。
+
+    Returns:
+        JSON格式的结果，包含 file_id、filename、summary（补充要点）等信息。
+    """
+    try:
+        attachments = _current_attachments.get()
+        if not attachments:
+            return json.dumps({
+                "status": "error",
+                "message": "当前项目没有上传附件，无法补全。请先上传需要补全的文档。",
+            }, ensure_ascii=False)
+
+        # 定位附件（复用 modify_attachment 的定位逻辑）
+        target = None
+        if file_id:
+            target = next((a for a in attachments if a.get("file_id") == file_id), None)
+            if target is None:
+                return json.dumps({
+                    "status": "error",
+                    "message": f"未找到附件 {file_id}。可用附件: {_attachments_hint(attachments)}",
+                }, ensure_ascii=False)
+        else:
+            completed = [a for a in attachments if a.get("status") == "completed" and a.get("full_text")]
+            if not completed:
+                return json.dumps({
+                    "status": "error",
+                    "message": "没有可补全的附件（附件可能仍在处理中）。请稍后重试或重新上传。",
+                }, ensure_ascii=False)
+            if len(completed) > 1:
+                return json.dumps({
+                    "status": "error",
+                    "message": f"有多个附件，请指定要补全的附件 file_id。可用附件: {_attachments_hint(completed)}",
+                }, ensure_ascii=False)
+            target = completed[0]
+
+        filename = target.get("filename", "document.md")
+
+        # ── 段落级手术：保留原 docx 时，基于块清单输出编辑指令，避免全文重写破坏样式 ──
+        if _can_use_docx_edit(target):
+            original_path = target.get("original_path")
+            inventory = await _build_docx_inventory(original_path)
+            if inventory and len(inventory) <= _DOCX_EDIT_MAX_INVENTORY_CHARS:
+                ops, summary = await _llm_enrich_ops(instruction, inventory)
+                if ops:
+                    file_id_actual = target.get("file_id", "")
+                    _pending_modified_documents[file_id_actual] = {
+                        "ops": ops,
+                        "original_path": original_path,
+                        "filename": filename,
+                        "kind": "enrich",
+                    }
+                    return json.dumps({
+                        "status": "ok",
+                        "kind": "enrich",
+                        "file_id": file_id_actual,
+                        "filename": filename,
+                        "modified_chars": _ops_modified_chars(ops),
+                        "summary": summary,
+                        "message": f"附件「{filename}」补全完成，已生成补全版文档供下载。",
+                    }, ensure_ascii=False)
+            # 块清单生成失败 / 超长 / ops 为空 → 回退到全文重写
+
+        full_text = target.get("full_text", "") or ""
+        if not full_text.strip():
+            return json.dumps({
+                "status": "error",
+                "message": f"附件「{target.get('filename', '?')}」内容为空，无法补全。",
+            }, ensure_ascii=False)
+
+        if len(full_text) <= _MODIFY_SINGLE_PASS_LIMIT:
+            enriched_md, summary = await _enrich_single_pass(full_text, instruction)
+        else:
+            enriched_md, summary = await _enrich_section_wise(full_text, instruction)
+
+        if not (enriched_md or "").strip():
+            return json.dumps({
+                "status": "error",
+                "message": "文档补全失败（模型未返回有效内容）。请稍后重试。",
+            }, ensure_ascii=False)
+
+        # 存入旁路，供 _after_tools_node 写入 state（完整内容不进 LLM 对话历史）
+        file_id_actual = target.get("file_id", "")
+        _pending_modified_documents[file_id_actual] = {
+            "markdown": enriched_md,
+            "filename": filename,
+        }
+
+        return json.dumps({
+            "status": "ok",
+            "kind": "enrich",
+            "file_id": file_id_actual,
+            "filename": filename,
+            "modified_chars": len(enriched_md),
+            "summary": summary,
+            "message": f"附件「{filename}」补全完成，已生成补全版文档供下载。",
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"补全附件时发生异常: {str(e)}。请稍后重试。",
+        }, ensure_ascii=False)
+
+
+# ── Tool: summarize_attachment ──
+# 把用户上传附件的内容精简压缩、去除冗余。与 enrich_attachment 方向相反：
+# enrich_attachment 扩写补充；summarize_attachment 压缩精简。
+# 复用 modify_attachment / enrich_attachment 的旁路存储与前端下载链路。
+
+
+async def _summarize_attachment_single_pass(full_text: str) -> tuple[str, str]:
+    """单遍精简整个上传文档。返回 (精简后文档, 精简要点)"""
+    system_prompt = (
+        "你是一位专业的文档精简专家。用户上传了一份文档，要求把内容精简压缩、去除冗余，保留核心要点。\n"
+        "请输出精简后的完整文档。\n"
+        "要求:\n"
+        "- 保持原有章节结构、标题层级和段落顺序完全不变，不得增删章节\n"
+        "- 意思不变：保留所有核心观点、结论、法规条款号、技术参数，不编造、不篡改\n"
+        "- 精简冗余：合并重复表述、压缩冗长背景、删除过渡句和铺垫\n"
+        "- 所有表格（含表号、表头、全部数据行）必须原样保留，不得删除任何表格、表头或数据行；只可精简表格周围说明文字\n"
+        "- 涉及法规/标准的过程性、描述性语言（层层分析推导的叙述）直接精简为结论，删除分析推导过程，只保留条款号和最终结论\n"
+        "- 保持语句完整、段落连贯，禁止残句、悬空引用\n"
+        "- 保持原有的Markdown格式和标题层级\n"
+        + _TABLE_FORMAT_RULE
+        + "- 用中文表述（标准号和必要缩写除外）\n"
+        f"- 在文档正文结束后空一行，输出标记行 `{_MODIFY_SUMMARY_MARKER}`，"
+        "标记行之后逐条列出本次精简的要点（每条一行，以-开头）\n"
+    )
+    user_prompt = f"请把下面这份文档的内容精简压缩、保留核心要点：\n\n原文:\n{full_text}"
+    response = await _llm_rewrite(system_prompt, user_prompt)
+    if not response:
+        return "", ""
+    return _split_summary(response)
+
+
+async def _summarize_attachment_section_wise(full_text: str) -> tuple[str, str]:
+    """长文档分段精简：逐节精简，失败章节保留原文。返回 (精简后文档, 精简要点)。"""
+    sections = _split_sections_by_heading(full_text)
+
+    notes = []
+    for idx in range(len(sections)):
+        sec = sections[idx]
+        sys_p = (
+            "你是一位专业的文档精简专家。下面是文档中的一个章节，请把它精简压缩、去除冗余。\n"
+            "要求:\n"
+            "- 保持本节标题和结构不变\n"
+            "- 意思不变：保留本节核心观点、结论、法规条款号、技术参数\n"
+            "- 合并重复表述、压缩冗长背景、删除过渡句和铺垫\n"
+            "- 所有表格（含表号、表头、全部数据行）必须原样保留，不得删除任何表格、表头或数据行\n"
+            "- 涉及法规/标准的过程性、描述性语言直接精简为结论，删除分析推导过程\n"
+            "- 保持语句完整、段落连贯，禁止残句、悬空引用\n"
+            + _TABLE_FORMAT_RULE
+            + "- 只输出精简后的**这一节**的完整内容，不要输出章节列表或解释\n"
+            f"- 在本节内容结束后空一行，输出标记行 `{_MODIFY_SUMMARY_MARKER}`，"
+            "标记行之后用一行概括本节的精简要点；若本节未精简则标记行后写“无”\n"
+        )
+        user_p = f"请精简下面这一节的内容：\n\n本节原文:\n{sec}"
+        resp = await _llm_rewrite(sys_p, user_p)
+        if not resp:
+            continue  # 失败保留原文
+        new_sec, note = _split_summary(resp)
+        if new_sec.strip():
+            sections[idx] = new_sec.strip()
+        if note.strip() and note.strip() != "无":
+            notes.append(note.strip())
+
+    summarized_md = "\n\n".join(s.strip() for s in sections if s.strip())
+    summary = "\n".join(notes)
+    return summarized_md, summary
+
+
+@tool
+async def summarize_attachment(file_id: str = "") -> str:
+    """把用户上传附件的内容精简压缩、去除冗余，生成精简版文档并提供下载。
+
+    调用时机: 用户要求"精简这篇文档/压缩这份附件/把上传的文档精简一下/删掉冗余内容"时。
+    精简的是附件副本，不改变原附件，也不影响已生成的目标文档。
+
+    与 summarize_section / summarize_document 的区别: 那两者精简的是已生成的目标文档章节
+    （generated_sections）；本工具精简的是用户上传的附件（attachments）。
+
+    Args:
+        file_id: 要精简的附件ID（来自附件列表）。为空时自动选择第一个已上传附件。
+
+    Returns:
+        JSON格式的结果，包含 file_id、filename、summary（精简要点）等信息。
+    """
+    try:
+        attachments = _current_attachments.get()
+        if not attachments:
+            return json.dumps({
+                "status": "error",
+                "message": "当前项目没有上传附件，无法精简。请先上传需要精简的文档。",
+            }, ensure_ascii=False)
+
+        # 定位附件（复用 modify_attachment / enrich_attachment 的定位逻辑）
+        target = None
+        if file_id:
+            target = next((a for a in attachments if a.get("file_id") == file_id), None)
+            if target is None:
+                return json.dumps({
+                    "status": "error",
+                    "message": f"未找到附件 {file_id}。可用附件: {_attachments_hint(attachments)}",
+                }, ensure_ascii=False)
+        else:
+            completed = [a for a in attachments if a.get("status") == "completed" and a.get("full_text")]
+            if not completed:
+                return json.dumps({
+                    "status": "error",
+                    "message": "没有可精简的附件（附件可能仍在处理中）。请稍后重试或重新上传。",
+                }, ensure_ascii=False)
+            if len(completed) > 1:
+                return json.dumps({
+                    "status": "error",
+                    "message": f"有多个附件，请指定要精简的附件 file_id。可用附件: {_attachments_hint(completed)}",
+                }, ensure_ascii=False)
+            target = completed[0]
+
+        filename = target.get("filename", "document.md")
+
+        # ── 段落级手术：保留原 docx 时，基于块清单输出编辑指令，避免全文重写破坏样式 ──
+        if _can_use_docx_edit(target):
+            original_path = target.get("original_path")
+            inventory = await _build_docx_inventory(original_path)
+            if inventory and len(inventory) <= _DOCX_EDIT_MAX_INVENTORY_CHARS:
+                ops, summary = await _llm_summarize_ops(inventory)
+                if ops:
+                    file_id_actual = target.get("file_id", "")
+                    _pending_modified_documents[file_id_actual] = {
+                        "ops": ops,
+                        "original_path": original_path,
+                        "filename": filename,
+                        "kind": "summarize",
+                    }
+                    return json.dumps({
+                        "status": "ok",
+                        "kind": "summarize",
+                        "file_id": file_id_actual,
+                        "filename": filename,
+                        "modified_chars": _ops_modified_chars(ops),
+                        "summary": summary,
+                        "message": f"附件「{filename}」精简完成，已生成精简版文档供下载。",
+                    }, ensure_ascii=False)
+            # 块清单生成失败 / 超长 / ops 为空 → 回退到全文重写
+
+        full_text = target.get("full_text", "") or ""
+        if not full_text.strip():
+            return json.dumps({
+                "status": "error",
+                "message": f"附件「{target.get('filename', '?')}」内容为空，无法精简。",
+            }, ensure_ascii=False)
+
+        if len(full_text) <= _MODIFY_SINGLE_PASS_LIMIT:
+            summarized_md, summary = await _summarize_attachment_single_pass(full_text)
+        else:
+            summarized_md, summary = await _summarize_attachment_section_wise(full_text)
+
+        if not (summarized_md or "").strip():
+            return json.dumps({
+                "status": "error",
+                "message": "文档精简失败（模型未返回有效内容）。请稍后重试。",
+            }, ensure_ascii=False)
+
+        # 存入旁路，供 _after_tools_node 写入 state（完整内容不进 LLM 对话历史）
+        file_id_actual = target.get("file_id", "")
+        _pending_modified_documents[file_id_actual] = {
+            "markdown": summarized_md,
+            "filename": filename,
+        }
+
+        return json.dumps({
+            "status": "ok",
+            "kind": "summarize",
+            "file_id": file_id_actual,
+            "filename": filename,
+            "modified_chars": len(summarized_md),
+            "summary": summary,
+            "message": f"附件「{filename}」精简完成，已生成精简版文档供下载。",
+        }, ensure_ascii=False)
+
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"精简附件时发生异常: {str(e)}。请稍后重试。",
         }, ensure_ascii=False)
 
 
@@ -1006,6 +1727,10 @@ async def generate_section(section_name: str, doc_type: str = "design_developmen
                  "- 同一法规条款仅在与本节直接相关处展开，不在多节重复相同说明\n"
         )
 
+        # 模板写作风格参考：用户上传模板时注入，让章节模仿模板风格
+        template_style_block = _build_template_style_hint()
+        style_section = f"{template_style_block}\n\n" if template_style_block else ""
+
         system_prompt = f"""你是一位贴敷式胰岛素泵RA文档专家。请基于当前已确认的策划内容信息，
 生成《{doc_label}》文档中「{section_name}」章节的初稿。{expert_section}
 
@@ -1015,13 +1740,13 @@ async def generate_section(section_name: str, doc_type: str = "design_developmen
 {_regulation_clause_rule(doc_type)}- 使用Markdown格式，标题层级清晰 (##, ###)
 - 技术参数要具体、可测量、有明确的数值范围
 - 表格要填写完整，不能留"(描述)"或"待填写"等占位符
-- 针对贴敷式胰岛素泵产品特性编写
+{_TABLE_FORMAT_RULE}- 针对贴敷式胰岛素泵产品特性编写
 - 生成内容的详细程度要像实际可用于注册申报的正式文档一样
 - 用中文表述 (标准号和必要缩写除外)
 - 禁止以"本章依据XX标准编制"等冗余前缀行开头
 
 {covered_block}
-{_output_structure_requirement(doc_type)}"""
+{style_section}{_output_structure_requirement(doc_type)}{_supplementary_block()}"""
 
         # RAG 检索: 用 LLM 基于产品上下文+章节信息生成针对性查询词
         rag_context = ""
@@ -1042,7 +1767,7 @@ async def generate_section(section_name: str, doc_type: str = "design_developmen
             merged_results = []
             seen_keys = set()
             for q in queries:
-                rag_result = await search_kb.ainvoke({"query": q, "top_k": 10})
+                rag_result = await search_kb.ainvoke({"query": q, "top_k": 15})
                 rag_data = json.loads(rag_result)
                 if rag_data.get("status") == "ok" and rag_data.get("results"):
                     for item in rag_data["results"]:
@@ -1099,11 +1824,19 @@ async def generate_section(section_name: str, doc_type: str = "design_developmen
 _docx_store: dict = {}
 
 
-def _store_docx(file_bytes: bytes, filename: str) -> str:
-    """将生成的docx存入内存，返回download_id"""
+def _store_docx(
+    file_bytes: bytes,
+    filename: str,
+    content_type: str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+) -> str:
+    """将生成的文档（docx 或 xlsx）存入内存，返回download_id"""
     import uuid
     download_id = str(uuid.uuid4())[:8]
-    _docx_store[download_id] = {"bytes": file_bytes, "filename": filename}
+    _docx_store[download_id] = {
+        "bytes": file_bytes,
+        "filename": filename,
+        "content_type": content_type,
+    }
     return download_id
 
 
@@ -1112,9 +1845,53 @@ def _get_docx(download_id: str) -> dict | None:
     return _docx_store.get(download_id)
 
 
+async def _build_risk_excel(doc_type: str, product_name: str) -> str:
+    """风险分析总表类文档：调用本地模型生成结构化风险条目并构建 Excel (.xlsx)。"""
+    from app.services.risk_excel import generate_risk_rows, build_risk_excel
+    from app.services.doc_types import DOC_TYPE_LABELS
+
+    classification = _current_product_classification.get()
+    intended_use = _current_product_intended_use.get()
+
+    rows = await asyncio.wait_for(
+        asyncio.to_thread(
+            generate_risk_rows, doc_type, product_name, classification, intended_use
+        ),
+        timeout=240.0,
+    )
+    if not rows:
+        return json.dumps({
+            "status": "error",
+            "message": "风险条目生成失败（模型未返回有效数据），请稍后重试。",
+        }, ensure_ascii=False)
+
+    file_bytes = await asyncio.to_thread(build_risk_excel, doc_type, rows)
+
+    label = DOC_TYPE_LABELS.get(doc_type, "风险分析和管理总表")
+    filename = f"{product_name}_{label}.xlsx"
+
+    download_id = _store_docx(
+        file_bytes,
+        filename,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    return json.dumps({
+        "status": "ok",
+        "download_id": download_id,
+        "filename": filename,
+        "size_bytes": len(file_bytes),
+        "message": f"风险分析和管理总表 Excel「{filename}」已生成，点击下载按钮即可获取。",
+    }, ensure_ascii=False)
+
+
 @tool
 async def build_docx(doc_type: str = "", product_name: str = "", markdown: str = "") -> str:
-    """将已生成的Markdown文档内容构建为Word (.docx) 文件并提供下载。
+    """将已生成的文档内容构建为可下载文件并提供下载。
+
+    普通文档构建为 Word (.docx)；风险分析总表类文档
+    （product_risk_analysis_matrix / cybersecurity_risk_analysis_matrix）
+    自动构建为 Excel (.xlsx)，与参考「风险分析和管理总表」格式一致。
 
     调用时机: 在所有章节生成完毕、用户确认内容无误后调用。
     调用后前端会自动弹出下载按钮。
@@ -1131,6 +1908,7 @@ async def build_docx(doc_type: str = "", product_name: str = "", markdown: str =
     try:
         from app.services.template import TemplateService
         from app.services.doc_types import DOC_TYPE_LABELS
+        from app.services.risk_excel import is_risk_matrix_doc
 
         # 从上下文填充缺失参数
         if not doc_type:
@@ -1139,6 +1917,10 @@ async def build_docx(doc_type: str = "", product_name: str = "", markdown: str =
             product_name = _current_product_name.get()
         if not markdown:
             markdown = _current_generated_markdown.get()
+
+        # ── 风险分析总表类文档 → 直接导出 Excel (.xlsx) ──
+        if is_risk_matrix_doc(doc_type):
+            return await _build_risk_excel(doc_type, product_name)
 
         if not markdown:
             return json.dumps({
@@ -1241,7 +2023,7 @@ async def revise_section(section_name: str, instruction: str, doc_type: str = "d
         rag_context = ""
         try:
             rag_query = f"{doc_label} {section_name} {instruction}"
-            rag_result = await search_kb.ainvoke({"query": rag_query, "top_k": 10})
+            rag_result = await search_kb.ainvoke({"query": rag_query, "top_k": 15})
             rag_data = json.loads(rag_result)
             if rag_data.get("status") == "ok" and rag_data.get("results"):
                 lines = ["\n\n# 知识库参考资料（必须优先依据以下内容进行修改）:"]
@@ -1262,7 +2044,7 @@ async def revise_section(section_name: str, instruction: str, doc_type: str = "d
 {_regulation_clause_rule(doc_type)}- 使用Markdown格式，标题层级清晰 (##, ###)
 - 技术参数要具体、可测量、有明确的数值范围
 - 表格要填写完整，不能留"(描述)"或"待填写"等占位符
-- 针对贴敷式胰岛素泵产品特性编写
+{_TABLE_FORMAT_RULE}- 针对贴敷式胰岛素泵产品特性编写
 - 修改后内容的详细程度要与首次生成的其他章节保持一致，像实际可用于注册申报的正式文档一样
 - 用中文表述 (标准号和必要缩写除外)
 
@@ -1273,7 +2055,7 @@ async def revise_section(section_name: str, instruction: str, doc_type: str = "d
 - 如果修改影响了其他章节的参数/引用，在回复末尾用"⚠️ 关联影响:"标注
 - 用中文回复
 
-{_output_structure_requirement(doc_type, is_revision=True)}"""
+{_output_structure_requirement(doc_type, is_revision=True)}{_supplementary_block()}"""
 
         user_prompt = f"""请修改《{doc_label}》的「{section_name}」章节，修改指令: {instruction}
 
@@ -1311,6 +2093,155 @@ async def revise_section(section_name: str, instruction: str, doc_type: str = "d
         return f"[错误] 修订服务暂时不可用。请稍后重试。"
     except Exception as e:
         return f"[错误] 修订「{section_name}」时发生异常: {str(e)}。请稍后重试。"
+
+
+async def revise_paragraph(section_name: str, anchor_text: str, instruction: str,
+                           doc_type: str = "design_development_plan") -> str:
+    """精确修改文档中指定章节的某个段落，不影响其他段落。
+
+    与 revise_section 的区别：revise_section 重写整章，可能意外改动未涉及段落；
+    revise_paragraph 只修改锚定文本所在的段落，其余内容逐字保留。
+
+    Args:
+        section_name: 章节名称（如"风险管理"、"设计验证"）。
+        anchor_text: 用于定位目标段落的锚定文本（段落中的一句特征性原文，10-30字即可）。
+                     工具会在章节中搜索包含此文本的段落，仅修改该段落。
+        instruction: 修改指令，如"将风险等级从B改为C"、"增加EO灭菌的验证要求"。
+        doc_type: 文档类型标识，从当前会话状态的 doc_type 字段获取。
+
+    Returns:
+        修改后的完整章节内容（仅目标段落被修改，其余不变）。
+    """
+    try:
+        from app.services.minimax import _call_minimax_api_raw
+        from app.services.doc_types import DOC_TYPE_LABELS
+        from app.services.prompt_engineer import DOC_TYPE_SPECIFIC_PROMPTS
+
+        doc_label = DOC_TYPE_LABELS.get(doc_type, "设计策划文档")
+        expert_prompt = DOC_TYPE_SPECIFIC_PROMPTS.get(doc_type, "")
+        expert_section = f"\n\n{expert_prompt}" if expert_prompt else ""
+
+        # ── 获取当前章节完整内容 ──
+        current_section_content = ""
+        current_markdown = _current_generated_markdown.get()
+        if current_markdown:
+            import re
+            pattern = rf'^## \s*{re.escape(section_name)}\s*$'
+            lines = current_markdown.split('\n')
+            in_section = False
+            section_lines = []
+            for line in lines:
+                if re.match(pattern, line.strip()):
+                    in_section = True
+                    section_lines.append(line)
+                elif in_section and re.match(r'^## ', line.strip()):
+                    break
+                elif in_section:
+                    section_lines.append(line)
+            if section_lines:
+                current_section_content = '\n'.join(section_lines)
+
+        if not current_section_content:
+            return f"[错误] 未找到章节「{section_name}」的内容。请确认章节名称是否正确，或先生成该章节。"
+
+        # ── 定位目标段落 ──
+        # 按空行分割段落（保留标题行和子标题）
+        paragraphs = re.split(r'\n\n+', current_section_content)
+        target_idx = -1
+        for i, para in enumerate(paragraphs):
+            if anchor_text.strip() in para:
+                target_idx = i
+                break
+
+        if target_idx == -1:
+            # 模糊匹配：尝试部分匹配
+            anchor_chars = anchor_text.strip()
+            for i, para in enumerate(paragraphs):
+                # 检查是否有 70% 以上的字符重叠
+                para_clean = para.replace('\n', ' ').replace('  ', ' ')
+                common = sum(1 for c in anchor_chars if c in para_clean)
+                if len(anchor_chars) > 0 and common / len(anchor_chars) > 0.6:
+                    target_idx = i
+                    break
+
+        if target_idx == -1:
+            return (
+                f"[错误] 在章节「{section_name}」中未找到包含「{anchor_text}」的段落。"
+                f"请提供段落中更准确的特征文本（10-30字即可），或改用 revise_section 修改整章。"
+            )
+
+        target_paragraph = paragraphs[target_idx]
+
+        # ── 构建上下文（前后各一段，给 LLM 提供上下文）──
+        context_before = paragraphs[target_idx - 1] if target_idx > 0 else ""
+        context_after = paragraphs[target_idx + 1] if target_idx < len(paragraphs) - 1 else ""
+
+        # ── 构建精准修订 prompt ──
+        system_prompt = f"""你是一位贴敷式胰岛素泵RA文档专家。用户要求修改《{doc_label}》文档中「{section_name}」章节的某一个段落。{expert_section}
+
+要求:
+- 只修改目标段落，严格保持其他内容不变
+- 修改后段落的格式（标题层级、列表、表格等）与原文一致
+- 内容专业、具体，符合NMPA注册申报要求
+- 技术参数要具体、可测量
+- 用中文表述（标准号除外）
+
+输出格式:
+只输出修改后的段落文本，不要输出章节标题、不要输出其他段落、不要加"修改摘要"等额外说明。{_supplementary_block()}"""
+
+        user_prompt = f"""## 修改指令
+{instruction}
+
+## 目标段落（需要修改的段落）
+{target_paragraph}
+
+## 上下文（仅用于理解，不要修改）
+前一段: {context_before if context_before else "(无，这是章节开头)"}
+后一段: {context_after if context_after else "(无，这是章节末尾)"}
+
+请只输出修改后的目标段落文本："""
+
+        def _do_revise_para():
+            return _call_minimax_api_raw(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.3,
+                max_tokens=4096,
+            )
+
+        response = await asyncio.wait_for(
+            asyncio.to_thread(_do_revise_para),
+            timeout=120.0,
+        )
+
+        if not response:
+            return f"[错误] 无法修改段落。请稍后重试。"
+
+        # ── 替换目标段落，组装完整章节 ──
+        modified_paragraph = response.strip()
+        paragraphs[target_idx] = modified_paragraph
+        modified_section = '\n\n'.join(paragraphs)
+
+        # ── 生成变更摘要 ──
+        # 计算差异（简单对比）
+        old_preview = target_paragraph[:100].replace('\n', ' ')
+        new_preview = modified_paragraph[:100].replace('\n', ' ')
+        summary = (
+            f"📝 段落修改摘要:\n"
+            f"- 章节: {section_name}\n"
+            f"- 定位: 第{target_idx + 1}段（共{len(paragraphs)}段）\n"
+            f"- 原文开头: {old_preview}...\n"
+            f"- 修改后开头: {new_preview}..."
+        )
+
+        return f"[已修改段落: {section_name}]\n\n{modified_section}\n\n{summary}"
+
+    except asyncio.TimeoutError:
+        return f"[错误] 修改段落超时（120秒）。请稍后重试。"
+    except ImportError:
+        return f"[错误] 修订服务暂时不可用。请稍后重试。"
+    except Exception as e:
+        return f"[错误] 修订段落时发生异常: {str(e)}。请稍后重试。"
 
 
 # ═══════════════════════════════════════════════════════
@@ -1395,7 +2326,7 @@ async def design_outline(
         merged_results = []
         seen_keys = set()
         for q in queries:
-            rag_result = await search_kb.ainvoke({"query": q, "top_k": 10})
+            rag_result = await search_kb.ainvoke({"query": q, "top_k": 15})
             rag_data = json.loads(rag_result)
             if rag_data.get("status") == "ok" and rag_data.get("results"):
                 for item in rag_data["results"]:
@@ -1420,13 +2351,35 @@ async def design_outline(
     if special_requirements:
         prompt += f"\n特殊要求: {special_requirements}"
 
+    # 模板章节结构参考：用户上传模板时，优先参照模板的章节结构设计框架
+    templates = _current_templates.get()
+    if templates:
+        template_outline_parts = []
+        for tpl in templates:
+            tpl_name = tpl.get("name") or tpl.get("filename", "?")
+            tpl_text = tpl.get("full_text", "")
+            if tpl_text:
+                # 截取前 8000 字符供 LLM 识别章节结构
+                template_outline_parts.append(
+                    f"### 模板「{tpl_name}」原文（前8000字符，用于识别章节结构）\n{tpl_text[:8000]}"
+                )
+        if template_outline_parts:
+            prompt += "\n\n## 用户上传的模板文档（最高优先级：必须参照其章节结构设计框架）\n"
+            prompt += "请仔细分析以下模板的章节标题、层级和小节划分，设计的框架应尽量贴近模板的章节结构。\n\n"
+            prompt += "\n\n".join(template_outline_parts)
+
     if rag_context:
         prompt += f"""
 
 ## 知识库参考资料（必须优先依据以下内容设计框架）
 {rag_context}"""
 
-    prompt += "\n\n请严格按照 JSON 格式输出，不要包含任何 JSON 之外的解释文字。"
+    prompt += (
+        "\n\n## 章节编号规则（必须遵守）\n"
+        "- 章节标题必须形如\"第一章 XXX\"、\"第二章 XXX\"\n"
+        "- 章节序号从1开始连续递增，不得重复、不得跳号\n"
+        "\n请严格按照 JSON 格式输出，不要包含任何 JSON 之外的解释文字。"
+    )
 
     try:
         async with _llm_semaphore:
@@ -1531,6 +2484,58 @@ def _find_chapter_subsections(outline_json: str, chapter_name: str) -> list[dict
         _add_leaf(sub_title, 3, sub.get("content_points", []), "")
     return leaf_subs
 
+def _build_template_style_hint() -> str:
+    """从当前模板提取写作风格参考片段，供 write_chapter / generate_section 模仿模板风格。
+
+    优先级：
+    1. 用户通过「添加模板」上传的模板（full_text 已含完整内容），
+       由 _sync_template_context 每轮同步到 _current_templates。
+    2. 无用户模板时，验证/测试类文档（报告或方案）回退到内置默认模板
+       （见 app.services.default_templates）。
+    均无时返回空字符串，此时沿用默认写作风格。
+    """
+    templates = _current_templates.get()
+    if templates:
+        samples = []
+        for tpl in templates:
+            ft = tpl.get("full_text", "")
+            if not ft or not ft.strip():
+                continue
+            fn = tpl.get("filename", "unknown")
+            # 截取前 3000 字符作为风格样例，兼顾 token 消耗与代表性
+            samples.append(f"【模板「{fn}」原文样例】\n{ft[:3000]}")
+        if samples:
+            joined = "\n\n".join(samples)
+            return (
+                "## 模板写作风格模仿（最高优先级）\n"
+                "用户上传了参考模板，以下是模板的原文片段。"
+                "请在满足上述内容与格式要求的前提下，**严格模仿模板的写作风格**：\n"
+                "- 句式长短、段落密度、列表项与表格的使用习惯\n"
+                "- 措辞语气、术语表达、编号方式\n"
+                "- 参数的罗列方式与详略程度\n\n"
+                f"{joined}"
+            )
+        # 用户模板存在但均无文本 → 继续回退到内置默认（如适用）
+
+    # 无用户模板（或用户模板无文本）时：按 doc_type 匹配内置默认模板（报告/方案/风险管理计划）
+    from app.services.default_templates import get_default_template_style, get_default_template_label
+    doc_type = _current_doc_type.get()
+    default_style = get_default_template_style(doc_type)
+    if default_style:
+        label = get_default_template_label(doc_type)
+        return (
+            "## 默认模板写作风格参照（内置默认模板）\n"
+            f"当前文档类型匹配内置默认模板{label}，且用户未上传自定义模板。"
+            f"请以下方{label}原文片段为风格参照，"
+            "在满足上述内容与格式要求的前提下，**模仿其写作风格**：\n"
+            "- 句式长短、段落密度、列表项与表格的使用习惯\n"
+            "- 措辞语气、术语表达、编号方式\n"
+            "- 参数的罗列方式与详略程度\n\n"
+            f"【默认模板原文样例】\n{default_style}"
+        )
+    return ""
+
+
 @tool
 async def write_chapter(
     chapter_name: str,
@@ -1575,6 +2580,10 @@ async def write_chapter(
     # 已覆盖内容摘要（排除本章），注入每个小节提示词避免跨章节内容重复
     covered_digest = _build_covered_digest(chapter_name)
     covered_block = f"- 已覆盖内容（请勿重复，引用用\"详见第X章\"）:\n{covered_digest}" if covered_digest else ""
+
+    # 模板写作风格参考：用户上传模板时注入，让章节模仿模板风格而非默认风格
+    template_style_block = _build_template_style_hint()
+    style_section = f"{template_style_block}\n\n" if template_style_block else ""
 
     # 轻量去重: 对同一小节的检索结果做 Jaccard 相似度去重
     def _dedup_results(results: list, threshold: float = 0.6) -> list:
@@ -1631,7 +2640,7 @@ async def write_chapter(
             try:
                 async with _rag_sem:
                     for q in queries:
-                        r = await search_kb.ainvoke({"query": q, "top_k": 10})
+                        r = await search_kb.ainvoke({"query": q, "top_k": 15})
                         data = json.loads(r)
                         if data.get("status") == "ok" and data.get("results"):
                             for item in data["results"]:
@@ -1698,6 +2707,7 @@ async def write_chapter(
                 f"{_regulation_clause_rule(doc_type)}"
                 f"- 技术参数要具体、可测量、有明确的数值范围\n"
                 f"- 表格要填写完整，不能留\"(描述)\"或\"待填写\"等占位符\n"
+                f"{_TABLE_FORMAT_RULE}"
                 f"- 针对贴敷式胰岛素泵产品特性编写\n"
                 f"- 用中文表述 (标准号和必要缩写除外)\n"
                 f"- 只生成本小节正文，不要添加章节标题（如 ## 或 ###）\n"
@@ -1715,12 +2725,14 @@ async def write_chapter(
                 f"- 标准总则类描述（\"本部分适用于…\"\"本标准规定…\"）全文档只出现一次\n"
                 f"- 同一法规条款仅在与本节直接相关处展开，不在多节重复相同说明\n"
                 f"{covered_block}\n"
+                f"{style_section}"
                 f"\n"
                 f"## 输出结构示例（参考《产品技术要求》风格）\n"
                 f"直接写要点/列表/小表格，第一行就是实质内容（不是标题）。\n"
                 f"\n"
                 f"## 字数约束\n"
                 f"本小节总字数控制在 200-500 字之间。**宁少勿多**。"
+                f"{_supplementary_block()}"
             )
 
             user_prompt = (
@@ -1799,7 +2811,7 @@ async def write_chapter(
             merged_results = []
             seen_keys = set()
             for q in queries:
-                rag_result = await search_kb.ainvoke({"query": q, "top_k": 10})
+                rag_result = await search_kb.ainvoke({"query": q, "top_k": 15})
                 rag_data = json.loads(rag_result)
                 if rag_data.get("status") == "ok" and rag_data.get("results"):
                     for item in rag_data["results"]:
@@ -1833,6 +2845,7 @@ async def write_chapter(
             f"{_regulation_clause_rule(doc_type)}"
             f"- 技术参数要具体、可测量、有明确的数值范围\n"
             f"- 表格要填写完整，不能留\"(描述)\"或\"待填写\"等占位符\n"
+            f"{_TABLE_FORMAT_RULE}"
             f"- 针对贴敷式胰岛素泵产品特性编写\n"
             f"- 用中文表述 (标准号和必要缩写除外)\n"
             f"\n"
@@ -1841,8 +2854,10 @@ async def write_chapter(
             f"- **禁止写总结段、归纳段、结尾段**\n"
             f"- **禁止把同一要点展开成完整段落**\n"
             f"\n"
+            f"{style_section}"
             f"## 字数约束\n"
             f"整章总字数控制在 800-2000 字之间。**宁少勿多**。"
+            f"{_supplementary_block()}"
         )
 
         user_prompt = (
@@ -1918,6 +2933,12 @@ async def update_outline(
 用户要求: {instruction}
 
 请输出修改后的完整 JSON 框架。保持一样的格式和字段，只修改用户要求的部分。
+
+## 章节编号规则（必须遵守）
+- 章节标题序号必须连续递增（"第一章"→"第二章"→...），不得重复、不得跳号
+- 新增章节的序号必须接在现有最大章节序号之后（顺延），例如现有最后一章为"第六章"时，新增章节应为"第七章"
+- 删除或插入章节后，必须对后续章节重新连续编号
+
 只输出 JSON，不要包含其他文字。"""
 
     try:
@@ -2361,7 +3382,7 @@ async def _summarize_one_subsection(
 ### 必须保留（不可删除/篡改）
 - 所有法规标准条款号（如 "ISO 13485 §7.3.2"、"GB 9706.224-2021 第4章"）
 - 所有具体技术参数和数值（如 "0.05 U/h"、"IPX8"、"3-7天"）
-- 表格中的数据行（保留表格，可精简表格周围说明文字）
+- 所有表格（含表号、表头、全部数据行）必须原样保留，不得删除任何表格、表头或数据行；只可精简表格周围说明文字
 - 核心结论和合规判定语句
 - 关键术语首次出现时的定义
 
@@ -2371,6 +3392,7 @@ async def _summarize_one_subsection(
 - 冗长的过渡句和铺垫（删除）
 - 同一标准的多条引用（合并为一条带多个条款号）
 - 非关键的示例和说明性文字
+- 涉及法规/标准的过程性、描述性语言（如"根据 GB XXXX 第 X 章规定……该条款要求……因此……"这类层层分析推导的叙述），直接精简为结论，删除分析推导过程；只保留条款号和最终结论
 
 ### 禁止
 - 编造原文没有的数据、条款号或参数
@@ -2401,9 +3423,9 @@ async def _summarize_one_subsection(
 ## ⚠️ 紧急要求：必须严格控制字数
 你之前的精简尝试未达标，现在需要更紧凑地精简。
 - 在不损伤语义前提下合并同义句、压缩冗长背景、删除过渡性描述
-- 表格保留完整列结构，可压缩单元格内冗余说明文字，但不得删除整列或破坏表格语义
+- 所有表格（含表号、表头、全部数据行）必须原样保留，不得删除任何表格、表头或数据行；只可精简表格周围说明文字
 - 表格单元格内文本必须保持语法完整、语义通顺，禁止单元格残句
-- 法规条款号可保留但删除其后的展开说明
+- 法规条款号保留，但删除其后的过程性展开说明和层层分析推导，直接写结论
 - 目标约 {target_chars} 字（最多 {hard_limit} 字）
 - **可读性约束仍然适用**：即使精简也必须保持语句完整、段落连贯，禁止悬空引用；如要删除被引用的内容，必须同时改写或删除引用本身"""
     if aggressive else ""
@@ -2547,7 +3569,7 @@ async def _summarize_one_subsection(
                   f"{new_chars}字 > 目标{target_chars}字×1.15={int(target_chars*1.15)}字，重试")
             retry_user_prompt = f"""上一轮精简后为 {new_chars} 字，仍超出目标 {target_chars} 字。
 请在保持语义完整和可读性的前提下，进一步精简以下内容，目标约 {target_chars} 字（最多 {hard_limit} 字）：
-合并重复表述、压缩冗长背景、删除非必要过渡句，保留核心结论、法规条款号和技术参数：
+合并重复表述、压缩冗长背景、删除非必要过渡句；所有表格（含表号、表头、数据行）必须原样保留不得删除；涉及法规的过程性描述直接写结论、删除分析推导；保留核心结论、法规条款号和技术参数：
 
 {cleaned}"""
             try:
@@ -3031,6 +4053,34 @@ def _user_asks_realtime(user_text: str) -> bool:
     return any(kw in user_text for kw in _REALTIME_TOPIC_KEYWORDS)
 
 
+def _user_asks_attachment_process(user_text: str) -> str | None:
+    """检测用户消息是否要求处理（修改/补全/精简）上传的附件文档。
+
+    用于 agent_engine._agent_node 的代码级兜底：当本地 LLM 未遵循提示词、
+    没有调用 modify_attachment / enrich_attachment / summarize_attachment 工具，
+    而是直接口头回答（甚至伪造"已生成/已下载"）时，据此强制触发对应工具调用。
+
+    返回 "modify" / "enrich" / "summarize"，未命中返回 None。
+    """
+    if not user_text:
+        return None
+    # 精简/压缩 → summarize（方向最明确，先判断）
+    if any(kw in user_text for kw in ("精简", "压缩", "删冗余", "删掉冗余", "缩短")):
+        return "summarize"
+    # 补全/补充/完善/缺失表格 → enrich（覆盖"补充缺失表格"场景）
+    if any(kw in user_text for kw in (
+        "补全", "补充", "完善", "扩写", "更完整", "更详细", "加表格", "加个表格",
+        "补个表格", "补充表格", "补全表格", "缺失", "缺表格", "缺了表格",
+    )):
+        return "enrich"
+    # 修改/改写/更新 → modify
+    if any(kw in user_text for kw in (
+        "修改", "改写", "更新", "改为", "改成", "调整", "修订", "帮我改",
+    )):
+        return "modify"
+    return None
+
+
 @tool
 async def web_search(query: str, doc_type: str = "design_development_plan") -> str:
     """搜索互联网获取最新信息。
@@ -3165,7 +4215,7 @@ async def analyze_document_structure(file_id: str = "") -> str:
         if not target_attachments:
             return json.dumps({
                 "status": "not_found",
-                "message": f"未找到 file_id={file_id} 的附件。",
+                "message": f"未找到 file_id={file_id} 的附件。可用附件: {_attachments_hint(attachments)}",
                 "structures": [],
             }, ensure_ascii=False)
 
@@ -3289,101 +4339,25 @@ async def analyze_document_structure(file_id: str = "") -> str:
     }, ensure_ascii=False)
 
 
-# ── Tool 8b: outline_from_attachment ──
+# ── 章节结构提取共享助手 (outline_from_attachment / outline_from_template 复用) ──
 
-@tool
-async def outline_from_attachment(
-    file_id: str = "",
-    doc_type: str = "design_development_plan",
-    product_name: str = "贴敷式胰岛素泵",
+class _OutlineExtractError(Exception):
+    """文档章节结构提取失败（含超时/解析错误）"""
+
+
+async def _extract_outline_from_text(
+    text_sample: str,
+    filename_display: str,
+    doc_label: str,
+    doc_type: str,
 ) -> str:
-    """基于上传附件的章节结构生成文档框架（附件优先路径）。
+    """从文档全文识别章节结构并补全 subsections/content_points，返回 design_outline 兼容 JSON。
 
-    当用户上传参考文档并希望按附件结构生成新文档时调用。
-    输出与 design_outline 完全兼容的格式，后续可直接调用 write_chapter 逐章生成。
-
-    与 design_outline 的区别:
-    - design_outline 由 LLM 自主设计框架（基于标准法规）
-    - outline_from_attachment 复用附件原有章节结构，LLM 仅补全小节和内容要点
-
-    何时用: 用户上传了附件 + 明确选择"按附件结构生成"时。
-    降级: 附件无可识别章节时返回 error，Agent 应回退到 design_outline。
-
-    Args:
-        file_id: 可选，指定要参照的附件 file_id。为空时自动取第一个有章节结构的附件。
-        doc_type: 目标文档类型标识，用于调整小节以适配目标文档类型特有维度。
-        product_name: 产品名称，用于生成 doc_title。
-
-    Returns:
-        JSON 字符串，格式与 design_outline 一致:
-        {"doc_title": "...", "chapters": [{"id", "title", "description",
-         "key_standards", "subsections": [{"title", "content_points"}]}]}
-        失败时返回 {"status": "error", "message": "..."}
+    供 outline_from_attachment / outline_from_template 复用。失败时抛出
+    _OutlineExtractError，由调用方格式化为带降级指引的错误 JSON。
     """
     from app.services.minimax import _call_minimax_api_raw
-    from app.services.doc_types import DOC_TYPE_LABELS
 
-    doc_label = DOC_TYPE_LABELS.get(doc_type, doc_type)
-
-    # Step 1: 从 _current_attachments 取目标附件
-    attachments = _current_attachments.get()
-    if not attachments:
-        return json.dumps({
-            "status": "error",
-            "message": "当前没有上传附件。请先上传参考文档，或改用 design_outline 自主设计框架。",
-        }, ensure_ascii=False)
-
-    # 确定要使用的附件列表
-    if file_id:
-        # 指定 file_id: 只用该附件（向后兼容）
-        target_att = next((a for a in attachments if a.get("file_id") == file_id), None)
-        if not target_att:
-            return json.dumps({
-                "status": "error",
-                "message": f"未找到 file_id={file_id} 的附件。请改用 design_outline。",
-            }, ensure_ascii=False)
-        target_attachments = [target_att]
-    else:
-        # 未指定 file_id: 使用所有有 full_text 的附件
-        target_attachments = [a for a in attachments if a.get("full_text")]
-
-    if not target_attachments:
-        return json.dumps({
-            "status": "error",
-            "message": "未找到可用的附件（所有附件均无文本内容）。请改用 design_outline。",
-        }, ensure_ascii=False)
-
-    # Step 2: 截取附件全文送给 LLM
-    # 多附件时等额分配 50000 字符预算，确保每个附件都有代表
-    TOTAL_BUDGET = 50000
-    n = len(target_attachments)
-    per_budget = TOTAL_BUDGET // n if n > 0 else TOTAL_BUDGET
-
-    text_parts = []
-    filenames = []
-    for att in target_attachments:
-        fn = att.get("filename", "unknown")
-        ft = att.get("full_text", "")
-        if not ft or not ft.strip():
-            continue
-        sample = ft[:per_budget]
-        if len(ft) > per_budget:
-            print(f"[agent_tools] outline_from_attachment: full_text truncated "
-                  f"({len(ft)} -> {per_budget} chars) for '{fn}'")
-        text_parts.append(f"=== 附件: {fn} ===\n{sample}")
-        filenames.append(fn)
-
-    if not text_parts:
-        return json.dumps({
-            "status": "error",
-            "message": "所有附件均无文本内容。请改用 design_outline。",
-        }, ensure_ascii=False)
-
-    text_sample = "\n\n".join(text_parts)
-    filename_display = ", ".join(filenames)
-
-    # Step 3: 一步 LLM 调用 — 直接从附件全文识别章节结构并补全 subsections + content_points
-    # 不再依赖 analyze_document_structure 的两步流程，避免中间格式转换损失和短窗口截断
     system_prompt = f"""你是医疗器械注册文档框架分析专家。请分析附件全文，识别其完整的章节结构，
 并输出与 design_outline 兼容的框架JSON。
 
@@ -3395,6 +4369,7 @@ async def outline_from_attachment(
 
 ## 关键约束
 - **必须保留附件原始章节顺序与标题**，不得增删章节或重命名
+- 章节标题序号必须连续递增（"第一章"→"第二章"→...），不得重复、不得跳号
 - 必须识别出附件的**所有**章节，不得遗漏（即使章节在文档末尾）
 - 每个章节至少2个小节，最多4个小节
 - 每个小节至少2条 content_points，最多4条
@@ -3446,21 +4421,12 @@ async def outline_from_attachment(
             timeout=300.0,
         )
     except asyncio.TimeoutError:
-        return json.dumps({
-            "status": "error",
-            "message": "附件框架识别超时（300秒）。请稍后重试，或改用 design_outline。",
-        }, ensure_ascii=False)
+        raise _OutlineExtractError("章节结构识别超时（300秒）。")
     except Exception as e:
-        return json.dumps({
-            "status": "error",
-            "message": f"附件框架识别失败: {str(e)}。请改用 design_outline。",
-        }, ensure_ascii=False)
+        raise _OutlineExtractError(f"章节结构识别失败: {str(e)}。")
 
     if not response:
-        return json.dumps({
-            "status": "error",
-            "message": "LLM 返回空结果，附件框架识别失败。请改用 design_outline。",
-        }, ensure_ascii=False)
+        raise _OutlineExtractError("LLM 返回空结果，章节结构识别失败。")
 
     # 复用 _extract_json 提取并清理 JSON
     outline_str = _extract_json(response)
@@ -3471,13 +4437,226 @@ async def outline_from_attachment(
         if not parsed.get("chapters"):
             raise ValueError("输出缺少 chapters 字段")
     except (json.JSONDecodeError, ValueError) as e:
+        raise _OutlineExtractError(f"章节结构识别输出格式无效: {str(e)}。")
+
+    return outline_str
+
+
+# ── Tool 8b: outline_from_attachment ──
+
+@tool
+async def outline_from_attachment(
+    file_id: str = "",
+    doc_type: str = "design_development_plan",
+    product_name: str = "贴敷式胰岛素泵",
+) -> str:
+    """基于上传附件的章节结构生成文档框架（附件优先路径）。
+
+    当用户上传参考文档并希望按附件结构生成新文档时调用。
+    输出与 design_outline 完全兼容的格式，后续可直接调用 write_chapter 逐章生成。
+
+    与 design_outline 的区别:
+    - design_outline 由 LLM 自主设计框架（基于标准法规）
+    - outline_from_attachment 复用附件原有章节结构，LLM 仅补全小节和内容要点
+
+    何时用: 用户上传了附件 + 明确选择"按附件结构生成"时。
+    降级: 附件无可识别章节时返回 error，Agent 应回退到 design_outline。
+
+    Args:
+        file_id: 可选，指定要参照的附件 file_id。为空时自动取第一个有章节结构的附件。
+        doc_type: 目标文档类型标识，用于调整小节以适配目标文档类型特有维度。
+        product_name: 产品名称，用于生成 doc_title。
+
+    Returns:
+        JSON 字符串，格式与 design_outline 一致:
+        {"doc_title": "...", "chapters": [{"id", "title", "description",
+         "key_standards", "subsections": [{"title", "content_points"}]}]}
+        失败时返回 {"status": "error", "message": "..."}
+    """
+    from app.services.doc_types import DOC_TYPE_LABELS
+
+    doc_label = DOC_TYPE_LABELS.get(doc_type, doc_type)
+
+    # Step 1: 从 _current_attachments 取目标附件
+    attachments = _current_attachments.get()
+    if not attachments:
         return json.dumps({
             "status": "error",
-            "message": f"附件框架识别输出格式无效: {str(e)}。请改用 design_outline。",
+            "message": "当前没有上传附件。请先上传参考文档，或改用 design_outline 自主设计框架。",
         }, ensure_ascii=False)
 
+    # 确定要使用的附件列表
+    if file_id:
+        # 指定 file_id: 只用该附件（向后兼容）
+        target_att = next((a for a in attachments if a.get("file_id") == file_id), None)
+        if not target_att:
+            return json.dumps({
+                "status": "error",
+                "message": f"未找到 file_id={file_id} 的附件。可用附件: {_attachments_hint(attachments)}。请改用 design_outline。",
+            }, ensure_ascii=False)
+        target_attachments = [target_att]
+    else:
+        # 未指定 file_id: 使用所有有 full_text 的附件
+        target_attachments = [a for a in attachments if a.get("full_text")]
+
+    if not target_attachments:
+        return json.dumps({
+            "status": "error",
+            "message": "未找到可用的附件（所有附件均无文本内容）。请改用 design_outline。",
+        }, ensure_ascii=False)
+
+    # Step 2: 截取附件全文送给 LLM
+    # 多附件时等额分配 50000 字符预算，确保每个附件都有代表
+    TOTAL_BUDGET = 50000
+    n = len(target_attachments)
+    per_budget = TOTAL_BUDGET // n if n > 0 else TOTAL_BUDGET
+
+    text_parts = []
+    filenames = []
+    for att in target_attachments:
+        fn = att.get("filename", "unknown")
+        ft = att.get("full_text", "")
+        if not ft or not ft.strip():
+            continue
+        sample = ft[:per_budget]
+        if len(ft) > per_budget:
+            print(f"[agent_tools] outline_from_attachment: full_text truncated "
+                  f"({len(ft)} -> {per_budget} chars) for '{fn}'")
+        text_parts.append(f"=== 附件: {fn} ===\n{sample}")
+        filenames.append(fn)
+
+    if not text_parts:
+        return json.dumps({
+            "status": "error",
+            "message": "所有附件均无文本内容。请改用 design_outline。",
+        }, ensure_ascii=False)
+
+    text_sample = "\n\n".join(text_parts)
+    filename_display = ", ".join(filenames)
+
+    # Step 3: 共享助手一步 LLM 调用，从附件全文识别章节结构并补全 subsections + content_points
+    try:
+        outline_str = await _extract_outline_from_text(
+            text_sample, filename_display, doc_label, doc_type
+        )
+    except _OutlineExtractError as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"{e}请改用 design_outline。",
+        }, ensure_ascii=False)
+
+    parsed = json.loads(outline_str)
     print(f"[agent_tools] outline_from_attachment: "
           f"{len(parsed.get('chapters', []))} chapters from attachment '{att.get('filename', '?')}'")
+    return outline_str
+
+
+# ── Tool 8c: outline_from_template (添加模板功能) ──
+
+@tool
+async def outline_from_template(
+    template_id: str = "",
+    doc_type: str = "design_development_plan",
+    product_name: str = "贴敷式胰岛素泵",
+) -> str:
+    """基于用户添加的模板文档的章节结构生成文档框架（模板优先路径）。
+
+    当用户添加了模板并希望按模板的章节结构和写作风格生成文档时调用。
+    输出与 design_outline 完全兼容的格式，后续可直接调用 write_chapter 逐章生成。
+
+    与 outline_from_attachment 的区别:
+    - outline_from_attachment 参照的是普通上传附件
+    - outline_from_template 参照的是用户通过「添加模板」功能登记的结构/风格模板，
+      应同时遵循模板的写作风格（短句、列表、小表格、参数化表达等）
+
+    何时用: 用户添加了模板 + 明确要求"按模板生成/参照模板"时。
+    降级: 模板无可识别章节时返回 error，Agent 应回退到 design_outline 或 outline_from_attachment。
+
+    Args:
+        template_id: 可选，指定要参照的模板 ID。为空时自动取第一个有章节结构的模板。
+        doc_type: 目标文档类型标识，用于调整小节以适配目标文档类型特有维度。
+        product_name: 产品名称，用于生成 doc_title。
+
+    Returns:
+        JSON 字符串，格式与 design_outline 一致:
+        {"doc_title": "...", "chapters": [{"id", "title", "description",
+         "key_standards", "subsections": [{"title", "content_points"}]}]}
+        失败时返回 {"status": "error", "message": "..."}
+    """
+    from app.services.doc_types import DOC_TYPE_LABELS
+
+    doc_label = DOC_TYPE_LABELS.get(doc_type, doc_type)
+
+    templates = _current_templates.get()
+    if not templates:
+        return json.dumps({
+            "status": "error",
+            "message": "当前没有添加模板。请先通过「添加模板」上传参考文档，"
+                       "或改用 design_outline 自主设计框架。",
+        }, ensure_ascii=False)
+
+    # 确定要使用的模板列表
+    if template_id:
+        target = next((t for t in templates if t.get("template_id") == template_id), None)
+        if not target:
+            return json.dumps({
+                "status": "error",
+                "message": f"未找到 template_id={template_id} 的模板。可用模板: {_templates_hint(templates)}。请改用 design_outline。",
+            }, ensure_ascii=False)
+        target_templates = [target]
+    else:
+        # 未指定 template_id: 使用所有有 full_text 的模板
+        target_templates = [t for t in templates if t.get("full_text")]
+
+    if not target_templates:
+        return json.dumps({
+            "status": "error",
+            "message": "未找到可用的模板（所有模板均无文本内容）。请改用 design_outline。",
+        }, ensure_ascii=False)
+
+    # 截取模板全文送给 LLM（等额分配 50000 字符预算，确保每个模板都有代表）
+    TOTAL_BUDGET = 50000
+    n = len(target_templates)
+    per_budget = TOTAL_BUDGET // n if n > 0 else TOTAL_BUDGET
+
+    text_parts = []
+    names = []
+    for tpl in target_templates:
+        fn = tpl.get("filename", "unknown")
+        ft = tpl.get("full_text", "")
+        if not ft or not ft.strip():
+            continue
+        sample = ft[:per_budget]
+        if len(ft) > per_budget:
+            print(f"[agent_tools] outline_from_template: full_text truncated "
+                  f"({len(ft)} -> {per_budget} chars) for '{fn}'")
+        text_parts.append(f"=== 模板: {fn} ===\n{sample}")
+        names.append(fn)
+
+    if not text_parts:
+        return json.dumps({
+            "status": "error",
+            "message": "所有模板均无文本内容。请改用 design_outline。",
+        }, ensure_ascii=False)
+
+    text_sample = "\n\n".join(text_parts)
+    name_display = ", ".join(names)
+
+    # 共享助手一步 LLM 调用，从模板全文识别章节结构并补全 subsections + content_points
+    try:
+        outline_str = await _extract_outline_from_text(
+            text_sample, name_display, doc_label, doc_type
+        )
+    except _OutlineExtractError as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"{e}请改用 design_outline 或 outline_from_attachment。",
+        }, ensure_ascii=False)
+
+    parsed = json.loads(outline_str)
+    print(f"[agent_tools] outline_from_template: "
+          f"{len(parsed.get('chapters', []))} chapters from template "
+          f"'{target_templates[0].get('filename', '?')}'")
     return outline_str
 
 
@@ -3517,7 +4696,7 @@ async def ingest_attachment_to_kb(file_id: str = "") -> str:
         if not target_attachments:
             return json.dumps({
                 "status": "not_found",
-                "message": f"未找到 file_id={file_id} 的附件。",
+                "message": f"未找到 file_id={file_id} 的附件。可用附件: {_attachments_hint(attachments)}",
                 "results": [],
             }, ensure_ascii=False)
 
@@ -3592,6 +4771,341 @@ async def ingest_attachment_to_kb(file_id: str = "") -> str:
     }, ensure_ascii=False)
 
 
+# ── 本地文件系统工具 ──
+
+_MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024   # 最大可读取文件大小 (10 MB)
+_MAX_READ_LINES = 500                      # 默认最大读取行数
+
+
+def _safe_resolve_path(user_path: str) -> str:
+    """安全解析用户提供的路径，展开 ~ 并转为绝对路径。
+
+    检查路径遍历攻击，拒绝访问文件系统根目录。
+
+    Args:
+        user_path: 用户提供的原始路径字符串
+
+    Returns:
+        规范化后的绝对路径
+
+    Raises:
+        ValueError: 路径为空或指向文件系统根目录
+    """
+    if not user_path or not user_path.strip():
+        raise ValueError("路径不能为空")
+
+    resolved = os.path.abspath(os.path.expanduser(user_path.strip()))
+
+    if resolved == os.path.abspath(os.sep):
+        raise ValueError("不允许访问文件系统根目录")
+
+    return resolved
+
+
+@tool
+async def list_local_directory(directory_path: str) -> str:
+    """列出指定本地目录的内容（文件与子目录）。
+
+    遍历目录路径，返回所有文件和子目录的列表，包含名称、类型（文件/目录）、
+    文件大小（字节）等信息。结果按名称排序，目录优先于文件。
+
+    何时用:
+    - 用户在对话中指定了一个本地目录路径，需要查看其内容
+    - 用户说"列出这个目录下的文件"、"看看这个文件夹里有什么"
+    - 需要选择要读取的文件时，先用此工具浏览目录
+
+    Args:
+        directory_path: 要列出内容的本地目录的绝对路径。用户对话中提供的路径。
+
+    Returns:
+        JSON格式，包含:
+        - status: "ok" | "error" | "not_found"
+        - directory_path: 规范化后的绝对路径
+        - entries: 条目列表，每项含 name, type, size_bytes
+        - total_files: 文件总数
+        - total_dirs: 目录总数
+    """
+    try:
+        resolved = _safe_resolve_path(directory_path)
+
+        if not os.path.exists(resolved):
+            return json.dumps({
+                "status": "not_found",
+                "message": f"目录不存在: {resolved}",
+                "directory_path": resolved,
+            }, ensure_ascii=False)
+
+        if not os.path.isdir(resolved):
+            return json.dumps({
+                "status": "error",
+                "message": (
+                    f"路径指向的是一个文件，不是目录，"
+                    f"请使用 read_local_file 读取: {resolved}"
+                ),
+                "directory_path": resolved,
+            }, ensure_ascii=False)
+
+        entries = []
+        try:
+            with os.scandir(resolved) as it:
+                for entry in it:
+                    item = {
+                        "name": entry.name,
+                        "type": "dir" if entry.is_dir() else "file",
+                    }
+                    if entry.is_file():
+                        try:
+                            item["size_bytes"] = entry.stat().st_size
+                        except OSError:
+                            item["size_bytes"] = -1
+                    entries.append(item)
+        except PermissionError:
+            return json.dumps({
+                "status": "error",
+                "message": f"权限不足，无法读取目录: {resolved}",
+                "directory_path": resolved,
+            }, ensure_ascii=False)
+
+        # 排序: 目录优先，同类按名称排序 (不区分大小写)
+        entries.sort(key=lambda e: (0 if e["type"] == "dir" else 1, e["name"].lower()))
+
+        files = [e for e in entries if e["type"] == "file"]
+        dirs = [e for e in entries if e["type"] == "dir"]
+
+        return json.dumps({
+            "status": "ok",
+            "directory_path": resolved,
+            "entries": entries,
+            "total_files": len(files),
+            "total_dirs": len(dirs),
+        }, ensure_ascii=False)
+
+    except ValueError as e:
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"读取目录时发生异常: {str(e)}",
+        }, ensure_ascii=False)
+
+
+@tool
+async def read_local_file(
+    file_path: str,
+    start_line: int = 0,
+    max_lines: int = 500,
+    encoding: str = "utf-8",
+) -> str:
+    """读取指定本地文件的文本内容。
+
+    支持任意类型的文本文件（代码、文档、配置、日志等），自动检测编码。
+    对于大文件，可通过 start_line 和 max_lines 参数控制读取范围，
+    避免返回过长内容。
+
+    何时用:
+    - 用户在对话中指定了一个本地文件路径，需要读取其内容
+    - 用户说"读取这个文件"、"看看这个文件内容"、"打开XXX"
+    - 先用 list_local_directory 浏览目录，再用此工具读取具体文件
+
+    Args:
+        file_path: 要读取的本地文件的绝对路径。用户对话中提供的路径。
+        start_line: 起始行号（从0开始），默认0表示从第一行开始。
+        max_lines: 最大读取行数，默认500行。超过此限制会截断并提示。
+        encoding: 文件编码，默认 "utf-8"。如读取失败会自动尝试 "gbk" 编码。
+
+    Returns:
+        JSON格式，包含:
+        - status: "ok" | "error" | "not_found"
+        - file_path: 规范化后的绝对路径
+        - file_name: 文件名
+        - content: 文件文本内容
+        - total_lines: 文件总行数
+        - start_line: 实际起始行号
+        - end_line: 实际结束行号
+        - truncated: 是否因超过 max_lines 而被截断
+        - size_bytes: 文件大小（字节）
+        - encoding_used: 实际使用的编码
+    """
+    try:
+        resolved = _safe_resolve_path(file_path)
+        file_name = os.path.basename(resolved)
+
+        if not os.path.exists(resolved):
+            return json.dumps({
+                "status": "not_found",
+                "message": f"文件不存在: {resolved}",
+                "file_path": resolved,
+            }, ensure_ascii=False)
+
+        if os.path.isdir(resolved):
+            return json.dumps({
+                "status": "error",
+                "message": (
+                    f"路径指向的是一个目录，不是文件，"
+                    f"请使用 list_local_directory 列出目录内容: {resolved}"
+                ),
+                "file_path": resolved,
+            }, ensure_ascii=False)
+
+        # 文件大小检查
+        try:
+            file_size = os.path.getsize(resolved)
+        except OSError:
+            file_size = -1
+
+        if file_size > _MAX_FILE_SIZE_BYTES:
+            return json.dumps({
+                "status": "error",
+                "message": (
+                    f"文件过大 ({file_size:,} bytes)，"
+                    f"超过最大读取限制 ({_MAX_FILE_SIZE_BYTES:,} bytes ≈ 10 MB)"
+                ),
+                "file_path": resolved,
+                "size_bytes": file_size,
+            }, ensure_ascii=False)
+
+        # 编码尝试链
+        encodings_to_try = [encoding, "gbk", "latin-1"]
+        seen = set()
+        encodings_to_try = [e for e in encodings_to_try if not (e in seen or seen.add(e))]
+
+        all_lines = None
+        encoding_used = None
+        last_error = None
+
+        for enc in encodings_to_try:
+            try:
+                with open(resolved, "r", encoding=enc) as f:
+                    all_lines = f.readlines()
+                encoding_used = enc
+                break
+            except (UnicodeDecodeError, UnicodeError) as e:
+                last_error = str(e)
+                continue
+            except PermissionError:
+                return json.dumps({
+                    "status": "error",
+                    "message": f"权限不足，无法读取文件: {resolved}",
+                    "file_path": resolved,
+                }, ensure_ascii=False)
+
+        if all_lines is None:
+            return json.dumps({
+                "status": "error",
+                "message": (
+                    f"无法解码文件内容，尝试了 {', '.join(encodings_to_try)} 编码均失败。"
+                    f"最后错误: {last_error}"
+                ),
+                "file_path": resolved,
+                "size_bytes": file_size if file_size >= 0 else None,
+            }, ensure_ascii=False)
+
+        total_lines = len(all_lines)
+
+        # 行范围截取
+        actual_start = max(0, min(start_line, total_lines - 1)) if total_lines > 0 else 0
+        actual_end = min(actual_start + max_lines, total_lines)
+        selected_lines = all_lines[actual_start:actual_end]
+        content = "".join(selected_lines)
+        truncated = (actual_end < total_lines)
+
+        return json.dumps({
+            "status": "ok",
+            "file_path": resolved,
+            "file_name": file_name,
+            "content": content,
+            "total_lines": total_lines,
+            "start_line": actual_start,
+            "end_line": actual_end,
+            "truncated": truncated,
+            "size_bytes": file_size if file_size >= 0 else None,
+            "encoding_used": encoding_used,
+        }, ensure_ascii=False)
+
+    except ValueError as e:
+        return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"读取文件时发生异常: {str(e)}",
+        }, ensure_ascii=False)
+
+
+@tool
+async def read_folder_file(file_path: str) -> str:
+    """读取已上传文件夹中的指定文件完整内容。
+
+    当需要查看文件夹中某个特定文件的完整代码或内容时使用此工具。
+    与 search_attachment 的区别：
+    - search_attachment 在所有附件中做关键词搜索，适合查找包含特定信息的文件
+    - read_folder_file 精确读取指定路径的文件全文，适合需要完整上下文的场景
+
+    使用前建议先查看系统提示中的目录树结构，确认文件路径。
+
+    Args:
+        file_path: 文件在文件夹中的相对路径，如 "src/utils/helper.py"。
+                   必须与系统提示目录树中的路径一致。
+
+    Returns:
+        JSON格式，包含文件完整内容、字符数、文件名等信息。
+    """
+    attachments = _current_attachments.get()
+    if not attachments:
+        return json.dumps({
+            "status": "no_attachments",
+            "message": "当前项目没有已上传的文件夹或附件",
+        }, ensure_ascii=False)
+
+    normalized = file_path.strip().lstrip("/").replace("\\", "/")
+
+    # 精确匹配 relative_path
+    for att in attachments:
+        att_path = (att.get("relative_path", "") or "").replace("\\", "/")
+        if att_path == normalized:
+            full_text = att.get("full_text", "")
+            if not full_text:
+                return json.dumps({
+                    "status": "no_content",
+                    "file_path": normalized,
+                    "filename": att.get("filename"),
+                    "message": (
+                        "该文件为二进制文件或内容为空，无法读取文本内容。"
+                        f"状态: {att.get('status', 'unknown')}"
+                    ),
+                }, ensure_ascii=False)
+            return json.dumps({
+                "status": "ok",
+                "file_path": normalized,
+                "filename": att.get("filename"),
+                "char_count": len(full_text),
+                "content": full_text,
+            }, ensure_ascii=False)
+
+    # 模糊匹配: 路径结尾匹配
+    candidates = []
+    for att in attachments:
+        att_path = (att.get("relative_path", "") or "").replace("\\", "/")
+        if att_path.endswith(normalized) or normalized in att_path:
+            candidates.append(att_path)
+
+    if len(candidates) == 1:
+        return await read_folder_file.ainvoke({"file_path": candidates[0]})
+    elif len(candidates) > 1:
+        return json.dumps({
+            "status": "ambiguous",
+            "message": f"找到多个匹配路径: {candidates}。请提供更精确的路径。",
+        }, ensure_ascii=False)
+
+    return json.dumps({
+        "status": "not_found",
+        "file_path": normalized,
+        "message": (
+            f"未找到路径为 '{normalized}' 的文件。"
+            "可用路径见系统提示中的目录树，或使用 search_attachment 搜索。"
+        ),
+    }, ensure_ascii=False)
+
+
 # ── SQL 数据库查询工具（内置贴敷式胰岛素泵领域库） ──
 
 @tool
@@ -3660,21 +5174,528 @@ async def sql_db_query(query: str) -> str:
         return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
 
 
+# ── PostgreSQL 数据库查询工具（用户自有 PG 库，与内置 SQLite 并存） ──
+
+@tool
+async def pgsql_list_tables() -> str:
+    """列出 PostgreSQL 数据库中的所有用户表名。
+
+    何时用: 用户提到要查询 PostgreSQL/PG 数据库里的数据，或需要从用户自有
+           业务库查询结构化数据时，最先调用此工具了解有哪些表。
+    与 sql_db_list_tables 的区别: sql_db_* 查内置贴敷式胰岛素泵领域 SQLite 库，
+           pgsql_* 查用户配置的 PostgreSQL 库（连接信息在 .env 的 PGSQL_* 变量）。
+
+    Returns:
+        str: 表名列表，或"未启用/无表"提示。
+    """
+    try:
+        from app.services.pgsql_client import list_tables
+        return await list_tables()
+    except Exception as e:
+        return f"[pgsql] 列出表失败: {str(e)}"
+
+
+@tool
+async def pgsql_schema(table_names: str) -> str:
+    """查看 PostgreSQL 指定表的列名、类型与示例数据。
+
+    何时用: 调用 pgsql_list_tables 拿到表名后，在编写 SQL 查询之前，
+           先用本工具确认目标表的列名和示例内容，避免查询不存在的列。
+
+    Args:
+        table_names: 逗号分隔的表名列表，如 "orders, customers"。
+           最多展示 6 张表。
+
+    Returns:
+        str: 每张表的列信息（Markdown 表格）+ 前3行示例数据，或错误信息。
+    """
+    try:
+        from app.services.pgsql_client import get_schema
+        return await get_schema(table_names)
+    except Exception as e:
+        return f"[pgsql] 获取表结构失败: {str(e)}"
+
+
+@tool
+async def pgsql_query(query: str) -> str:
+    """对 PostgreSQL 数据库执行只读 SQL 查询（SELECT/WITH/EXPLAIN）。
+
+    何时用: 已通过 pgsql_list_tables + pgsql_schema 确认表名和列名后，
+           需要执行具体查询获取数据时。
+    规则:
+    - 仅允许 SELECT/WITH/EXPLAIN，拒绝任何写操作
+    - 单次最多返回 50 行，超出自动截断
+    - 查询超时 10 秒
+
+    Args:
+        query: SQL 查询语句（SELECT 开头）。
+
+    Returns:
+        str: Markdown 表格格式的查询结果，或明确的错误信息。
+    """
+    try:
+        from app.services.pgsql_client import run_query
+        return await run_query(query)
+    except Exception as e:
+        return f"[pgsql] 查询执行失败: {str(e)}"
+
+
+# ── 计算/统计工具 ──
+# 纯函数计算（无 LLM / 无 I/O），为验证/测试报告、可靠性评估等场景
+# 提供真实、可追溯的数值，避免 LLM 编造数据。
+
+def _parse_numbers(text) -> list:
+    """将数字列表输入解析为 float 列表，兼容 JSON 数组/逗号/空格/分号/换行分隔。"""
+    if isinstance(text, (int, float)):
+        return [float(text)]
+    if isinstance(text, (list, tuple)):
+        vals = []
+        for v in text:
+            try:
+                vals.append(float(v))
+            except (TypeError, ValueError):
+                continue
+        return vals
+    s = str(text).strip()
+    if not s:
+        return []
+    if s.startswith("["):
+        try:
+            arr = json.loads(s)
+            return _parse_numbers(arr)
+        except Exception:
+            pass
+    import re
+    parts = re.split(r"[,\s;，；\n]+", s)
+    vals = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            vals.append(float(p))
+        except ValueError:
+            continue
+    return vals
+
+
+def _z_two_tailed(confidence: float) -> float:
+    """根据置信水平返回双侧 z 值（近似查表）。"""
+    table = {0.90: 1.645, 0.95: 1.960, 0.975: 2.241, 0.99: 2.576, 0.999: 3.291}
+    if confidence in table:
+        return table[confidence]
+    best = min(table, key=lambda c: abs(c - confidence))
+    return table[best]
+
+
+def _z_one_tailed(power: float) -> float:
+    """根据统计功效返回单侧 z 值（近似查表）。"""
+    table = {0.80: 0.842, 0.85: 1.036, 0.90: 1.282, 0.95: 1.645, 0.99: 2.326}
+    if power in table:
+        return table[power]
+    best = min(table, key=lambda c: abs(c - power))
+    return table[best]
+
+
+def _normal_cdf(x: float) -> float:
+    """标准正态分布 CDF（用误差函数计算）。"""
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def _t_test_pvalue(t_stat: float, df: float) -> float:
+    """计算 t 检验双侧 p 值；优先用 scipy（精确 t 分布），否则正态近似。"""
+    try:
+        from scipy import stats
+        return 2 * (1 - stats.t.cdf(abs(t_stat), df))
+    except Exception:
+        return 2 * (1 - _normal_cdf(abs(t_stat)))
+
+
+@tool
+def calculate_sample_size(
+    method: str,
+    confidence: float = 0.95,
+    margin: float = 0.0,
+    sigma: float = 0.0,
+    proportion: float = 0.5,
+    delta: float = 0.0,
+    power: float = 0.80,
+) -> str:
+    """计算样本量（验证/测试报告、临床试验、抽样检验等场景）。
+
+    方法 method 取值：
+    - "estimate_mean": 估计总体均值，n = (z·σ/E)²，需 sigma（标准差）与 margin（允许误差 E）
+    - "estimate_proportion": 估计总体比例，n = z²·p(1-p)/E²，需 proportion（预期比例，默认 0.5 最保守）与 margin
+    - "compare_means": 两样本均值比较，每组 n = 2(z_α+z_β)²σ²/Δ²，需 sigma、delta（最小可检出差异）、power（功效）
+
+    何时用: 文档要求说明"样本量如何确定"时（如输注精度测试测多少个样品、
+    加速老化测多少个批次），用本工具给出可追溯的样本量依据，而非凭空写一个数。
+
+    Args:
+        method: 计算方法（estimate_mean / estimate_proportion / compare_means）
+        confidence: 置信水平（0.90 / 0.95 / 0.99），默认 0.95
+        margin: 允许误差 E（estimate_mean / estimate_proportion 用）
+        sigma: 总体标准差 σ（estimate_mean / compare_means 用）
+        proportion: 预期比例 p（estimate_proportion 用，默认 0.5）
+        delta: 最小可检出差异 Δ（compare_means 用）
+        power: 统计功效（compare_means 用，默认 0.80）
+
+    Returns:
+        str: 含计算公式、代入值与结果的说明文本。
+    """
+    method = (method or "").strip().lower()
+    z = _z_two_tailed(confidence)
+    if method == "estimate_mean":
+        if sigma <= 0 or margin <= 0:
+            return "参数错误：estimate_mean 需要 sigma>0 且 margin>0。"
+        n = (z * sigma / margin) ** 2
+        return (
+            "样本量计算结果（估计总体均值）\n"
+            f"- 公式: n = (z·σ/E)²\n"
+            f"- 置信水平: {confidence:.0%} → z = {z:.3f}\n"
+            f"- 标准差 σ = {sigma}\n"
+            f"- 允许误差 E = {margin}\n"
+            f"- 所需样本量 n = {n:.2f} → 向上取整 **{math.ceil(n)}**"
+        )
+    if method == "estimate_proportion":
+        if not (0 < proportion < 1) or margin <= 0:
+            return "参数错误：estimate_proportion 需要 0<proportion<1 且 margin>0。"
+        n = (z ** 2) * proportion * (1 - proportion) / (margin ** 2)
+        return (
+            "样本量计算结果（估计总体比例）\n"
+            f"- 公式: n = z²·p(1-p)/E²\n"
+            f"- 置信水平: {confidence:.0%} → z = {z:.3f}\n"
+            f"- 预期比例 p = {proportion}\n"
+            f"- 允许误差 E = {margin}\n"
+            f"- 所需样本量 n = {n:.2f} → 向上取整 **{math.ceil(n)}**"
+        )
+    if method == "compare_means":
+        if sigma <= 0 or delta <= 0:
+            return "参数错误：compare_means 需要 sigma>0 且 delta>0。"
+        zb = _z_one_tailed(power)
+        n = 2 * ((z + zb) ** 2) * (sigma ** 2) / (delta ** 2)
+        return (
+            "样本量计算结果（两样本均值比较）\n"
+            f"- 公式: n/组 = 2(z_α + z_β)²σ²/Δ²\n"
+            f"- 置信水平: {confidence:.0%} → z_α = {z:.3f}\n"
+            f"- 功效: {power:.0%} → z_β = {zb:.3f}\n"
+            f"- 标准差 σ = {sigma}\n"
+            f"- 最小可检出差异 Δ = {delta}\n"
+            f"- 每组样本量 n = {n:.2f} → 向上取整 **{math.ceil(n)}**"
+        )
+    return f"参数错误：未知 method '{method}'。可选: estimate_mean / estimate_proportion / compare_means。"
+
+
+@tool
+def calculate_process_capability(measurements: str, usl: float, lsl: float) -> str:
+    """计算过程能力指数 Cp/Cpk（输注精度、尺寸等关键质量特性的过程能力评估）。
+
+    何时用: 文档要求评估某关键参数的过程能力（如输注精度 Cpk、关键尺寸 Cpk）时，
+    用本工具根据实测数据计算 Cp/Cpk，而非凭经验写一个值。
+
+    Args:
+        measurements: 测量数据，用逗号/空格/分号分隔，如 "12.3, 12.5, 12.4, 12.6, 12.5"
+        usl: 规格上限 USL
+        lsl: 规格下限 LSL
+
+    Returns:
+        str: 均值、标准差、Cp、Cpk 及是否达标（Cpk≥1.33 为常用接受准则）。
+    """
+    data = _parse_numbers(measurements)
+    if len(data) < 2:
+        return "参数错误：measurements 至少需要 2 个数值。"
+    if usl <= lsl:
+        return "参数错误：usl 必须大于 lsl。"
+    mu = statistics.mean(data)
+    s = statistics.stdev(data)
+    if s == 0:
+        return "参数错误：数据标准差为 0，无法计算过程能力（数据全相同）。"
+    cp = (usl - lsl) / (6 * s)
+    cpu = (usl - mu) / (3 * s)
+    cpl = (mu - lsl) / (3 * s)
+    cpk = min(cpu, cpl)
+    verdict = "达标（Cpk ≥ 1.33）" if cpk >= 1.33 else "未达标（Cpk < 1.33）"
+    return (
+        "过程能力计算结果\n"
+        f"- 样本量 n = {len(data)}\n"
+        f"- 均值 μ = {mu:.4f}\n"
+        f"- 标准差 σ = {s:.4f}\n"
+        f"- Cp = (USL-LSL)/(6σ) = {cp:.3f}\n"
+        f"- Cpu = {cpu:.3f}, Cpl = {cpl:.3f}\n"
+        f"- Cpk = min(Cpu, Cpl) = **{cpk:.3f}**\n"
+        f"- 结论: {verdict}"
+    )
+
+
+@tool
+def calculate_reliability(
+    method: str,
+    total_time: float = 0.0,
+    failures: int = 0,
+    ea_ev: float = 0.0,
+    temp_use_c: float = 0.0,
+    temp_accel_c: float = 0.0,
+    accel_days: float = 0.0,
+    mtbf: float = 0.0,
+    time: float = 0.0,
+) -> str:
+    """可靠性计算（MTBF、Arrhenius 加速老化、可靠度）。
+
+    方法 method 取值：
+    - "mtbf": MTBF = 累计运行时间 / 故障数；λ = 1/MTBF。需 total_time、failures
+    - "arrhenius": 加速老化换算，AF = exp[(Ea/k)·(1/T_use - 1/T_accel)]。需 ea_ev（活化能 eV）、
+      temp_use_c（实际使用温度℃）、temp_accel_c（加速温度℃）、accel_days（加速天数）
+    - "reliability": 可靠度 R(t) = exp(-t/MTBF)。需 mtbf、time
+
+    何时用: 可靠性文档、加速老化验证、有效期评估等需要给出 MTBF / 加速因子 / 可靠度时。
+
+    Args:
+        method: 计算方法（mtbf / arrhenius / reliability）
+        total_time: 累计运行时间（小时，mtbf 用）
+        failures: 故障数（mtbf 用）
+        ea_ev: 活化能 Ea（eV，arrhenius 用，常见 0.5~1.0）
+        temp_use_c: 实际使用温度（℃，arrhenius 用）
+        temp_accel_c: 加速老化温度（℃，arrhenius 用）
+        accel_days: 加速老化天数（arrhenius 用）
+        mtbf: MTBF（小时，reliability 用）
+        time: 目标时间（小时，reliability 用）
+
+    Returns:
+        str: 含公式、代入值与结果的说明文本。
+    """
+    method = (method or "").strip().lower()
+    k = 8.617333e-5  # 玻尔兹曼常数 eV/K
+    if method == "mtbf":
+        if failures <= 0:
+            return "参数错误：mtbf 需要 failures>0。"
+        mtbf_val = total_time / failures
+        lam = failures / total_time
+        return (
+            "可靠性计算结果（MTBF）\n"
+            f"- 公式: MTBF = 累计运行时间 / 故障数\n"
+            f"- 累计运行时间 = {total_time} 小时\n"
+            f"- 故障数 = {failures}\n"
+            f"- MTBF = **{mtbf_val:.2f} 小时**\n"
+            f"- 失效率 λ = {lam:.6f} /小时"
+        )
+    if method == "arrhenius":
+        if ea_ev <= 0 or accel_days <= 0:
+            return "参数错误：arrhenius 需要 ea_ev>0 且 accel_days>0。"
+        t_use = temp_use_c + 273.15
+        t_accel = temp_accel_c + 273.15
+        if t_use <= 0 or t_accel <= t_use:
+            return "参数错误：温度需合理（加速温度应高于使用温度）。"
+        af = math.exp((ea_ev / k) * (1 / t_use - 1 / t_accel))
+        real_days = accel_days * af
+        return (
+            "可靠性计算结果（Arrhenius 加速老化）\n"
+            f"- 公式: AF = exp[(Ea/k)·(1/T_use - 1/T_accel)]\n"
+            f"- 活化能 Ea = {ea_ev} eV\n"
+            f"- 使用温度 T_use = {t_use:.1f} K（{temp_use_c}℃）\n"
+            f"- 加速温度 T_accel = {t_accel:.1f} K（{temp_accel_c}℃）\n"
+            f"- 加速因子 AF = **{af:.2f}**\n"
+            f"- 加速 {accel_days} 天 ≈ 等效实际 **{real_days:.1f} 天**（{real_days / 365:.2f} 年）"
+        )
+    if method == "reliability":
+        if mtbf <= 0 or time < 0:
+            return "参数错误：reliability 需要 mtbf>0 且 time≥0。"
+        r = math.exp(-time / mtbf)
+        return (
+            "可靠性计算结果（可靠度）\n"
+            f"- 公式: R(t) = exp(-t/MTBF)\n"
+            f"- MTBF = {mtbf} 小时\n"
+            f"- 目标时间 t = {time} 小时\n"
+            f"- 可靠度 R(t) = **{r:.6f}**（{r:.2%}）"
+        )
+    return f"参数错误：未知 method '{method}'。可选: mtbf / arrhenius / reliability。"
+
+
+@tool
+def calculate_statistics(
+    method: str,
+    data: str = "",
+    sample1: str = "",
+    sample2: str = "",
+    alpha: float = 0.05,
+) -> str:
+    """描述统计与假设检验。
+
+    方法 method 取值：
+    - "descriptive": 描述统计（均值/中位数/标准差/极差/95%置信区间）。需 data
+    - "t_test": 独立两样本 t 检验（Welch 校正，比较两组均值差异是否显著）。需 sample1、sample2
+
+    何时用: 需要汇总一组测量数据的统计量，或比较两组测试数据是否有显著差异时。
+
+    Args:
+        method: 计算方法（descriptive / t_test）
+        data: 数据（descriptive 用，逗号/空格/分号分隔）
+        sample1: 第一组样本（t_test 用）
+        sample2: 第二组样本（t_test 用）
+        alpha: 显著性水平（t_test 用，默认 0.05）
+
+    Returns:
+        str: 统计结果说明。
+    """
+    method = (method or "").strip().lower()
+    if method == "descriptive":
+        d = _parse_numbers(data)
+        if not d:
+            return "参数错误：descriptive 需要至少 1 个数值。"
+        n = len(d)
+        mu = statistics.mean(d)
+        med = statistics.median(d)
+        if n >= 2:
+            s = statistics.stdev(d)
+            z = _z_two_tailed(0.95)
+            ci = z * s / math.sqrt(n)
+        else:
+            s = 0.0
+            ci = 0.0
+        return (
+            "描述统计结果\n"
+            f"- 样本量 n = {n}\n"
+            f"- 均值 = {mu:.4f}\n"
+            f"- 中位数 = {med:.4f}\n"
+            f"- 标准差 = {s:.4f}\n"
+            f"- 最小值 = {min(d):.4f}, 最大值 = {max(d):.4f}\n"
+            f"- 极差 = {max(d) - min(d):.4f}\n"
+            f"- 95% 置信区间: [{mu - ci:.4f}, {mu + ci:.4f}]"
+        )
+    if method == "t_test":
+        a = _parse_numbers(sample1)
+        b = _parse_numbers(sample2)
+        if len(a) < 2 or len(b) < 2:
+            return "参数错误：t_test 需要两组样本各至少 2 个数值。"
+        ma = statistics.mean(a)
+        mb = statistics.mean(b)
+        va = statistics.variance(a)
+        vb = statistics.variance(b)
+        na = len(a)
+        nb = len(b)
+        se = math.sqrt(va / na + vb / nb)
+        if se == 0:
+            return "参数错误：两组数据方差为 0，无法进行 t 检验。"
+        t = (ma - mb) / se
+        df = ((va / na + vb / nb) ** 2) / (
+            (va / na) ** 2 / (na - 1) + (vb / nb) ** 2 / (nb - 1)
+        )
+        p = _t_test_pvalue(t, df)
+        sig = "显著" if p < alpha else "不显著"
+        return (
+            "独立两样本 t 检验结果（Welch 校正）\n"
+            f"- 组1: n={na}, 均值={ma:.4f}, 方差={va:.4f}\n"
+            f"- 组2: n={nb}, 均值={mb:.4f}, 方差={vb:.4f}\n"
+            f"- 均值差 = {ma - mb:.4f}\n"
+            f"- t 统计量 = {t:.4f}\n"
+            f"- 自由度 df ≈ {df:.2f}\n"
+            f"- p 值 ≈ {p:.4f}\n"
+            f"- 显著性水平 α = {alpha}\n"
+            f"- 结论: 在 α={alpha} 水平下，两组均值差异**{sig}**"
+        )
+    return f"参数错误：未知 method '{method}'。可选: descriptive / t_test。"
+
+
+# ── 补充提示词生成工具 ──
+# 当用户提出编写文档的具体要求或对当前文档的修改意见时，主代理调用此工具，
+# 将用户要求转化为一套结构化的「补充提示词」。这些补充提示词会被**追加**到
+# 各文档生成工具（generate_section / revise_section / revise_paragraph / write_chapter）
+# 的 system_prompt 末尾，作为对原有提示词的补充（不覆盖、不破坏原有提示词）。
+
+_SUPPLEMENTARY_SYSTEM_PROMPT = """你是文档生成提示词工程师。用户提出了一些文档编写要求或修改意见，你的任务是把这些要求转化为一套清晰、具体、可执行的「补充提示词」。
+
+这些补充提示词会被**追加**到原有文档生成提示词的末尾，作为对原有提示词的补充。因此：
+
+1. 只输出「补充要求」本身，不要重复原有提示词中已有的通用规则（如"内容专业""用中文""符合NMPA"等）
+2. 每条补充要求要具体、可操作，明确指出"应该怎么做"或"不要怎么做"
+3. 用简洁的要点列表表达，每条一行，以 `- ` 开头
+4. 严格保留用户要求的原意，不要擅自扩展或缩小范围，不要臆造用户未提及的要求
+5. 只输出补充提示词正文，不要输出任何解释、前言、JSON 围栏或 markdown 代码块"""
+
+
+@tool
+async def generate_supplementary_prompt(
+    requirement: str,
+    doc_type: str = "design_development_plan",
+) -> str:
+    """将用户提出的文档编写要求或修改意见转化为一套「补充提示词」。
+
+    当用户提出以下需求时调用此工具：
+    - 对文档编写提出额外要求（如"风险等级用中文不用英文"、"表格统一用三线表"）
+    - 对已生成文档提出修改意见（如"把严重度分级改成3级"、"增加EO灭菌验证要求"）
+    - 指定特定格式、风格、术语、字数、结构等要求
+
+    生成的补充提示词会被**追加**到文档生成工具的原有提示词末尾，
+    作为对原有提示词的补充（不会覆盖或破坏原有提示词）。
+
+    Args:
+        requirement: 用户的原始要求或修改意见（完整原文，尽量原样传入）
+        doc_type: 文档类型标识，从当前会话状态的 doc_type 字段获取
+
+    Returns:
+        JSON 字符串，含 status 和 supplementary_prompt 字段。
+        supplementary_prompt 为生成的补充提示词正文，由系统累积追加到后续生成任务。
+    """
+    from app.services.minimax import _call_minimax_api_raw
+    from app.services.doc_types import DOC_TYPE_LABELS
+
+    doc_label = DOC_TYPE_LABELS.get(doc_type, doc_type)
+
+    user_prompt = (
+        f"文档类型：{doc_label}\n\n"
+        f"用户的原始要求/修改意见：\n{requirement}\n\n"
+        f"请把上述要求转化为一套补充提示词（追加到原有提示词末尾）："
+    )
+
+    try:
+        result = _call_minimax_api_raw(
+            _SUPPLEMENTARY_SYSTEM_PROMPT,
+            user_prompt,
+            temperature=0.3,
+            max_tokens=2048,
+            timeout=(30, 120),
+        )
+        sp_text = (result or "").strip()
+        if not sp_text:
+            return json.dumps({
+                "status": "error",
+                "message": "补充提示词生成失败：API 返回空结果。",
+            }, ensure_ascii=False)
+        # 去掉可能残留的 markdown 围栏
+        sp_text = re.sub(r"^```(?:markdown)?\s*\n?", "", sp_text)
+        sp_text = re.sub(r"\n?```\s*$", "", sp_text)
+        return json.dumps({
+            "status": "ok",
+            "supplementary_prompt": sp_text,
+            "requirement": requirement[:200],
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "message": f"补充提示词生成异常: {str(e)}",
+        }, ensure_ascii=False)
+
+
 # ── 工具列表导出 ──
 
 PHASE1_TOOLS = [
     search_kb,
     search_attachment,
+    search_template,
     modify_attachment,
+    enrich_attachment,
+    summarize_attachment,
     web_search,
     analyze_document_structure,
     ingest_attachment_to_kb,
     generate_search_query,
     generate_section,
     revise_section,
+    revise_paragraph,
+    generate_supplementary_prompt,
     build_docx,
     design_outline,
     outline_from_attachment,
+    outline_from_template,
     write_chapter,
     update_outline,
     summarize_section,
@@ -3683,4 +5704,17 @@ PHASE1_TOOLS = [
     sql_db_list_tables,
     sql_db_schema,
     sql_db_query,
+    # PostgreSQL 数据库查询（2026-08-18 集成）
+    pgsql_list_tables,
+    pgsql_schema,
+    pgsql_query,
+    # 本地文件系统工具
+    list_local_directory,
+    read_local_file,
+    read_folder_file,
+    # 计算/统计工具（2026-08-19 集成）
+    calculate_sample_size,
+    calculate_process_capability,
+    calculate_reliability,
+    calculate_statistics,
 ]

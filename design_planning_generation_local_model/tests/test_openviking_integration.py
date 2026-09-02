@@ -47,16 +47,18 @@ async def test_capture_silent_degradation_when_unavailable():
 
 @pytest.mark.asyncio
 async def test_capture_silent_degradation_on_exception():
-    """recorder.arecord 抛异常时不传播（critical gap 验证）。
+    """add_message 抛异常时不传播（critical gap 验证）。
 
-    场景：OpenViking 服务器运行中崩溃，arecord 抛连接异常。
+    场景：OpenViking 服务器运行中崩溃，写入消息抛连接异常。
     期望：capture_messages 捕获异常仅记日志，不中断 Agent。
     """
     from app.services.openviking_client import OpenVikingService
     svc = OpenVikingService()
-    # 模拟 recorder 抛异常（服务器崩溃）
+    # 模拟 async client 写入时抛异常（服务器崩溃）
+    mock_client = MagicMock()
+    mock_client.add_message = AsyncMock(side_effect=ConnectionError("server crash"))
     mock_recorder = MagicMock()
-    mock_recorder.arecord = AsyncMock(side_effect=ConnectionError("server crash"))
+    mock_recorder.get_async_client = AsyncMock(return_value=mock_client)
     svc._recorder = mock_recorder
 
     # 不应抛异常
@@ -70,11 +72,10 @@ async def test_capture_empty_session_id_skipped():
     from app.services.openviking_client import OpenVikingService
     svc = OpenVikingService()
     mock_recorder = MagicMock()
-    mock_recorder.arecord = AsyncMock()
     svc._recorder = mock_recorder
 
     await svc.capture_messages([HumanMessage(content="test")], "")
-    mock_recorder.arecord.assert_not_called()
+    mock_recorder.get_async_client.assert_not_called()
 
 
 # ── 测试增量捕获 + session 隔离 ──
@@ -85,23 +86,21 @@ async def test_capture_incremental():
     from app.services.openviking_client import OpenVikingService
 
     svc = OpenVikingService()
+    mock_client = MagicMock()
+    mock_client.add_message = AsyncMock()
     mock_recorder = MagicMock()
-    mock_recorder.arecord = AsyncMock(return_value=MagicMock())
+    mock_recorder.get_async_client = AsyncMock(return_value=mock_client)
     svc._recorder = mock_recorder
 
     # 第一次：1 条消息
     msgs1 = [HumanMessage(content="hello")]
     await svc.capture_messages(msgs1, "session-1")
-    mock_recorder.arecord.assert_called_once()
-    captured_args = mock_recorder.arecord.call_args
-    assert len(captured_args[0][1]) == 1  # 第二个位置参数是 messages
+    assert mock_client.add_message.call_count == 1
 
     # 第二次：2 条消息（增量 1 条）
     msgs2 = [HumanMessage(content="hello"), AIMessage(content="hi")]
     await svc.capture_messages(msgs2, "session-1")
-    assert mock_recorder.arecord.call_count == 2
-    captured_args = mock_recorder.arecord.call_args
-    assert len(captured_args[0][1]) == 1  # 只捕获增量 1 条
+    assert mock_client.add_message.call_count == 2  # 只捕获增量 1 条
 
 
 @pytest.mark.asyncio
@@ -110,17 +109,19 @@ async def test_capture_no_new_messages_skipped():
     from app.services.openviking_client import OpenVikingService
 
     svc = OpenVikingService()
+    mock_client = MagicMock()
+    mock_client.add_message = AsyncMock()
     mock_recorder = MagicMock()
-    mock_recorder.arecord = AsyncMock()
+    mock_recorder.get_async_client = AsyncMock(return_value=mock_client)
     svc._recorder = mock_recorder
 
     msgs = [HumanMessage(content="hello")]
     await svc.capture_messages(msgs, "session-1")
-    assert mock_recorder.arecord.call_count == 1
+    assert mock_client.add_message.call_count == 1
 
-    # 再次传入相同消息：无增量，不应调用 arecord
+    # 再次传入相同消息：无增量，不应调用 add_message
     await svc.capture_messages(msgs, "session-1")
-    assert mock_recorder.arecord.call_count == 1  # 仍为 1
+    assert mock_client.add_message.call_count == 1  # 仍为 1
 
 
 @pytest.mark.asyncio
@@ -129,20 +130,22 @@ async def test_capture_session_isolation():
     from app.services.openviking_client import OpenVikingService
 
     svc = OpenVikingService()
+    mock_client = MagicMock()
+    mock_client.add_message = AsyncMock()
     mock_recorder = MagicMock()
-    mock_recorder.arecord = AsyncMock(return_value=MagicMock())
+    mock_recorder.get_async_client = AsyncMock(return_value=mock_client)
     svc._recorder = mock_recorder
 
     await svc.capture_messages([HumanMessage(content="a")], "session-A")
     await svc.capture_messages([HumanMessage(content="b")], "session-B")
 
-    assert mock_recorder.arecord.call_count == 2
+    assert mock_client.add_message.call_count == 2
 
     # session-A 第二次：1 条新增
     await svc.capture_messages(
         [HumanMessage(content="a"), AIMessage(content="reply-a")], "session-A"
     )
-    assert mock_recorder.arecord.call_count == 3
+    assert mock_client.add_message.call_count == 3
 
 
 # ── 测试 capture-only 工具过滤（决策 #3 合规收窄）──

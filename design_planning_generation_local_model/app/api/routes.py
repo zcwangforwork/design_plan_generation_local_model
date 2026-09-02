@@ -14,7 +14,9 @@ from app.services.attachment_service import (
 )
 from app.services.conversation import conversation_manager
 import io
+import json
 import os
+import re
 import time
 import zipfile
 from typing import Optional, List
@@ -414,6 +416,22 @@ async def get_extract_task_status(file_id: str):
     if status is None:
         raise HTTPException(status_code=404, detail="任务不存在或已过期")
     return status
+
+
+@router.get("/kb/files")
+async def list_kb_files():
+    """列出上传知识库（qms_doc_uploads）中的所有文件及其统计信息"""
+    try:
+        from app.services.rag.vector_store import VectorStore
+        store = VectorStore(collection_name="uploads")
+        files = store.list_uploaded_files()
+        return {
+            "status": "ok",
+            "count": len(files),
+            "files": files,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询知识库文件列表失败: {str(e)}")
 
 
 @router.get("/debug/env")
@@ -1065,13 +1083,19 @@ async def agent_update_document(project_id: str, request: DocumentUpdateRequest)
 
 @router.get("/agent/projects/{project_id}/download")
 async def agent_download_document(project_id: str):
-    """直接从Agent状态组装文档并下载.docx（无需Agent参与）
+    """直接从Agent状态组装文档并下载（无需Agent参与）
 
-    读取 generated_sections，组装为完整Markdown，
-    通过TemplateService构建.docx并返回。
+    普通文档读取 generated_sections 组装为完整Markdown，通过TemplateService构建.docx；
+    风险分析总表类文档（product_risk_analysis_matrix / cybersecurity_risk_analysis_matrix）
+    则调用 risk_excel 生成 .xlsx（与参考「风险分析和管理总表」格式一致）。
     """
     from app.services.agent_engine import get_agent
     from app.services.template import TemplateService
+    from app.services.risk_excel import (
+        is_risk_matrix_doc, generate_risk_rows, build_risk_excel,
+    )
+    import asyncio
+    from urllib.parse import quote
 
     agent = get_agent()
     config = {"configurable": {"thread_id": project_id}}
@@ -1085,8 +1109,34 @@ async def agent_download_document(project_id: str):
         raise HTTPException(status_code=404, detail="项目不存在或尚未开始")
 
     values = state.values
-    generated = values.get("generated_sections", {}) or {}
+    doc_type = values.get("doc_type", "design_development_plan")
     product_name = values.get("product_name", "") or "贴敷式胰岛素泵"
+
+    # ── 风险分析总表类文档 → 直接导出 Excel (.xlsx) ──
+    if is_risk_matrix_doc(doc_type):
+        classification = values.get("product_classification", "") or ""
+        intended_use = values.get("product_intended_use", "") or ""
+        rows = await asyncio.to_thread(
+            generate_risk_rows, doc_type, product_name, classification, intended_use
+        )
+        if not rows:
+            raise HTTPException(
+                status_code=500,
+                detail="风险条目生成失败（模型未返回有效数据），请稍后重试",
+            )
+        file_bytes = await asyncio.to_thread(build_risk_excel, doc_type, rows)
+        label = DOC_TYPE_LABELS.get(doc_type, "风险分析和管理总表")
+        filename = f"{product_name}_{label}.xlsx"
+        encoded_filename = quote(filename)
+        return StreamingResponse(
+            io.BytesIO(file_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
+            },
+        )
+
+    generated = values.get("generated_sections", {}) or {}
 
     if not generated:
         raise HTTPException(status_code=400, detail="尚未生成任何章节，请先在Agent对话中生成文档")
@@ -1096,23 +1146,24 @@ async def agent_download_document(project_id: str):
     # 修订/重新生成同名小节时 dict 顺序自动保留，避免重排导致顺序错乱
     full_markdown = "\n\n".join(generated.values())
 
-    # 读取实际的 doc_type，非硬编码
-    doc_type = values.get("doc_type", "design_development_plan")
     doc_label = DOC_TYPE_LABELS.get(doc_type, "设计策划文档")
 
-    # 构建.docx
-    template_service = TemplateService()
-    doc = template_service.load_template(doc_type)
-    doc = template_service.fill_template(
-        doc=doc,
-        content=full_markdown,
-        product_name=product_name,
-        doc_type=doc_type,
-    )
-    file_bytes = template_service.document_to_bytes(doc)
+    # 构建.docx：fill_template 内部会用 Playwright 同步 API 渲染 mermaid 流程图，
+    # 而 Playwright 同步 API 不能在 asyncio 事件循环线程内运行，故放入独立线程执行。
+    def _build_docx():
+        template_service = TemplateService()
+        doc = template_service.load_template(doc_type)
+        doc = template_service.fill_template(
+            doc=doc,
+            content=full_markdown,
+            product_name=product_name,
+            doc_type=doc_type,
+        )
+        return template_service.document_to_bytes(doc)
+
+    file_bytes = await asyncio.to_thread(_build_docx)
 
     filename = f"{product_name}_{doc_label}.docx"
-    from urllib.parse import quote
     encoded_filename = quote(filename)
 
     return StreamingResponse(
@@ -1126,7 +1177,7 @@ async def agent_download_document(project_id: str):
 
 @router.get("/agent/download/{download_id}")
 async def agent_download_docx(download_id: str):
-    """下载Agent通过 build_docx 工具生成的Word文档"""
+    """下载Agent通过 build_docx 工具生成的文档（Word .docx 或风险总表 .xlsx）"""
     from app.services.agent_tools import _get_docx
 
     docx_data = _get_docx(download_id)
@@ -1135,10 +1186,14 @@ async def agent_download_docx(download_id: str):
 
     from urllib.parse import quote
     encoded_filename = quote(docx_data["filename"])
+    content_type = docx_data.get(
+        "content_type",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
 
     return StreamingResponse(
         io.BytesIO(docx_data["bytes"]),
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        media_type=content_type,
         headers={
             "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
         }
@@ -1182,6 +1237,62 @@ async def agent_list_modified_documents(project_id: str):
     }
 
 
+@router.post("/agent/projects/{project_id}/undo")
+async def agent_undo(project_id: str):
+    """回退到最近一次文档修改/生成/精简/附件修改之前的状态（单步撤销）。
+
+    从 Agent 状态的 undo_stack 弹出栈顶快照，恢复 generated_sections 中被覆盖的章节
+    与 attachment_modifications 列表，并持久化。
+    """
+    from app.services.agent_engine import get_agent
+
+    agent = get_agent()
+    config = {"configurable": {"thread_id": project_id}}
+
+    try:
+        state = await agent.aget_state(config)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"无法读取Agent状态: {str(e)}")
+
+    if not state or not state.values:
+        raise HTTPException(status_code=404, detail="项目不存在或尚未开始")
+
+    values = state.values
+    undo_stack = list(values.get("undo_stack", []) or [])
+    if not undo_stack:
+        return {"success": False, "message": "没有可回退的操作"}
+
+    entry = undo_stack.pop()
+    generated_sections = dict(values.get("generated_sections", {}) or {})
+    attachment_modifications = list(values.get("attachment_modifications", []) or [])
+
+    # 恢复被覆盖章节的旧值（old 为 None 表示该章节原本不存在，应删除）
+    sections_before = entry.get("sections_before", {}) or {}
+    for name, old in sections_before.items():
+        if old is None:
+            generated_sections.pop(name, None)
+        else:
+            generated_sections[name] = old
+
+    # 截断附件修改列表到变更前长度
+    attachments_before_len = entry.get("attachments_before_len")
+    if attachments_before_len is not None:
+        attachment_modifications = attachment_modifications[:attachments_before_len]
+
+    await agent.aupdate_state(config, {
+        "generated_sections": generated_sections,
+        "attachment_modifications": attachment_modifications,
+        "undo_stack": undo_stack,
+    }, as_node="after_tools")
+
+    return {
+        "success": True,
+        "message": f"已回退：{entry.get('description', '上次操作')}",
+        "description": entry.get("description", ""),
+        "removed_file_ids": entry.get("removed_file_ids", []) or [],
+    }
+
+
 @router.get("/agent/projects/{project_id}/modified-documents/{file_id}/download")
 async def agent_download_modified_document(project_id: str, file_id: str):
     """下载修改后的附件文档 (.docx)
@@ -1209,24 +1320,45 @@ async def agent_download_modified_document(project_id: str, file_id: str):
     if not target:
         raise HTTPException(status_code=404, detail="未找到该附件的修改结果，请先在对话中让Agent修改附件")
 
-    modified_markdown = target.get("modified_markdown", "")
-    if not modified_markdown.strip():
-        raise HTTPException(status_code=400, detail="修改后文档内容为空")
+    import asyncio
 
-    # 读取实际的 doc_type（无则默认设计开发计划书）
-    doc_type = values.get("doc_type", "design_development_plan")
-    product_name = values.get("product_name", "") or "贴敷式胰岛素泵"
+    ops = target.get("ops")
+    original_path = target.get("original_path", "")
+    if ops and original_path and os.path.isfile(original_path):
+        # 段落级手术：在原 docx 上执行编辑指令，未涉及的段落/表格样式原样保留
+        from docx import Document as _Document
+        from app.services.docx_edit import apply_edit_ops
 
-    # 构建.docx（复用审阅下载链路）
-    template_service = TemplateService()
-    doc = template_service.load_template(doc_type)
-    doc = template_service.fill_template(
-        doc=doc,
-        content=modified_markdown,
-        product_name=product_name,
-        doc_type=doc_type,
-    )
-    file_bytes = template_service.document_to_bytes(doc)
+        def _build_docx():
+            doc = _Document(original_path)
+            apply_edit_ops(doc, ops)
+            buf = io.BytesIO()
+            doc.save(buf)
+            return buf.getvalue()
+
+        file_bytes = await asyncio.to_thread(_build_docx)
+    else:
+        modified_markdown = target.get("modified_markdown", "")
+        if not modified_markdown.strip():
+            raise HTTPException(status_code=400, detail="修改后文档内容为空")
+
+        # 读取实际的 doc_type（无则默认设计开发计划书）
+        doc_type = values.get("doc_type", "design_development_plan")
+        product_name = values.get("product_name", "") or "贴敷式胰岛素泵"
+
+        # 构建.docx（复用审阅下载链路）；Playwright 同步 API 渲染 mermaid 须在独立线程执行
+        def _build_docx():
+            template_service = TemplateService()
+            doc = template_service.load_template(doc_type)
+            doc = template_service.fill_template(
+                doc=doc,
+                content=modified_markdown,
+                product_name=product_name,
+                doc_type=doc_type,
+            )
+            return template_service.document_to_bytes(doc)
+
+        file_bytes = await asyncio.to_thread(_build_docx)
 
     orig_name = target.get("filename", "document.md")
     stem = os.path.splitext(orig_name)[0]
@@ -1250,16 +1382,18 @@ async def agent_download_modified_document(project_id: str, file_id: str):
 async def agent_upload_attachment(
     project_id: str,
     file: UploadFile = File(..., description="附件文件 (.pdf/.docx/.doc/.txt/.xlsx)"),
+    hidden: bool = Form(False),
 ):
     """Agent模式下上传附件
 
-    上传文件后自动提取文本，将附件信息（含全文）存入Agent状态，
-    供Agent在后续对话中通过 search_attachment 工具检索使用。
+    提交后台提取任务后立即返回 processing，前端轮询 GET /extract-status/{file_id}，
+    提取完成后调用 POST /agent/projects/{project_id}/attachments/{file_id}/finalize
+    把全文写入 Agent 状态。避免在请求内同步轮询（MinerU 首次加载模型 +
+    多页推理可远超 5 分钟导致上传超时）。
 
     同时将文本写入向量库（uploads集合），支持混合检索。
     """
-    from app.services.agent_engine import get_agent
-    from app.services.agent_state import create_initial_state
+    from app.services.attachment_service import extract_tasks
 
     # 验证文件
     file_content = await file.read()
@@ -1267,7 +1401,7 @@ async def agent_upload_attachment(
     if not is_valid:
         raise HTTPException(status_code=400, detail=error_msg)
 
-    # 提交提取任务（persist=True 写入向量库）
+    # 提交提取任务（persist=True 写入向量库），后台线程异步执行
     task_id = submit_extract_task(
         file_content=file_content,
         filename=file.filename,
@@ -1275,23 +1409,38 @@ async def agent_upload_attachment(
         doc_type="agent_attachment",
     )
 
-    # 轮询等待提取完成（最长5分钟，适配 MinerU GPU 首次加载模型 + 多页推理耗时）
-    import asyncio
-    for _ in range(600):
-        status = get_extract_status(task_id)
-        if status is None:
-            raise HTTPException(status_code=500, detail="提取任务丢失")
-        if status["status"] == "completed":
-            break
-        if status["status"] == "failed":
-            raise HTTPException(status_code=500, detail=f"文件提取失败: {status.get('message', '未知错误')}")
-        await asyncio.sleep(0.5)
-    else:
-        raise HTTPException(status_code=500, detail="文件提取超时（超过5分钟），请重试或使用更小的文档")
+    # 记录「修改文档」入口标记，供 finalize 端点写入状态时使用
+    extract_tasks[task_id]["hidden"] = bool(hidden)
 
-    # 获取提取后的完整文本（从 extract_tasks 内存中读取，提取完成后需重新获取）
+    return {
+        "success": True,
+        "status": "processing",
+        "file_id": task_id,
+        "filename": file.filename,
+        "message": f"文件「{file.filename}」已接收，正在后台提取文本...",
+    }
+
+
+@router.post("/agent/projects/{project_id}/attachments/{file_id}/finalize")
+async def agent_finalize_attachment(project_id: str, file_id: str):
+    """将已提取完成的附件全文写入 Agent 状态 attachments 列表。
+
+    与 agent_upload_attachment 配套：上传端点立即返回 processing，前端轮询
+    /extract-status/{file_id} 至 completed 后调用本端点，把提取出的 full_text
+    写入 Agent 状态，供后续 modify_attachment / enrich_attachment /
+    summarize_attachment / search_attachment 使用。
+    """
+    from app.services.agent_engine import get_agent
+    from app.services.agent_state import create_initial_state
     from app.services.attachment_service import extract_tasks
-    task = extract_tasks.get(task_id, {})
+
+    task = extract_tasks.get(file_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="提取任务不存在（服务可能已重启），请重新上传")
+
+    if task.get("status") != "completed":
+        raise HTTPException(status_code=409, detail=f"文件文本尚未提取完成（当前状态: {task.get('status')}），请稍后重试")
+
     full_text = task.get("full_text", "")
     preview = task.get("preview", "")
     char_count = task.get("char_count", 0)
@@ -1302,7 +1451,7 @@ async def agent_upload_attachment(
             from app.services.rag.vector_store import VectorStore
             vs = VectorStore(collection_name="uploads")
             results = vs.collection.get(
-                where={"file_id": task_id},
+                where={"file_id": file_id},
                 include=["documents"]
             )
             if results and results.get("documents"):
@@ -1311,7 +1460,9 @@ async def agent_upload_attachment(
         except Exception:
             pass
 
-    # 读取当前Agent状态，追加附件
+    filename = task.get("filename", file_id)
+    hidden = bool(task.get("hidden", False))
+
     agent = get_agent()
     config = {"configurable": {"thread_id": project_id}}
 
@@ -1323,33 +1474,283 @@ async def agent_upload_attachment(
 
     attachments = list(state_values.get("attachments", []) or [])
     attachments.append({
-        "file_id": task_id,
-        "filename": file.filename,
+        "file_id": file_id,
+        "filename": filename,
         "char_count": char_count,
         "preview": preview,
         "full_text": full_text,  # 附件全文，不截断，直接给大模型
         "toc": task.get("toc", ""),
         "status": "completed",
+        "hidden": hidden,  # 标记「修改文档」入口上传的文档，不展示在附件列表
+        # 原 .docx 文件路径（段落级手术编辑基底；非 docx 无此字段）
+        "original_path": task.get("original_path", ""),
     })
 
     # 更新Agent状态
-    # 用 try/except 包裹：aupdate_state 在某些 LangGraph 版本下仍可能抛错，
-    # 把错误信息返回到响应体方便前端定位，同时打印完整 traceback 到终端。
     import traceback as _tb
     try:
         await agent.aupdate_state(config, {"attachments": attachments}, as_node="after_tools")
     except Exception as e:
         err_tb = _tb.format_exc()
-        print(f"[agent_upload_attachment] aupdate_state 失败:\n{err_tb}")
+        print(f"[agent_finalize_attachment] aupdate_state 失败:\n{err_tb}")
         raise HTTPException(status_code=500, detail=f"状态更新失败: {type(e).__name__}: {e}")
 
     return {
         "success": True,
-        "file_id": task_id,
-        "filename": file.filename,
+        "file_id": file_id,
+        "filename": filename,
         "char_count": char_count,
         "preview": preview,
-        "message": f"文件「{file.filename}」已上传并提取完成 ({char_count} 字符)。Agent现在可以在对话中检索此文件内容。",
+        "message": f"文件「{filename}」已提取完成 ({char_count} 字符)。Agent现在可以在对话中检索此文件内容。",
+    }
+
+
+# ── 文件夹批量上传 ──
+
+PLAINTEXT_EXTENSIONS = {
+    '.py', '.js', '.ts', '.jsx', '.tsx', '.json', '.yaml', '.yml', '.md',
+    '.txt', '.html', '.htm', '.css', '.scss', '.less', '.cfg', '.ini',
+    '.toml', '.xml', '.sh', '.bat', '.env', '.gitignore', '.sql', '.java',
+    '.c', '.cpp', '.h', '.hpp', '.rs', '.go', '.rb', '.php', '.swift', '.kt',
+    '.csv', '.log', '.rst', '.tex', '.mjs', '.cjs', '.vue', '.svelte',
+    '.cmake', '.mak', '.mk', '.gradle', '.proto', '.graphql',
+}
+
+
+def _classify_file_type(filename: str) -> tuple:
+    """根据扩展名判断文件类型: ("plaintext", None) | ("document", None) | ("binary", None)"""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in PLAINTEXT_EXTENSIONS:
+        return ("plaintext", None)
+    if ext in ('.pdf', '.docx', '.doc', '.xlsx', '.xls', '.ppt', '.pptx'):
+        return ("document", None)
+    return ("binary", None)
+
+
+def _extract_plaintext(file_content: bytes) -> tuple:
+    """直接读取纯文本文件内容，尝试多种编码。返回 (text, char_count, preview)"""
+    for enc in ["utf-8", "gbk", "gb18030", "latin-1"]:
+        try:
+            text = file_content.decode(enc)
+            char_count = len(text)
+            preview = text[:500] + ("..." if char_count > 500 else "")
+            return (text, char_count, preview)
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    return ("", 0, "")
+
+
+def _sanitize_relative_path(path: str) -> str:
+    """规范化相对路径，防路径遍历"""
+    cleaned = path.replace("\\", "/").lstrip("/")
+    parts = []
+    for p in cleaned.split("/"):
+        if p in ("", ".", ".."):
+            continue
+        parts.append(p)
+    return "/".join(parts) if parts else os.path.basename(cleaned) or "unknown"
+
+
+@router.post("/agent/upload-folder/{project_id}")
+async def agent_upload_folder(
+    project_id: str,
+    files: List[UploadFile] = File(..., description="文件夹中的所有文件"),
+    relative_paths: str = Form(..., description="JSON数组，每个文件的相对路径，与files顺序对应"),
+    folder_name: str = Form("", description="根文件夹名称"),
+):
+    """批量上传文件夹，保留目录结构，所有文件内容供Agent使用。
+
+    接收文件夹中所有文件及对应的相对路径。纯文本/代码文件直接提取文本，
+    文档文件（PDF/DOCX等）通过MinerU管道提取，二进制文件仅记录元数据。
+
+    Args:
+        project_id: 项目ID
+        files: 文件列表
+        relative_paths: JSON数组字符串，如 '["src/main.py", "src/utils/helper.py"]'
+        folder_name: 根文件夹名，为空时从路径推断
+
+    Returns:
+        {success, total_files, total_chars, results, errors, folder_name}
+    """
+    from app.services.agent_engine import get_agent
+    from app.services.agent_state import create_initial_state
+
+    try:
+        rel_paths = json.loads(relative_paths)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="relative_paths 必须是有效的 JSON 数组")
+
+    if len(files) != len(rel_paths):
+        raise HTTPException(
+            status_code=400,
+            detail=f"文件数量 ({len(files)}) 与路径数量 ({len(rel_paths)}) 不匹配",
+        )
+
+    if not files:
+        raise HTTPException(status_code=400, detail="未选择任何文件")
+
+    # 推断文件夹名
+    if not folder_name.strip():
+        first_path = rel_paths[0] if rel_paths else ""
+        parts = first_path.replace("\\", "/").lstrip("/").split("/")
+        folder_name = parts[0] if parts else "未命名文件夹"
+
+    # 读取当前 Agent 状态
+    agent = get_agent()
+    config = {"configurable": {"thread_id": project_id}}
+    try:
+        current_state = await agent.aget_state(config)
+        state_values = dict(current_state.values) if current_state and current_state.values else dict(create_initial_state())
+    except Exception:
+        state_values = dict(create_initial_state())
+
+    attachments = list(state_values.get("attachments", []) or [])
+    results = []
+    errors = []
+    total_chars = 0
+
+    for i, (file, raw_path) in enumerate(zip(files, rel_paths)):
+        rel_path = _sanitize_relative_path(raw_path)
+        filename = file.filename or os.path.basename(rel_path) or f"file_{i}"
+        file_content = await file.read()
+
+        if not file_content:
+            file_id = str(uuid.uuid4())[:12]
+            attachments.append({
+                "file_id": file_id,
+                "filename": filename,
+                "relative_path": rel_path,
+                "char_count": 0,
+                "preview": "[空文件]",
+                "full_text": "",
+                "toc": "",
+                "status": "empty",
+            })
+            results.append({"filename": filename, "relative_path": rel_path, "status": "empty"})
+            continue
+
+        if len(file_content) > MAX_UPLOAD_SIZE_BYTES:
+            errors.append(f"{rel_path}: 文件过大 ({len(file_content) / 1024 / 1024:.1f}MB > 10MB)")
+            continue
+
+        file_type, _ = _classify_file_type(filename)
+
+        if file_type == "plaintext":
+            text, char_count, preview = _extract_plaintext(file_content)
+            if char_count == 0:
+                file_id = str(uuid.uuid4())[:12]
+                attachments.append({
+                    "file_id": file_id,
+                    "filename": filename,
+                    "relative_path": rel_path,
+                    "char_count": 0,
+                    "preview": "[编码错误]",
+                    "full_text": "",
+                    "toc": "",
+                    "status": "encoding_error",
+                })
+                results.append({"filename": filename, "relative_path": rel_path, "status": "encoding_error"})
+                continue
+
+            file_id = str(uuid.uuid4())[:12]
+            attachments.append({
+                "file_id": file_id,
+                "filename": filename,
+                "relative_path": rel_path,
+                "char_count": char_count,
+                "preview": preview,
+                "full_text": text,
+                "toc": "",
+                "status": "completed",
+            })
+            total_chars += char_count
+            results.append({
+                "filename": filename, "relative_path": rel_path,
+                "status": "ok", "char_count": char_count,
+            })
+
+        elif file_type == "document":
+            task_id = submit_extract_task(
+                file_content=file_content,
+                filename=filename,
+                persist=False,
+                doc_type="agent_attachment",
+            )
+            import asyncio
+            extracted = False
+            for _ in range(600):
+                status = get_extract_status(task_id)
+                if status is None:
+                    break
+                if status["status"] == "completed":
+                    extracted = True
+                    break
+                if status["status"] == "failed":
+                    break
+                await asyncio.sleep(0.5)
+
+            if extracted:
+                from app.services.attachment_service import extract_tasks
+                task = extract_tasks.get(task_id, {})
+                full_text = task.get("full_text", "")
+                char_count = task.get("char_count", 0)
+                preview = task.get("preview", "")
+                attachments.append({
+                    "file_id": task_id,
+                    "filename": filename,
+                    "relative_path": rel_path,
+                    "char_count": char_count,
+                    "preview": preview,
+                    "full_text": full_text,
+                    "toc": task.get("toc", ""),
+                    "status": "completed",
+                })
+                total_chars += char_count
+                results.append({
+                    "filename": filename, "relative_path": rel_path,
+                    "status": "ok", "char_count": char_count,
+                })
+            else:
+                errors.append(f"{rel_path}: 文档提取失败或超时")
+
+        else:
+            file_id = str(uuid.uuid4())[:12]
+            attachments.append({
+                "file_id": file_id,
+                "filename": filename,
+                "relative_path": rel_path,
+                "char_count": 0,
+                "preview": "[二进制文件]",
+                "full_text": "",
+                "toc": "",
+                "status": "binary",
+            })
+            results.append({
+                "filename": filename, "relative_path": rel_path,
+                "status": "binary", "size_bytes": len(file_content),
+            })
+
+    import traceback as _tb
+    try:
+        await agent.aupdate_state(config, {"attachments": attachments}, as_node="after_tools")
+    except Exception as e:
+        err_tb = _tb.format_exc()
+        print(f"[agent_upload_folder] aupdate_state 失败:\n{err_tb}")
+        raise HTTPException(status_code=500, detail=f"状态更新失败: {type(e).__name__}: {e}")
+
+    return {
+        "success": True,
+        "folder_name": folder_name,
+        "total_files": len(results),
+        "total_chars": total_chars,
+        "failed_count": len(errors),
+        "results": results,
+        "errors": errors,
+        "message": (
+            f"文件夹「{folder_name}」上传完成: {len(results)} 个文件, "
+            f"共 {total_chars} 字符"
+            + (f", {len(errors)} 个失败" if errors else "")
+        ),
     }
 
 
@@ -1382,7 +1783,58 @@ async def agent_list_attachments(project_id: str):
                 "status": a.get("status", "unknown"),
             }
             for a in attachments
+            if not a.get("hidden")
         ],
+    }
+
+
+@router.post("/agent/projects/{project_id}/recall")
+async def agent_recall_message(project_id: str):
+    """撤回最近一条用户消息及其后所有Agent回复
+
+    通过 LangGraph checkpoint 回滚实现：找到上一条消息之前的 checkpoint 并恢复，
+    使 Agent 状态回到发送该消息之前。
+    """
+    from app.services.agent_engine import get_agent
+    from app.services.agent_state import get_checkpointer
+
+    try:
+        checkpointer = await get_checkpointer()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"无法获取检查点: {str(e)}")
+
+    config = {"configurable": {"thread_id": project_id}}
+
+    # 获取最近2个checkpoint（倒序，最新在前）
+    checkpoints = []
+    try:
+        async for cp in checkpointer.alist(config, limit=2):
+            checkpoints.append(cp)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"读取检查点失败: {str(e)}")
+
+    if len(checkpoints) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="没有可撤回的消息（检查点不足，可能是首条消息或尚未开始对话）",
+        )
+
+    # checkpoints[0] = 最新状态（当前），checkpoints[1] = 上一条消息之前的状态
+    prev = checkpoints[1]
+
+    try:
+        await checkpointer.aput(
+            config,
+            checkpoint=prev.checkpoint,
+            metadata=prev.metadata,
+            new_versions=prev.checkpoint.get("channel_versions", {}),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"回滚检查点失败: {str(e)}")
+
+    return {
+        "success": True,
+        "message": "已撤回到上一条消息之前的状态",
     }
 
 
@@ -1421,3 +1873,444 @@ async def agent_delete_attachment(project_id: str, file_id: str):
         "message": "附件已删除",
         "remaining": len(attachments),
     }
+
+
+@router.post("/agent/projects/{project_id}/templates")
+async def agent_upload_template(
+    project_id: str,
+    file: UploadFile = File(..., description="模板文件 (.docx/.pdf/.doc/.txt/.md)"),
+    name: str = Form("", description="模板名称"),
+    doc_type: str = Form("", description="模板关联的目标文档类型"),
+):
+    """Agent模式下添加模板
+
+    上传模板文档后自动提取文本，将模板信息（含全文）存入Agent状态 templates 列表。
+    模板作为文档风格/结构参照：agent 生成文档时模仿其章节结构与写作风格。
+
+    与普通附件的区别:
+    - 模板带 name + doc_type，前端以独立「模板」UI 展示
+    - 系统提示词注入「已添加模板（文档风格参照）」指令，agent 优先按模板生成
+    - persist=False：模板内容不写入共享向量库，仅作为本项目风格参照，避免污染 RAG
+    """
+    from app.services.agent_engine import get_agent
+    from app.services.agent_state import create_initial_state
+
+    # 验证文件
+    file_content = await file.read()
+    is_valid, error_msg = validate_upload(file.filename, len(file_content))
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=error_msg)
+
+    # 提交提取任务（persist=False 不入共享向量库，模板仅作风格参照）
+    task_id = submit_extract_task(
+        file_content=file_content,
+        filename=file.filename,
+        persist=False,
+        doc_type=doc_type or "template",
+    )
+
+    # 记录模板元数据到任务，供 finalize 端点读取（提取完成后写入 Agent 状态）
+    from app.services.attachment_service import extract_tasks
+    template_name = (name or "").strip() or file.filename
+    extract_tasks[task_id]["template_name"] = template_name
+    extract_tasks[task_id]["template_doc_type"] = (doc_type or "").strip()
+
+    # 提取在后台线程异步执行，立即返回；前端轮询 /api/extract-status/{task_id}，
+    # 提取完成后调用 /agent/projects/{project_id}/templates/{task_id}/finalize 写入状态。
+    # 避免在请求内同步轮询（MinerU 首次加载模型 + 多页推理可远超 5 分钟导致超时）。
+    return {
+        "success": True,
+        "status": "processing",
+        "template_id": task_id,
+        "name": template_name,
+        "filename": file.filename,
+        "doc_type": doc_type,
+        "message": f"模板「{template_name}」已接收，正在后台提取文本...",
+    }
+
+
+@router.post("/agent/projects/{project_id}/templates/{template_id}/finalize")
+async def agent_finalize_template(project_id: str, template_id: str):
+    """将已提取完成的模板文本写入 Agent 状态 templates 列表。
+
+    与 agent_upload_template 配套：上传端点立即返回 processing，前端轮询
+    /api/extract-status/{template_id} 至 completed 后调用本端点，
+    把提取出的 full_text 写入 Agent 状态，供后续 outline_from_template / write_chapter 参照。
+    """
+    from app.services.agent_engine import get_agent
+    from app.services.agent_state import create_initial_state
+    from app.services.attachment_service import extract_tasks
+
+    task = extract_tasks.get(template_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="提取任务不存在（服务可能已重启），请重新上传")
+
+    if task.get("status") != "completed":
+        raise HTTPException(status_code=409, detail=f"模板文本尚未提取完成（当前状态: {task.get('status')}），请稍后重试")
+
+    full_text = task.get("full_text", "")
+    preview = task.get("preview", "")
+    char_count = task.get("char_count", 0)
+    toc = task.get("toc", "")
+    template_name = task.get("template_name") or task.get("filename", "unknown")
+    template_doc_type = task.get("template_doc_type", "")
+
+    agent = get_agent()
+    config = {"configurable": {"thread_id": project_id}}
+
+    try:
+        current_state = await agent.aget_state(config)
+        state_values = dict(current_state.values) if current_state and current_state.values else dict(create_initial_state())
+    except Exception:
+        state_values = dict(create_initial_state())
+
+    templates = list(state_values.get("templates", []) or [])
+    templates.append({
+        "template_id": template_id,
+        "name": template_name,
+        "filename": task.get("filename", ""),
+        "doc_type": template_doc_type,
+        "char_count": char_count,
+        "preview": preview,
+        "toc": toc,
+        "full_text": full_text,
+        "status": "completed",
+    })
+
+    import traceback as _tb
+    try:
+        await agent.aupdate_state(config, {"templates": templates}, as_node="after_tools")
+    except Exception as e:
+        err_tb = _tb.format_exc()
+        print(f"[agent_finalize_template] aupdate_state 失败:\n{err_tb}")
+        raise HTTPException(status_code=500, detail=f"状态更新失败: {type(e).__name__}: {e}")
+
+    return {
+        "success": True,
+        "template_id": template_id,
+        "name": template_name,
+        "filename": task.get("filename", ""),
+        "doc_type": template_doc_type,
+        "char_count": char_count,
+        "preview": preview,
+        "message": f"模板「{template_name}」已添加并提取完成 ({char_count} 字符)。"
+                   f"Agent生成文档时将参照其章节结构与写作风格。",
+    }
+
+
+@router.get("/agent/projects/{project_id}/templates")
+async def agent_list_templates(project_id: str):
+    """获取Agent项目已添加的模板列表"""
+    from app.services.agent_engine import get_agent
+    from app.services.agent_state import create_initial_state
+
+    agent = get_agent()
+    config = {"configurable": {"thread_id": project_id}}
+
+    try:
+        current_state = await agent.aget_state(config)
+        state_values = current_state.values if current_state and current_state.values else {}
+    except Exception:
+        state_values = {}
+
+    templates = state_values.get("templates", []) or []
+
+    return {
+        "success": True,
+        "project_id": project_id,
+        "templates": [
+            {
+                "template_id": t.get("template_id"),
+                "name": t.get("name"),
+                "filename": t.get("filename"),
+                "doc_type": t.get("doc_type"),
+                "char_count": t.get("char_count", 0),
+                "preview": t.get("preview", ""),
+                "status": t.get("status", "unknown"),
+            }
+            for t in templates
+        ],
+    }
+
+
+@router.delete("/agent/projects/{project_id}/templates/{template_id}")
+async def agent_delete_template(project_id: str, template_id: str):
+    """删除Agent项目中的指定模板"""
+    from app.services.agent_engine import get_agent
+    from app.services.agent_state import create_initial_state
+
+    agent = get_agent()
+    config = {"configurable": {"thread_id": project_id}}
+
+    try:
+        current_state = await agent.aget_state(config)
+        state_values = dict(current_state.values) if current_state and current_state.values else dict(create_initial_state())
+    except Exception:
+        raise HTTPException(status_code=404, detail="项目不存在")
+
+    templates = list(state_values.get("templates", []) or [])
+    original_count = len(templates)
+    templates = [t for t in templates if t.get("template_id") != template_id]
+
+    if len(templates) == original_count:
+        raise HTTPException(status_code=404, detail="模板不存在")
+
+    import traceback as _tb
+    try:
+        await agent.aupdate_state(config, {"templates": templates}, as_node="after_tools")
+    except Exception as e:
+        err_tb = _tb.format_exc()
+        print(f"[agent_delete_template] aupdate_state 失败:\n{err_tb}")
+        raise HTTPException(status_code=500, detail=f"状态更新失败: {type(e).__name__}: {e}")
+
+    return {
+        "success": True,
+        "message": "模板已删除",
+        "remaining": len(templates),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# 流程图生成 / 修改 / 导出 / 插入文档接口
+# ═══════════════════════════════════════════════════════════════
+
+_FLOWCHART_SYSTEM_PROMPT = """你是专业的医疗器械文档流程图生成助手。根据用户描述生成 mermaid flowchart 源码。
+
+严格要求：
+1. 只输出 mermaid flowchart 源码，不要输出任何解释、前言、markdown 围栏或后缀
+2. 第一行必须输出 "flowchart TD"（自上而下）；特殊需要可用 "flowchart LR"
+3. 节点文字用中文、简短，选用合适形状：
+   - 起止节点用 ([文字]) 圆角形状
+   - 处理步骤用 [文字] 矩形
+   - 判断分支用 {文字} 菱形
+4. 连线用 --> 表示，条件分支连线用 -- 条件文字 -->（如 -- 是 -->）
+5. 节点数控制在 5~15 个，避免过于复杂
+6. 若描述涉及医疗器械领域（风险管理、设计评审、生产工艺、软件开发生命周期等），使用专业术语
+7. 保证 mermaid 语法正确、连接关系自洽（有开始、有结束，不出现孤立节点），可直接渲染
+"""
+
+
+def _extract_mermaid_block(text: str) -> str:
+    """从 LLM 返回文本中提取 mermaid 源码（优先围栏内内容）。"""
+    if not text:
+        return ""
+    m = re.search(r"```mermaid\s*\n(.*?)```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"```\s*\n(.*?)```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    idx = text.find("flowchart")
+    if idx >= 0:
+        return text[idx:].strip()
+    return text.strip()
+
+
+class FlowchartGenerateRequest(BaseModel):
+    """流程图生成/修改请求"""
+    prompt: str = Field(..., description="流程描述（生成）或修改指令（修改）")
+    current_mermaid: Optional[str] = Field(None, description="当前流程图源码（修改时传入）")
+
+
+class FlowchartRenderRequest(BaseModel):
+    """流程图渲染请求"""
+    mermaid: str = Field(..., description="mermaid 源码")
+
+
+class FlowchartInsertRequest(BaseModel):
+    """流程图插入文档请求"""
+    mermaid: str = Field(..., description="mermaid 源码")
+    section_name: str = Field("", description="目标章节名，为空则新增独立「流程图」章节")
+
+
+@router.post("/agent/flowchart/generate")
+async def agent_generate_flowchart(request: FlowchartGenerateRequest):
+    """生成或修改流程图（返回 mermaid 源码）。
+
+    - 生成：只传 prompt
+    - 修改：传 prompt（修改指令）+ current_mermaid（当前流程图源码）
+
+    使用本地模型生成 mermaid 源码，前端用 mermaid 渲染预览，插入文档时
+    由后端把 mermaid 渲染为 PNG（_add_mermaid_or_fallback）。
+    """
+    import asyncio
+    from app.services.minimax import _call_minimax_api_raw
+
+    prompt = (request.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="描述不能为空")
+
+    current = (request.current_mermaid or "").strip()
+    if current:
+        user_prompt = (
+            f"以下是当前流程图的 mermaid 源码：\n```mermaid\n{current}\n```\n\n"
+            f"用户修改要求：{prompt}\n\n"
+            f"请根据修改要求调整流程图，保持 mermaid 语法正确，只输出修改后的 mermaid 源码。"
+        )
+    else:
+        user_prompt = f"请根据以下描述生成 mermaid flowchart 源码：{prompt}"
+
+    try:
+        result = await asyncio.to_thread(
+            _call_minimax_api_raw,
+            _FLOWCHART_SYSTEM_PROMPT,
+            user_prompt,
+            0.3,
+            4096,
+            (30, 120),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"流程图生成失败: {str(e)}")
+
+    mermaid_code = _extract_mermaid_block(result or "")
+    if not mermaid_code:
+        raise HTTPException(status_code=500, detail="模型未返回有效的 mermaid 流程图，请重试")
+
+    # 规范化：确保有 flowchart/graph 方向声明（模型有时直接从节点定义开始输出，
+    # 缺少方向声明会导致 mermaid 渲染失败）
+    first_line = mermaid_code.splitlines()[0].strip() if mermaid_code else ""
+    if not re.match(r"^(flowchart|graph)(\s|$)", first_line, re.IGNORECASE):
+        mermaid_code = "flowchart TD\n" + mermaid_code
+
+    return {"success": True, "mermaid": mermaid_code}
+
+
+@router.post("/agent/flowchart/render")
+async def agent_render_flowchart(request: FlowchartRenderRequest):
+    """将 mermaid 源码渲染为 PNG 图片（供前端「导出 PNG」下载）。"""
+    import asyncio
+    from app.services.mermaid_render import render_mermaid_to_png
+
+    code = (request.mermaid or "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="mermaid 源码不能为空")
+
+    png = await asyncio.to_thread(render_mermaid_to_png, code)
+    if not png:
+        raise HTTPException(status_code=500, detail="流程图渲染失败（mermaid 语法可能有误或渲染依赖不可用）")
+
+    return StreamingResponse(
+        io.BytesIO(png),
+        media_type="image/png",
+        headers={"Content-Disposition": 'attachment; filename="flowchart.png"'},
+    )
+
+
+@router.post("/agent/projects/{project_id}/flowchart/insert")
+async def agent_insert_flowchart(project_id: str, request: FlowchartInsertRequest):
+    """把流程图插入到正在生成的文档。
+
+    - section_name 指定 → 追加到该章节末尾
+    - section_name 为空 → 新增独立「流程图」章节（多张则「流程图 2」「流程图 3」...）
+    """
+    from app.services.agent_engine import get_agent
+
+    code = (request.mermaid or "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="mermaid 源码不能为空")
+
+    block = f"```mermaid\n{code}\n```"
+
+    agent = get_agent()
+    config = {"configurable": {"thread_id": project_id}}
+    try:
+        state = await agent.aget_state(config)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"无法读取Agent状态: {str(e)}")
+
+    if not state or not state.values:
+        raise HTTPException(status_code=404, detail="项目不存在或尚未开始，请先生成文档")
+
+    generated = dict(state.values.get("generated_sections", {}) or {})
+
+    section_name = (request.section_name or "").strip()
+    if section_name:
+        if section_name not in generated:
+            raise HTTPException(
+                status_code=404,
+                detail=f"章节「{section_name}」不存在，可用章节: {list(generated.keys())}",
+            )
+        generated[section_name] = generated[section_name].rstrip() + "\n\n" + block
+        target = section_name
+    else:
+        base = "流程图"
+        count = sum(1 for k in generated if k.startswith(base))
+        target = base if count == 0 else f"{base} {count + 1}"
+        generated[target] = block
+
+    import traceback as _tb
+    try:
+        await agent.aupdate_state(config, {"generated_sections": generated}, as_node="after_tools")
+    except Exception as e:
+        err_tb = _tb.format_exc()
+        print(f"[agent_insert_flowchart] aupdate_state 失败:\n{err_tb}")
+        raise HTTPException(status_code=500, detail=f"状态更新失败: {type(e).__name__}: {e}")
+
+    return {
+        "success": True,
+        "project_id": project_id,
+        "section_name": target,
+        "message": f"流程图已插入到「{target}」",
+    }
+
+
+@router.get("/agent/projects/{project_id}/download-excel")
+async def agent_download_risk_excel(project_id: str):
+    """下载风险分析总表的 Excel (.xlsx) 版本。
+
+    仅对风险分析总表类文档（product_risk_analysis_matrix /
+    cybersecurity_risk_analysis_matrix）可用：读取项目状态中的产品信息，
+    调用本地 Ollama 生成结构化风险条目，按参考文件 17 列两行表头样式构建 .xlsx。
+    """
+    import asyncio
+    from app.services.agent_engine import get_agent
+    from app.services.risk_excel import (
+        is_risk_matrix_doc, generate_risk_rows, build_risk_excel,
+    )
+
+    agent = get_agent()
+    config = {"configurable": {"thread_id": project_id}}
+
+    try:
+        state = await agent.aget_state(config)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"无法读取Agent状态: {str(e)}")
+
+    if not state or not state.values:
+        raise HTTPException(status_code=404, detail="项目不存在或尚未开始")
+
+    values = state.values
+    doc_type = values.get("doc_type", "design_development_plan")
+
+    if not is_risk_matrix_doc(doc_type):
+        raise HTTPException(
+            status_code=400,
+            detail="当前文档类型不支持导出 Excel（仅风险分析和管理总表类文档可用）",
+        )
+
+    product_name = values.get("product_name", "") or "贴敷式胰岛素泵"
+    classification = values.get("product_classification", "") or ""
+    intended_use = values.get("product_intended_use", "") or ""
+
+    rows = await asyncio.to_thread(
+        generate_risk_rows, doc_type, product_name, classification, intended_use
+    )
+    if not rows:
+        raise HTTPException(
+            status_code=500,
+            detail="风险条目生成失败（模型未返回有效数据），请稍后重试",
+        )
+
+    file_bytes = await asyncio.to_thread(build_risk_excel, doc_type, rows)
+
+    filename = f"{product_name}_风险分析和管理总表.xlsx"
+    from urllib.parse import quote
+    encoded_filename = quote(filename)
+
+    return StreamingResponse(
+        io.BytesIO(file_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}"
+        },
+    )

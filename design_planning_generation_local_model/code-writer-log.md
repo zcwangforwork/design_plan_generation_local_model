@@ -2070,3 +2070,571 @@ MinerU 启用 GPU 后，首次加载模型 + 多页推理可能超过原 30 秒�
 - Topic: SQL agent 工具路由行为
 - Finding: 首轮开放式题 agent 全走 search_kb 且答案正确；显式要求查库时 3/3 走 SQL 链路且顺序符合 TOOL_RULES
 - Decision: 提示词无需改动（当前「何时用/何时不用」指引已正确引导路由）；SQL 能力验证以第 2 轮 3/3 为准
+
+## 2026-08-11 17:42 - Task Started
+- Project: design_plan_generation_local_model（设计方案生成 Agent）
+- Task: 参照《KF-CGM-2-0004 设计输入 V7.0》为每个生成的文档附加 首页 / 修订记录 / 目录
+- 决策（AskUserQuestion 确认）: 文件编号=阶段编号方案（KF-CGM-{阶段序号}-{4位序号}）；目录=Word 域目录（打开自动更新）；编制/审核/批准=env 可配置；跳过 /plan-eng-review 直接实现
+
+## 2026-08-11 17:42 - File Edited
+- File: app/services/template.py
+- Change: 新增前置页机制。导入 datetime/WD_TABLE_ALIGNMENT/OxmlElement/qn/DOC_CATEGORIES；模块级助手 _derive_doc_number（阶段编号方案，env DOC_NUMBER_PREFIX 覆盖前缀，未归类确定性兜底）、_append_field（Word 域 begin/instr/separate/end）、_set_update_fields_on_open（w:updateFields 使 Word 打开自动刷新域）。fill_template 在解析正文前注入 _add_front_matter（首页+修订记录+目录）+ _add_page_number_footer（第X页共Y页）。新增方法：_add_cover（Title+产品名+信息表4×2+签名表3×4）、_add_revision_history（6列表：版本号/修订日期/修订内容/编制/审核/批准，首行 V1.0）、_add_toc（TOC \o "1-3" 域）、_add_page_number_footer。_parse_and_fill 移除与首页重复的标题/副标题（product_name/doc_type 参数相应移除）。前置页小节标题用居中加粗段落（非 Heading 样式，避免进入 TOC）。
+- Result: Success
+
+## 2026-08-11 17:42 - File Created
+- File: tests/test_template_front_matter.py
+- Change: 17 条前置页测试（首页字段/修订记录表/目录域/updateFields/页码域/分页计数/编号推导与兜底/env 覆盖/正文仍完整解析/标题不重复）
+- Result: Success（17 passed）
+
+## 2026-08-11 17:42 - Bash Command Executed
+- Command: `python -m pytest tests/test_template_front_matter.py -q`（env_01）
+- Working Dir: design_planning_generation_local_model
+- Purpose: 前置页测试
+- Result: Success - 首轮 16 passed 1 failed（_Footer 用 _element 非 element），修正后 17 passed
+
+## 2026-08-11 17:42 - Bash Command Executed
+- Command: `python -m pytest tests/ -q -p no:cacheprovider`（env_01）
+- Working Dir: design_planning_generation_local_model
+- Purpose: 全量回归
+- Result: 216 passed, 3 failed（3 条均为历史既有失败：test_search_kb_no_results_format 依赖 vector_store.py；test_maybe_compress_above_threshold / test_fallback_summary_generates_json 依赖 LLM 环境。无新增回归）
+
+## 2026-08-11 17:42 - Bash Command Executed
+- Command: `python _scratch_front_matter_check.py`（env_01，生成 _front_matter_sample.docx 并 dump 结构）
+- Working Dir: design_planning_generation_local_model
+- Purpose: 验证前置页布局顺序与域
+- Result: Success - 首页(Title 设计输入文件+产品名+信息表4×2+签名表3×4)→修订记录(2×6)→目录(TOC 域)→正文(Heading 1/2+列表+markdown 表)；page_breaks=3，TOC 域与 updateFields 均存在。临时脚本已删除，样例保留 _front_matter_sample.docx（38KB）
+
+## 2026-08-11 17:42 - Analysis
+- Topic: 前置页编号方案
+- Finding: 参考《KF-CGM-2-0004 设计输入 V7.0》为「前缀-阶段序号-4位序号」；本项目 DOC_CATEGORIES 分组名首字中文数字即阶段序号（二、设计输入→2），组内顺序为序号。design_input 推导为 KF-CGM-2-0001（格式一致，具体序号不必与参考逐一对齐）。legacy/未归类文档阶段=0，未归类用确定性散列序号避免冲突
+- Decision: 阶段序号解析自分组名而非 dict 顺序（显式、可读、不依赖插入序）；修订记录/目录页标题用非 Heading 段落避免进入正文目录
+
+## 2026-08-11 18:04 - 任务开始: 添加模板功能 (front-matter 之后新功能)
+- Topic: 添加模板入口 — 用户点击「添加模板」上传参考文档，Agent 读取其章节结构与内容，模仿模板风格生成目标文档
+- Decision: 用户确认「不用评审，直接执行」。模板作为 state["templates"] 一级概念（区别于普通附件），持久化提取不污染共享知识库；新增 outline_from_template 工具，复用 outline_from_attachment 的章节结构提取逻辑（共享 _extract_outline_from_text 助手）
+
+## 2026-08-11 18:04 - File Edited
+- File: app/services/agent_state.py
+- Change: AgentState 增加 `templates: list[dict]` 字段（template_id/name/filename/doc_type/char_count/preview/toc/full_text/status）；create_initial_state 返回 templates=[]；build_state_snapshot 增加 templates 键
+- Result: Success
+
+## 2026-08-11 18:04 - File Edited
+- File: app/services/agent_tools.py
+- Change: 新增 `_current_templates` contextvar + `set_current_templates()`；抽取共享助手 `_extract_outline_from_text`（超时/空/无效JSON 抛 `_OutlineExtractError`）；outline_from_attachment Step3 改为调用共享助手；新增 `outline_from_template` 工具（无模板/无全文/指定 ID 不存在 → 降级错误；全文按 50000 预算等额截断；成功返回 design_outline 兼容 JSON）；注册到 PHASE1_TOOLS（outline_from_attachment 之后、write_chapter 之前）
+- Result: Success
+
+## 2026-08-11 18:04 - File Edited
+- File: app/services/agent_prompt.py
+- Change: TOOL_RULES 增加 5c 节说明 outline_from_template（模板优先路径）；SOP_KNOWLEDGE 步骤4 改为「有附件/模板时的路径选择」（模板非空时必须提供选项C 按模板生成）；build_system_prompt 在 attachment_info 后注入 template_info 段（模板名称/文档类型/预览/目录 + 生成时模仿模板风格指引），`{template_info}` 占位符加入 state_section
+- Result: Success
+
+## 2026-08-11 18:04 - File Edited
+- File: app/services/agent_engine.py
+- Change: _agent_node 在 _sync_attachment_context 后调用 _sync_template_context(state)，同步模板到 agent_tools contextvar
+- Result: Success
+
+## 2026-08-11 18:04 - File Edited
+- File: app/api/routes.py
+- Change: 新增三个路由 — POST /agent/projects/{id}/templates（上传+提取+写 state.templates）、GET /agent/projects/{id}/templates（列表）、DELETE /agent/projects/{id}/templates/{template_id}（移除）
+- Result: Success
+
+## 2026-08-11 18:04 - File Edited
+- File: app/static/agent.html
+- Change: 新增 .tpl-upload-btn/.template-area/.tpl-chip 系列青绿色样式；templateDialog 弹窗（名称/文档类型下拉/文件选择）；header「📄 添加模板」按钮；template-area 容器；JS 函数 showTemplateDialog/closeTemplateDialog/handleTemplateFileSelect/submitTemplate/renderTemplateChips/removeTemplate/fetchTemplates；fetchTemplates 接入 sendMessage/resumeAgent/autoGen finally 与 init
+- Result: Success
+
+## 2026-08-11 18:04 - File Edited
+- File: tests/test_template_prompt.py (新建)
+- Change: build_system_prompt 模板段回归护栏：无模板不注入、有模板注入名称/预览/目录/风格指引、TOOL_RULES 5c、SOP 步骤4 模板路径、与精炼模式共存
+- Result: Success
+
+## 2026-08-11 18:04 - File Edited
+- File: tests/test_template_tools.py (新建)
+- Change: outline_from_template 分支测试：PHASE1_TOOLS 注册顺序、无模板/无全文/ID不存在降级、LLM 失败指引、正常路径返回兼容 JSON、全文预算截断、多模板分发
+- Result: Success
+
+## 2026-08-11 18:04 - Bash Command Executed
+- Command: `PYTHONIOENCODING=utf-8 python -m pytest tests/test_template_prompt.py tests/test_template_tools.py -q`（env_01）
+- Working Dir: design_planning_generation_local_model
+- Purpose: 模板功能新测试
+- Result: 首轮 4 failed → 修正（基线断言改用动态指引标记；DOC_TYPE_LABELS design_development_plan=设计开发策划书；_sample_template 增加 template_id/filename 参数；预算断言 lstrip 前缀换行）→ 27 passed
+
+## 2026-08-11 18:04 - Bash Command Executed
+- Command: `PYTHONIOENCODING=utf-8 python -m pytest tests/ -q --ignore=tests/test_openviking_integration.py`（env_01）
+- Working Dir: design_planning_generation_local_model
+- Purpose: 全量回归
+- Result: 231 passed, 3 failed（3 条均为历史既有失败，与模板功能无关：test_search_kb_no_results_format 依赖 vector_store 检索环境；test_maybe_compress_above_threshold / test_fallback_summary_generates_json 依赖 LLM 环境，且后者是 context_manager 实现返回纯文本与测试期望 JSON 的既有不匹配）。无新增回归
+
+## 2026-08-11 18:04 - Bash Command Executed
+- Command: `PYTHONIOENCODING=utf-8 python -c "import app.services.agent_state/agent_tools/agent_prompt/agent_engine, app.api.routes; ..."`（env_01）
+- Working Dir: design_planning_generation_local_model
+- Purpose: 后端导入与模板接线冒烟
+- Result: Success - imports OK；state.templates 存在；outline_from_template 已注册 PHASE1_TOOLS；routes 含模板端点
+
+## 2026-08-13 14:53 - Task Start
+- Task: 添加模板按钮支持一次性选择并批量添加多个模板文件
+- Project: design_planning_generation_local_model
+- Scope: 仅前端 app/static/agent.html（后端 POST /api/agent/projects/{id}/templates 本身支持单文件，前端逐个串行调用即可，无需改后端）
+
+## 2026-08-13 14:53 - File Edited
+- File: `app/static/agent.html`
+- Change: 模板对话框描述文案增加"支持一次选择多个文件批量添加"说明（约 L465）
+- Result: Success
+
+## 2026-08-13 14:53 - File Edited
+- File: `app/static/agent.html`
+- Change: #tplFileInput 增加 multiple 属性；"选择文件"按钮文案改为"选择文件（可多选）"（约 L480-486）
+- Result: Success
+
+## 2026-08-13 14:53 - File Edited
+- File: `app/static/agent.html`
+- Change: 模板管理 JS 重构为多文件批量添加：
+  1. `_selectedTemplateFile`（单文件）→ `_selectedTemplateFiles`（File 数组）
+  2. `showTemplateDialog()` 重置逻辑适配数组 + 名称输入框状态复位 + 清空 file input
+  3. `handleTemplateFileSelect()` 遍历所选文件逐个校验格式/大小，不合规文件跳过并提示；多选时禁用名称输入框（各模板以文件名命名）
+  4. `submitTemplate()` 改为逐个串行上传（后端每个文件需提取文本、可能触发 MinerU，串行避免资源争用）；每文件独立 uploading chip（唯一 chipId）；单文件仍需填名称，多文件以文件名命名；结束后汇总提示成功数与失败明细；失败响应兼容 data.detail（HTTPException）
+- Why: 用户要求点击"添加模板"按钮支持一次性添加多个模板文件
+- Result: Success
+
+## 2026-08-13 14:53 - Bash Command Executed
+- Command: `node -e "读取 agent.html 提取 <script> 块并用 new Function 做语法校验"`
+- Working Dir: design_planning_generation_local_model
+- Purpose: 校验修改后的内联 JS 语法
+- Result: Success - script block 0 OK, 60544 chars
+
+## 2026-08-13 14:53 - Analysis
+- Topic: 是否需要改后端
+- Finding: 后端 agent_upload_template 每次接收单文件并同步轮询提取（最长5分钟），前端串行循环调用即可实现批量；无需新增批量接口
+- Decision: 仅改前端，保持后端不动
+
+## 2026-08-13 16:12 - Analysis
+- Topic: 多模板上传 bug 根因定位
+- Finding: 前次会话已将 `_selectedTemplateFile`(单文件) 改为 `_selectedTemplateFiles`(数组)，但 `handleTemplateFileSelect` 中 `_selectedTemplateFiles = valid` 是**替换**而非追加。导致用户「先选文件A、再选文件B」时，A 被 B 顶替掉，最终只能上传最后一个文件。`_test_template_append_repro.py` 复现测试通过，证明后端 read-modify-write 逻辑无问题，bug 在前端。
+- Decision: 修改前端 `handleTemplateFileSelect` 为追加模式（带去重），并在对话框内显示已选文件列表（可单独移除）；同时移除「单文件必须输入名称」的限制。
+
+## 2026-08-13 16:12 - File Edited
+- File: `app/static/agent.html`
+- Change: 修复多模板上传 + 名称非必填：
+  1. 对话框 HTML：描述文本补充「也可多次追加选择」；标签改为「模板名称（留空则使用文件名）」；输入框 placeholder 改为「留空则使用文件名」；按钮文案改为「选择文件（可多选/可追加）」；新增 `<div id="tplSelectedList">` 用于渲染已选文件列表
+  2. `showTemplateDialog()`：placeholder 改为「留空则使用文件名」；调用 `renderSelectedTemplateFiles()` 清空已选列表 UI
+  3. 新增 `renderSelectedTemplateFiles()`：在对话框内渲染已选文件 chip 列表（文件名 + 大小 + × 移除按钮）
+  4. 新增 `removeSelectedTemplateFile(idx)`：从 `_selectedTemplateFiles` 移除指定索引文件，并重新计算名称输入框启用/禁用状态
+  5. `handleTemplateFileSelect()`：改为**追加**模式 `_selectedTemplateFiles = _selectedTemplateFiles.concat(valid)`（带同名同大小去重）；`event.target.value = ''` 允许重选同一文件；UI 状态基于累计数量 `_selectedTemplateFiles.length` 而非当次 `valid.length`；末尾调用 `renderSelectedTemplateFiles()`
+  6. `submitTemplate()`：删除 `if (files.length === 1 && !name) { showError('请输入模板名称'); return; }` 校验；`tplName = (files.length === 1 && name) ? name : file.name`（单文件有名称用名称、否则用文件名；多文件一律用文件名）
+- Why: 用户反馈 agent 模式上传模板时无法上传多个模板（实为「追加选择会顶替上一个」），且要求添加模板时无需强制输入名称
+- Result: Success
+
+## 2026-08-13 16:12 - Bash Command Executed
+- Command: `python _test_template_append_repro.py`
+- Working Dir: design_planning_generation_local_model
+- Purpose: 验证后端 agent_upload_template 的 read-modify-write 在连续 3 次追加后是否累积（排除后端 bug）
+- Result: Success - FINAL templates = ['tpl-A', 'tpl-B', 'tpl-C']，后端无问题，bug 定位在前端
+
+## 2026-08-13 16:14 - Bash Command Executed
+- Command: `node -e "提取 <script> 块并用 new Function 做语法校验"`
+- Working Dir: design_planning_generation_local_model
+- Purpose: 校验修改后 agent.html 内联 JS 语法
+- Result: Success - JS syntax OK, length = 63709
+
+## 2026-08-13 16:14 - Analysis
+- Topic: 修复验证总结
+- Finding: JS 语法校验通过；前端 4 处改动（对话框 HTML、showTemplateDialog + 新增两个函数、handleTemplateFileSelect 改追加模式、submitTemplate 移除名称必填）均按预期完成
+- Decision: 修复完成，建议用户在浏览器中实际测试多模板上传流程
+
+## 2026-08-13 16:20 - File Edited
+- File: `app/static/agent.html`
+- Change: 添加附件入口显眼化：
+  1. 新增 CSS 类 `.att-header-btn`（蓝色 #1976d2 主色，与 `.tpl-upload-btn` / `.kb-upload-btn` 并列的 prominent 按钮）
+  2. 顶部 main-header 在「添加模板」按钮前新增 `📎 添加附件` 按钮（id=attHeaderBtn，触发同一 fileInput.click()）
+  3. 输入区旁的快速上传圆形按钮 `.att-upload-btn` 从「灰色虚线 32px」改为「蓝色实线 36px + 阴影 + hover 反色」，让用户在输入框附近也能及时看到
+- Why: 用户反馈添加附件的入口不够显眼，希望用户能及时看到
+- Result: Success
+
+## 2026-08-13 16:20 - Bash Command Executed
+- Command: `node -e "提取 <script> 块并用 new Function 做语法校验"`
+- Working Dir: design_planning_generation_local_model
+- Purpose: 校验修改后 agent.html 内联 JS 语法
+- Result: Success - JS syntax OK, length = 63709
+
+## 2026-08-18 - File Edited (OpenViking 前端记忆工具标签)
+- File: app/static/agent.html
+  Change: (1) toolLabel() 新增 viking_find/viking_search/viking_read/viking_store/viking_add_resource 的中文标签映射（"检索历史记忆"/"搜索当前会话记忆"/"读取记忆详情"/"保存记忆"/"添加记忆资源"）；(2) 两处 tool_end 硬编码三元改为统一使用 toolLabel()，避免新工具漏掉友好标签。
+  Result: Success
+
+## 2026-08-25 15:00:05 - 任务开始：Agent 对话框拖拽文件引用功能
+- 项目: design_planning_generation_local_model (设计策划文档生成系统 v2.0)
+- 需求: 实现"拖拽文件到对话框输入框 → 消息内插入 @文件名 引用标记 → 发送后 Agent 精确定位该附件"
+
+## 2026-08-25 15:00:05 - File Edited
+- File: `app/static/agent.html`
+- Change: 新增 `.input-area.drag-over` 高亮样式（拖拽文件到输入框时显示蓝色虚线边框）
+- Result: Success
+
+## 2026-08-25 15:00:05 - File Edited
+- File: `app/static/agent.html`
+- Change: 新增 `let fileRefs = {}`（文件名→file_id 映射），`uploadFile` 改为返回 `{file_id, filename}` 并在成功时登记映射，新增 `expandFileReferences()`（@文件名 → 附件《文件名》（file_id: xxx））和 `insertFileReference()`（在光标处插入引用标记）两个辅助函数
+- Result: Success
+
+## 2026-08-25 15:00:05 - File Edited
+- File: `app/static/agent.html`
+- Change: 新增 `setupInputDragDrop()` IIFE：监听 `.input-area` 的 dragenter/dragover/dragleave/drop，拖入文件后以 silent 模式上传并插入引用标记
+- Result: Success
+
+## 2026-08-25 15:00:05 - File Edited
+- File: `app/static/agent.html`
+- Change: `sendMessage()` 增加 `messageToSend = expandFileReferences(message)`，发送体和 `lastUserMessage`（重试用）改用展开后的消息，聊天气泡仍显示干净的 @文件名
+- Result: Success
+
+## 2026-08-25 15:05:00 - 需求修正：拖拽仅插入引用，不触发上传
+- 用户澄清：拖文件到输入框不是为了上传附件，只是要在输入框里引用这个文件名
+- 回退: uploadFile 恢复原样（去掉 silent/返回值/fileRefs 登记）、删除 fileRefs/expandFileReferences/insertFileReference/messageToSend
+- 保留: .input-area.drag-over 样式、insertReferenceToken()（仅插入文字）、setupInputDragDrop()（drop 时插入 @文件名，不上传）
+- Result: Success
+
+## 2026-08-25 15:15:21 - 任务开始：上传附件/模板过程中支持取消上传
+- 项目: design_planning_generation_local_model (设计策划文档生成系统 v2.0)
+- 需求: 用户要求"上传附件或模板的过程中，能否取消上传"。为三个上传路径（单文件附件、文件夹、模板）增加 AbortController + 取消入口。
+
+## 2026-08-25 15:15:21 - File Edited
+- File: `app/static/agent.html`
+- Change: 新增 `const activeUploads = {}`（uploadId → AbortController 映射），紧跟 `uploadedFiles` 声明之后。
+- Result: Success
+
+## 2026-08-25 15:15:21 - File Edited
+- File: `app/static/agent.html`
+- Change: 新增全局 `cancelUpload(uploadId)`：abort 对应 controller、清理附件/模板占位 chip 并重渲染，对不存在 id 幂等。
+- Result: Success
+
+## 2026-08-25 15:15:21 - File Edited
+- File: `app/static/agent.html`
+- Change: `uploadFile()`：tempId 加入随机后缀避免并发冲突；创建 AbortController 存入 activeUploads 并传入 fetch signal；catch 中 AbortError 不弹错误；finally 清理 activeUploads。
+- Result: Success
+
+## 2026-08-25 15:15:21 - File Edited
+- File: `app/static/agent.html`
+- Change: `buildAttachmentChip()` 的 uploading 分支新增"×"取消按钮（onclick=cancelUpload(file_id)）。
+- Result: Success
+
+## 2026-08-25 15:15:21 - File Edited
+- File: `app/static/agent.html`
+- Change: `submitTemplate()`：每个模板上传创建 AbortController 传入 POST fetch signal；轮询循环顶部检查 aborted 抛 AbortError；catch 中 AbortError 时 break 停止整个批量；finally 清理 activeUploads。
+- Result: Success
+
+## 2026-08-25 15:15:21 - File Edited
+- File: `app/static/agent.html`
+- Change: `renderTemplateChips()` 的 uploading 分支新增"×"取消按钮（onclick=cancelUpload(template_id)），替代原先空字符串。
+- Result: Success
+
+## 2026-08-25 15:15:21 - File Edited
+- File: `app/static/agent.html`
+- Change: 文件夹上传：`handleFolderSelect()` 生成 folderUploadId + AbortController，进度条文本新增红色"取消"链接；`uploadFolderBatch()` 新增 signal 参数并传入 fetch；catch 中 AbortError 不弹错误；finally 清理 activeUploads 并移除进度条。
+- Result: Success
+
+## 2026-08-25 15:30:00 - 任务开始：从附件/模板 chip 拖拽到输入框引用
+- 项目: design_planning_generation_local_model
+- 需求: 用户希望直接从附件区或模板区的 chip 拖到输入框，插入 @文件名 引用（不上传）。
+
+## 2026-08-25 15:30:00 - File Edited
+- File: `app/static/agent.html`
+- Change: 新增 `makeChipDraggable(el, refText)`：设置 draggable=true，dragstart 写入 `application/x-file-ref` 与 `text/plain` 数据。
+- Result: Success
+
+## 2026-08-25 15:30:00 - File Edited
+- File: `app/static/agent.html`
+- Change: `buildAttachmentChip()` 非上传态 chip 调用 `makeChipDraggable(chip, f.relative_path || f.filename)`（文件夹文件用完整相对路径，与 Agent 提示一致）。
+- Result: Success
+
+## 2026-08-25 15:30:00 - File Edited
+- File: `app/static/agent.html`
+- Change: `renderTemplateChips()` 非上传态 chip 调用 `makeChipDraggable(chip, t.name || t.filename)`。
+- Result: Success
+
+## 2026-08-25 15:30:00 - File Edited
+- File: `app/static/agent.html`
+- Change: `setupInputDragDrop()` 扩展：接受 `Files` 或 `application/x-file-ref` 两类拖拽；drop 时优先读取 chip 引用，否则回退为系统文件。
+- Result: Success
+
+## 2026-08-25 15:30:00 - File Edited
+- File: `app/static/agent.html`
+- Change: 新增 `.att-chip[draggable="true"]/.tpl-chip[draggable="true"] { cursor: grab }` 及 active 态 grabbing，提供可拖拽视觉提示。
+- Result: Success
+
+## 2026-08-25 15:45:00 - 任务开始：输入框快速清空
+- 项目: design_planning_generation_local_model
+- 需求: 用户希望快速清除输入框中的文字。
+
+## 2026-08-25 15:45:00 - File Edited
+- File: `app/static/agent.html`
+- Change: 输入框与发送按钮之间新增 `#clearBtn`（×）清空按钮，初始 display:none；textarea 增加 `oninput="updateClearBtn()"`。
+- Result: Success
+
+## 2026-08-25 15:45:00 - File Edited
+- File: `app/static/agent.html`
+- Change: 新增 `.input-area #clearBtn` 淡色小圆点样式（覆盖 `.input-area button` 默认蓝色大按钮）。
+- Result: Success
+
+## 2026-08-25 15:45:00 - File Edited
+- File: `app/static/agent.html`
+- Change: 新增 `clearInput()`（清空+聚焦）与 `updateClearBtn()`（按有无文字显示/隐藏按钮）；`insertReferenceToken()` 与 `sendMessage()` 清空输入后调用 updateClearBtn 保持按钮状态同步。
+- Result: Success
+
+## 2026-08-25 17:05:00 - 任务开始：修复生成文档出现 HTML <table> 而非渲染表格的问题
+- 项目: design_planning_generation_local_model
+- 需求: 用户发现生成的部分段落输出为 `<table><tr><td>阶段</td><td>核心任务</td>...</td></tr></table>` 原始 HTML，而非渲染的表格。根因：LLM 输出 HTML 表格，前端 formatContent 会转义 HTML 且只渲染 Markdown 管道表格；prompt 也未禁止 HTML 表格。方案：A（prompt 侧禁止 HTML 表格，治本）+ B（前端兜底把 HTML 表格归一化为 Markdown）。
+
+## 2026-08-25 17:05:00 - File Edited
+- File: `app/services/agent_tools.py`
+- Change: 新增常量 `_TABLE_FORMAT_RULE`（要求表格必须用 Markdown 管道表格语法，禁止 HTML <table>/<tr>/<td>）。
+- Result: Success
+
+## 2026-08-25 17:05:00 - File Edited
+- File: `app/services/agent_tools.py`
+- Change: 将 `{_TABLE_FORMAT_RULE}` 注入 6 处生成/改写 prompt：generate_section、revise_section、_rewrite_single_pass、_rewrite_section_wise、write_chapter 分段、write_chapter 整章（f-string 用 `{_TABLE_FORMAT_RULE}`，普通字符串拼接用 `+ _TABLE_FORMAT_RULE +`）。
+- Result: Success
+
+## 2026-08-25 17:09:00 - File Edited
+- File: `app/static/agent.html`
+- Change: 新增 `htmlTableToMarkdown(text)` 辅助函数：正则匹配 `<table>...</table>`，逐行提取 `<tr>`/`<td>`/`<th>` 单元格文本，首行作为表头生成 `|---|` 分隔的 Markdown 管道表格；`formatContent()` 开头先调用 `text = htmlTableToMarkdown(text)` 作为兜底。
+- Result: Success
+
+## 2026-08-25 17:09:17 - 校验
+- Topic: Python 语法校验（agent_tools.py）
+- Finding: `ast.parse` 通过（输出 AST_PARSE_OK），说明 6 处 prompt 注入无语法错误。
+- Decision: A（prompt 侧）+ B（前端兜底）两处修改均完成。
+
+## 2026-08-25 18:12:17 - 任务开始：文档名称改为"项目开发计划书"
+- 项目: design_planning_generation_local_model
+- 需求: 用户要求生成的文档名称改为"项目开发计划书"，不要写"设计开发策划书"。
+
+## 2026-08-25 18:12:17 - File Edited
+- File: `app/services/doc_types.py`
+- Change: `DOC_TYPE_LABELS["design_development_plan"]` 从"设计开发策划书"改为"项目开发计划书"（第212行，决定生成文档标题的核心映射）；同步修改第11行 `DOC_TYPES` 注释。
+- Result: Success
+
+## 2026-08-25 18:12:17 - File Edited
+- File: `app/services/prompt_engineer.py`
+- Change: `DOC_TYPE_SPECIFIC_PROMPTS["design_development_plan"]` 标题从"【设计开发策划书特别要求】"改为"【项目开发计划书特别要求】"。
+- Result: Success
+
+## 2026-08-25 18:12:17 - File Edited
+- File: `tests/test_template_tools.py`
+- Change: 断言 `"设计开发策划书" in captured["label"]` 改为 `"项目开发计划书" in captured["label"]`，与 DOC_TYPE_LABELS 映射同步。
+- Result: Success
+
+## 2026-08-26 16:11:47 - 任务开始：修复新增章节序号不顺延的问题
+- 项目: design_planning_generation_local_model
+- 需求: 文档生成后，对 agent 提出"增加某一章节"时，新增章节的序号不能顺延（最后一章为"第六章"，新增章节仍为"第六章"）。
+- 根因: 章节标题的"第X章"序号由 LLM 在 outline 阶段写入 title，prompt 未强制"序号连续递增 + 新增章节顺延"，导致 LLM 重复编号。
+
+## 2026-08-26 16:11:47 - File Edited
+- File: `app/services/agent_tools.py`
+- Change: `design_outline` prompt 末尾追加"章节编号规则"（章节标题形如"第一章 XXX"，序号从1连续递增，不重复不跳号）。
+- Result: Success
+
+## 2026-08-26 16:11:47 - File Edited
+- File: `app/services/agent_tools.py`
+- Change: `update_outline` prompt 追加"章节编号规则"（新增章节序号顺延=现有最大序号+1；删除/插入后重新连续编号）。
+- Result: Success
+
+## 2026-08-26 16:11:47 - File Edited
+- File: `app/services/agent_tools.py`
+- Change: `_extract_outline_from_text` 关键约束追加"章节标题序号连续递增，不重复不跳号"。
+- Result: Success
+
+## 2026-08-26 16:11:47 - File Edited
+- File: `app/services/agent_prompt.py`
+- Change: write_chapter 规则追加"增加新章节时 chapter_name 序号必须顺延（第X章→第X+1章）"。
+- Result: Success
+
+## 2026-08-26 16:11:47 - File Edited
+- File: `app/services/agent_prompt.py`
+- Change: update_outline 描述追加"⚠️ 章节序号连续递增、新增顺延、删除/插入后重新连续编号"。
+- Result: Success
+
+## 2026-08-26 16:11:47 - 校验
+- Topic: Python 语法校验（agent_tools.py / agent_prompt.py）
+- Finding: ast.parse 通过（AST_PARSE_OK），5 处 prompt 注入无语法错误。
+- Decision: 修复完成。
+
+## 2026-08-26 17:09:42 - 任务：前端新增「补充文档」入口（补全 enrich 功能）
+
+## 2026-08-26 17:09:42 - File Edited
+- File: `app/static/agent.html`
+- Change: `uploadFile(file)` 校验失败分支由 `return;` 改为 `return null;`，成功分支记录 `resultFileId = data.file_id`，函数末尾返回 `resultFileId`（供 `submitEnrich` 上传后拿到真实 file_id）。
+- Result: Success
+
+## 2026-08-26 17:09:42 - File Edited
+- File: `app/static/agent.html`
+- Change: 在 `submitModify` 之后、`showModifiedDownloadButton` 之前新增「补充文档」相关 JS 函数：`showEnrichDialog()`（动态填充已上传附件下拉框并重置字段）、`closeEnrichDialog()`、`handleEnrichFileSelect(event)`（选择新文件后清空下拉选择）、`onEnrichExistingChange(value)`（选择已有附件后清空新文件选择）、`submitEnrich()`（优先上传新文档拿 file_id，否则用已选附件，拼装"请把附件「X」的内容补充得更完整、更详细[，补充重点：Y]"注入聊天并 sendMessage）。
+- Result: Success
+
+## 2026-08-26 17:09:42 - 校验
+- Topic: 语法校验（Python + 前端 JS）
+- Finding: `py_compile` 通过（agent_tools.py / agent_engine.py / agent_prompt.py / default_templates/__init__.py，PY_COMPILE_OK）；抽取 agent.html 内联 JS（100422 字符）经 `node --check` 通过（JS_CHECK_OK）。
+- Decision: 前端「补充文档」入口 + 后端 enrich_attachment 链路完整，功能可用。
+
+## 2026-08-26 17:15:00 - 任务：精简文档时保留表格 + 法规过程描述直接写结论
+
+## 2026-08-26 17:15:00 - File Edited
+- File: `app/services/agent_tools.py`
+- Change: `_summarize_one_subsection` 的 system_prompt「必须保留」中表格规则由"表格中的数据行（保留表格，可精简表格周围说明文字）"强化为"所有表格（含表号、表头、全部数据行）必须原样保留，不得删除任何表格、表头或数据行；只可精简表格周围说明文字"；「可以精简」新增一条"涉及法规/标准的过程性、描述性语言（层层分析推导的叙述）直接精简为结论，删除分析推导过程；只保留条款号和最终结论"。
+- Result: Success
+
+## 2026-08-26 17:15:00 - File Edited
+- File: `app/services/agent_tools.py`
+- Change: aggressive（二次精简）prompt 中"表格保留完整列结构…不得删除整列"改为"所有表格（含表号、表头、全部数据行）必须原样保留，不得删除任何表格"；"法规条款号可保留但删除其后的展开说明"改为"法规条款号保留，但删除其后的过程性展开说明和层层分析推导，直接写结论"。
+- Result: Success
+
+## 2026-08-26 17:15:00 - File Edited
+- File: `app/services/agent_tools.py`
+- Change: 迭代精简 retry_user_prompt 追加"所有表格必须原样保留不得删除；涉及法规的过程性描述直接写结论、删除分析推导"。
+- Result: Success
+
+## 2026-08-26 17:15:00 - File Edited
+- File: `app/services/subagents.py`
+- Change: `SUMMARY_AGENT_PROMPT`「必须保留」中表格规则同步强化为"所有表格（含表号、表头、全部数据行）必须原样保留，不得删除任何表格、表头或数据行"；「可以精简」新增法规过程性描述语言直接写结论规则。
+- Result: Success
+
+## 2026-08-26 17:15:00 - 校验
+- Topic: Python 语法校验（agent_tools.py / subagents.py）
+- Finding: py_compile 通过（PY_COMPILE_OK）。
+- Decision: 精简功能规则已同步到主 prompt 与子代理 prompt，功能可用。
+
+## 2026-08-26 17:40:00 - 任务：新增文档版本回退功能（单步撤销）
+
+## 2026-08-26 17:40:00 - File Edited
+- File: `app/services/agent_state.py`
+- Change: AgentState 新增 `undo_stack: list[dict]` 字段（撤销栈快照），create_initial_state 初始化 `undo_stack=[]`。条目结构：`{"sections_before": {章节名: 旧内容或None}, "attachments_before_len": int, "removed_file_ids": [file_id,...], "description": str}`。
+- Result: Success
+
+## 2026-08-26 17:40:00 - File Edited
+- File: `app/services/agent_engine.py`
+- Change: `_after_tools_node` 在覆盖 generated_sections（generate_section/revise_section/revise_paragraph/write_chapter/summarize_section）前用 `sections_before` 记录旧值；在 append 附件修改（modify_attachment/enrich_attachment）时记录 `removed_file_ids` 与 `attachments_before_len`；循环后若有变更则压入 undo_stack（栈深上限 50），写入 result。
+- Result: Success
+
+## 2026-08-26 17:40:00 - File Edited
+- File: `app/api/routes.py`
+- Change: 新增 `POST /agent/projects/{project_id}/undo`，弹出 undo_stack 栈顶并恢复 generated_sections 章节旧值（None 删除章节）与 attachment_modifications 截断，`aupdate_state` 持久化，返回 description 与 removed_file_ids。
+- Result: Success
+
+## 2026-08-26 17:40:00 - File Edited
+- File: `app/static/agent.html`
+- Change: 顶栏新增「↩️ 回退」按钮（undoBtn）；新增 `undoLast()` JS，调用 undo API，成功后清理被回退的附件修改下载按钮 DOM 并 `fetchState()`/`fetchAttachments()` 刷新。
+- Result: Success
+
+## 2026-08-26 17:40:00 - 校验
+- Topic: 语法校验（Python + 前端 JS）
+- Finding: py_compile 通过（agent_state.py / agent_engine.py / routes.py，PY_COMPILE_OK）；抽取 agent.html 内联 JS（101445 字符）经 node --check 通过（JS_CHECK_OK）。
+- Decision: 回退功能链路完整（快照→压栈→undo API→前端按钮），功能可用。
+
+## 2026-08-26 18:20:00 - 任务：新增「精简上传附件」能力（对话驱动，补齐修改/补全/精简三类处理）
+
+## 2026-08-26 18:20:00 - File Edited
+- File: `app/services/agent_tools.py`
+- Change: 新增 `_summarize_attachment_single_pass` / `_summarize_attachment_section_wise` / `summarize_attachment` 工具（kind=summarize），精简 prompt 融入「保留表格」「法规过程描述直接写结论」规则；复用 modify/enrich 的旁路存储与下载链路；注册到 PHASE1_TOOLS（enrich_attachment 之后）。
+- Result: Success
+
+## 2026-08-26 18:20:00 - File Edited
+- File: `app/services/agent_engine.py`
+- Change: 三处 `("modify_attachment", "enrich_attachment")` 统一改为 `("modify_attachment", "enrich_attachment", "summarize_attachment")`（_after_tools_node 处理 + 两处 SSE modified_doc_ready 事件）。
+- Result: Success
+
+## 2026-08-26 18:20:00 - File Edited
+- File: `app/services/agent_prompt.py`
+- Change: 新增「2f. summarize_attachment」工具说明，明确与 summarize_section/summarize_document 的区别（前者精简上传附件，后者精简生成文档章节），并注明保留表格、法规过程描述直接写结论等规则。
+- Result: Success
+
+## 2026-08-26 18:20:00 - File Edited
+- File: `app/static/agent.html`
+- Change: `showModifiedDownloadButton` 改为 kind→文案映射（modify/enrich/summarize 分别显示修改/补全/精简版下载）；`toolLabel` 新增 `summarize_attachment` → 「精简附件」。
+- Result: Success
+
+## 2026-08-26 18:20:00 - 校验
+- Topic: 语法校验（Python + 前端 JS）
+- Finding: py_compile 通过（agent_tools.py / agent_engine.py / agent_prompt.py，PY_COMPILE_OK）；抽取 agent.html 内联 JS（101767 字符）经 node --check 通过（JS_CHECK_OK）。
+- Decision: 上传文档处理已覆盖「修改 / 补全 / 精简」三类，对话驱动触发，功能可用。
+
+## 2026-08-26 19:30:00 - 任务：前端「补充文档」显示改为「修改文档」
+
+## 2026-08-26 19:30:00 - File Edited
+- File: `app/static/agent.html`
+- Change: 头部按钮文本 `📝 补充文档` → `📝 修改文档`（enrichBtn），title 同步改为「…修改完善，生成修改版文档」；补充文档对话框标题 `<h3>📝 补充文档</h3>` → `<h3>📝 修改文档</h3>`。
+- Result: Success
+
+## 2026-08-26 19:30:00 - 校验
+- Topic: 前端显示字符串
+- Finding: 全局检索确认页面中已无「补充文档」字样（保留对话框内部「补充目标文档/补充重点/开始补全」等描述语，属于补全操作内部文案）。
+- Decision: 仅改按钮与标题两处「补充文档」显示文案，符合最小改动原则，任务完成。
+
+## 2026-08-26 19:40:00 - 任务：修改文档对话框「开始补全」改为「确认」，需求措辞泛化为修改/精简/补全
+
+## 2026-08-26 19:40:00 - File Edited
+- File: `app/static/agent.html`
+- Change: 对话框说明改为「…并描述处理需求（修改、精简、补全等），由 Agent 处理生成新文档…」；「补充目标文档」→「处理目标文档」；「补充重点（可选）」→「处理需求（可选）」并更新 placeholder 示例；按钮「开始补全」→「确认」；submitEnrich 注入消息由固定「补充得更完整」改为通用「请处理附件…，处理需求：…」（留空则让 Agent 自行判断处理方式）。
+- Result: Success
+
+## 2026-08-26 19:40:00 - 校验
+- Topic: 前端 JS 语法
+- Finding: 抽取 agent.html 内联 JS（2 个 script 块，实际内联脚本 1 块）经 node --check 通过（JS_CHECK_OK）。
+- Decision: 对话框从「单一补全」泛化为「通用文档处理」入口，用户可提出修改/精简/补全等任意需求，任务完成。
+
+## 2026-08-26 19:55:00 - 任务：修改文档上传后未填需求时，解析完成追加引导消息（方案1轻量）
+
+## 2026-08-26 19:55:00 - File Edited
+- File: `app/static/agent.html`
+- Change: `submitEnrich` 提交逻辑分支化——用户已填「处理需求」则直接注入指令并 sendMessage；用户留空则不再自动 sendMessage，改为 `appendMessage('agent', '文档「xxx」已解析完成。请告诉我是要 修改、精简 还是 补全，以及具体需求。')` 引导用户在输入框回复。复用现有对话流程，纯前端改动。
+- Result: Success
+
+## 2026-08-26 19:55:00 - 校验
+- Topic: 前端 JS 语法
+- Finding: 抽取 agent.html 内联 JS 经 node --check 通过（JS_CHECK_OK）。
+- Decision: 解析完成后留空场景会追加引导消息，提示用户选择修改/精简/补全，任务完成。
+
+## 2026-08-26 20:05:00 - 任务：修改文档入口上传的文档不放入附件列表（隐藏附件）
+
+## 2026-08-26 20:05:00 - File Edited
+- File: `app/api/routes.py`
+- Change: `/agent/upload/{project_id}` 新增 `hidden: bool = Form(False)` 参数，附件条目增加 `hidden` 字段；`/agent/projects/{project_id}/attachments` 列表接口过滤 `hidden` 附件，不再返回给前端展示。文档仍保留在 Agent 状态的 attachments 中（含 full_text），供 modify/enrich/summarize 工具处理。
+- Result: Success
+
+## 2026-08-26 20:05:00 - File Edited
+- File: `app/static/agent.html`
+- Change: `uploadFile(file, hidden=false)` 增加第二参数；hidden 模式不上传为附件 chip、不 appendMessage、不 renderAttachmentChips、不 fetchState，仅上传并返回 file_id；`submitEnrich` 上传新文档时传 `hidden=true`。
+- Result: Success
+
+## 2026-08-26 20:05:00 - 校验
+- Topic: 语法校验（Python + 前端 JS）
+- Finding: py_compile 通过（routes.py，PY_COMPILE_OK）；node --check 通过（agent.html 内联 JS，JS_CHECK_OK）。
+- Decision: 修改文档入口上传的文档仅作为处理对象，不展示在附件列表，任务完成。
+
+## 2026-09-01 16:41 - 任务：段落级手术（保留原版 docx 样式，修改/精简/补全不再全文重排）
+- 目标：解决「修改版与原版差距过大」问题——根因是原 docx 上传后被删除、LLM 在纯文本上重写、下载时从空白模板重排。
+- 方案（用户选定「段落级手术」）：保留原 docx，LLM 基于块清单输出编辑指令 JSON，在原 docx 上执行 delete/replace/insert_after，未涉及块样式原样保留。
+
+### 文件改动
+- File: app/services/docx_edit.py（新建）
+  - Change: 段落级手术核心模块——iter_body_blocks / build_block_inventory / inventory_text_from_path / apply_edit_ops（replace 保留段落样式、delete、insert_after 复制锚定段 pPr）。
+  - Result: Success - 单元测试验证（对真实文档 130 块做 replace/delete/insert，样式 pStyle 保留、run 数=1）。
+- File: app/services/attachment_service.py
+  - Change: _do_extract 的 finally 对 .docx 保留原文件并记录 extract_tasks[task_id]["original_path"]，其余格式仍删除临时文件。
+  - Result: Success
+- File: app/api/routes.py
+  - Change: agent_finalize_attachment 的 attachment 条目新增 original_path 字段；agent_download_modified_document 改为：有条目 ops+original_path 则执行段落级手术，否则走原 fill_template 重排。
+  - Result: Success
+- File: app/services/agent_tools.py
+  - Change: 新增段落级手术辅助函数（_can_use_docx_edit/_build_docx_inventory/_parse_edit_ops/_ops_modified_chars/_llm_summarize_ops/_llm_modify_ops/_llm_enrich_ops）；modify_attachment/enrich_attachment/summarize_attachment 各加入「优先段落级手术、失败回退全文重写」分支。
+  - Result: Success
+- File: app/services/agent_engine.py
+  - Change: _after_tools_node 中附件修改结果处理：pending 携带 ops+original_path 时存段落级手术条目（kind/ops/original_path），否则存 modified_markdown。
+  - Result: Success
+
+### Bash 命令
+- Command: python -m py_compile app/services/docx_edit.py app/services/attachment_service.py app/services/agent_tools.py app/services/agent_engine.py app/api/routes.py
+  - Result: Success - ALL_COMPILE_OK
+- Command: python _test_docx_edit.py（临时测试脚本，验证段落级手术样式保留，已删除）
+  - Result: Success - stats={'deleted':1,'replaced':1,'inserted':1,'skipped':0}，替换段落样式保持 None、run 数 1
+
+### 决策
+- 段落级手术仅对「有 original_path 且为 .docx」的附件生效；pdf/超长文档回退到原全文重写逻辑。
+- 表格块在提示词中约束为「只能 delete/保留」，replace/insert 不作用于表格（保真优先）。
+- 前端无需改动：工具返回 JSON 结构（status/kind/file_id/filename/modified_chars/summary/message）保持不变，下载按钮链路复用。

@@ -1898,7 +1898,7 @@ class MiniMaxService:
             pass
 
         # 2. 主知识库检索（含 uploads）
-        main_k = 13 if not uploads_has_data else 8
+        main_k = 20 if not uploads_has_data else 15
         chunks = []
         if self.use_rag:
             for attempt in range(2):

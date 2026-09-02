@@ -48,6 +48,14 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
+    # 关闭 PostgreSQL 连接池
+    try:
+        from app.services.pgsql_client import close_pool
+        await close_pool()
+        print("[main] PostgreSQL pool closed")
+    except Exception:
+        pass
+
 
 app = FastAPI(
     title="QMS Document Generator",
